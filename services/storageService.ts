@@ -28,14 +28,20 @@ export const StorageService = {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (!stored) {
       const init = getInitialData();
-      // Don't save init immediately to avoid overwriting potential cloud data fetch
-      // unless specifically asked. But for safety we return init.
       return init;
     }
     try {
       const parsed = JSON.parse(stored);
       // Merge with initial structure to ensure all fields exist
-      return { ...getInitialData(), ...parsed };
+      const data = { ...getInitialData(), ...parsed };
+      
+      // SAFETY NET: If for some reason (bad sync/corruption) users are empty, restore defaults
+      // This prevents the "cannot log in" issue if cloud overwrites with empty list
+      if (!data.users || data.users.length === 0) {
+          data.users = [INITIAL_ADMIN as User, DEFAULT_EMPLOYEE as User];
+      }
+      
+      return data;
     } catch (e) {
       return getInitialData();
     }
@@ -62,7 +68,12 @@ export const StorageService = {
       const cloudData = await response.json();
       
       // 驗證回傳的資料結構是否包含必要的欄位，簡單驗證
-      if (cloudData && cloudData.users) {
+      if (cloudData && Array.isArray(cloudData.users)) {
+        // Prevent overwriting local with empty user list from cloud if cloud is fresh/empty
+        if (cloudData.users.length === 0) {
+             cloudData.users = [INITIAL_ADMIN as User, DEFAULT_EMPLOYEE as User];
+        }
+
         // 更新本地儲存，確保它是最新的
         localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
         return cloudData as AppData;

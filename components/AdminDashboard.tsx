@@ -790,7 +790,10 @@ export const AdminDashboard: React.FC = () => {
                                  <span className={`px-3 py-1 rounded-full text-[10px] md:text-xs font-black uppercase ${ann.category==='urgent'?'bg-red-100 text-red-600':ann.category==='system'?'bg-gray-100 text-gray-500':'bg-brand-50 text-brand-600'}`}>
                                     {categoryMap[ann.category]}
                                  </span>
-                                 <span className="text-gray-400 text-xs md:text-sm font-mono">{ann.date}</span>
+                                 <span className="text-gray-400 text-xs md:text-sm font-mono">
+                                    {/* Format date: YYYY-MM-DD only */}
+                                    {ann.date.split(' ')[0].split('T')[0]}
+                                 </span>
                               </div>
                               <h4 className="text-lg md:text-xl font-black text-gray-800 mb-3">{ann.title}</h4>
                               <div className="text-gray-600 prose prose-sm max-w-none font-bold text-sm md:text-base" dangerouslySetInnerHTML={{ __html: ann.content }} />

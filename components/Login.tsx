@@ -63,15 +63,20 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setTimeout(() => {
       // Re-load data to ensure we use the latest from memory/storage
       const data = StorageService.loadData();
-      const normalizedInput = username.toLowerCase();
-      const user = data.users.find(u => u.id.toLowerCase() === normalizedInput && u.pass === password);
+      
+      // Normalize input: trim whitespace and lowercase
+      const normalizedInput = username.trim().toLowerCase();
+      
+      const user = data.users.find(u => 
+        u.id && u.id.toLowerCase() === normalizedInput && u.pass === password
+      );
       
       if (user) {
         if (user.deleted) {
           setError('此帳號已被封存，無法登入系統');
         } else {
           if (rememberMe) {
-            localStorage.setItem('remembered_user', username);
+            localStorage.setItem('remembered_user', username.trim());
             localStorage.setItem('remembered_pass', btoa(password));
           } else {
             localStorage.removeItem('remembered_user');
@@ -116,7 +121,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-5 md:space-y-6">
-            <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號 (不分大小寫)" />
+            <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號 (例如: user)" />
             <input type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="密碼" />
             <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
               <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />
@@ -141,7 +146,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                   <span className={`px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${ann.category === 'urgent' ? 'bg-red-100 text-red-600' : ann.category === 'system' ? 'bg-gray-100 text-gray-500' : 'bg-blue-100 text-blue-600'}`}>
                     {ann.category === 'urgent' ? '緊急' : ann.category === 'system' ? '系統' : '一般'}
                   </span>
-                  <span className="text-[10px] text-gray-400 font-black font-mono">{ann.date}</span>
+                  <span className="text-[10px] text-gray-400 font-black font-mono">
+                    {/* Show Only Date */}
+                    {ann.date.split(' ')[0].split('T')[0]}
+                  </span>
                 </div>
                 <h4 className="font-black text-gray-800 text-lg mb-4">{ann.title}</h4>
                 <div className="text-sm text-gray-500 prose prose-sm max-w-none font-bold leading-relaxed break-words" dangerouslySetInnerHTML={{ __html: ann.content }} />
