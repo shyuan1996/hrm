@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
 import { Button } from './ui/Button';
-import { Building2, AlertTriangle, Megaphone } from 'lucide-react';
+import { Building2, AlertTriangle, Megaphone, CloudDownload, RefreshCw } from 'lucide-react';
 
 interface LoginProps {
   onLogin: (user: User) => void;
@@ -16,8 +16,36 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'success' | 'error'>('idle');
 
   useEffect(() => {
+    // Attempt to sync from cloud immediately on load
+    const syncData = async () => {
+        setIsSyncing(true);
+        try {
+            const cloudData = await StorageService.fetchCloudData();
+            if (cloudData) {
+                setAnnouncements(cloudData.announcements);
+                setSyncStatus('success');
+            } else {
+                // If no cloud data (or no URL), load local
+                setAnnouncements(StorageService.loadData().announcements);
+                // If no URL configured, it's not strictly an error, just idle
+                const settings = StorageService.loadData().settings;
+                setSyncStatus(settings.gasUrl ? 'error' : 'idle');
+            }
+        } catch (e) {
+            console.error(e);
+            setSyncStatus('error');
+            setAnnouncements(StorageService.loadData().announcements);
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    syncData();
+
     const savedUser = localStorage.getItem('remembered_user');
     const savedPass = localStorage.getItem('remembered_pass');
     if (savedUser && savedPass) {
@@ -25,7 +53,6 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
       setPassword(atob(savedPass));
       setRememberMe(true);
     }
-    setAnnouncements(StorageService.loadData().announcements);
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -34,6 +61,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setError('');
 
     setTimeout(() => {
+      // Re-load data to ensure we use the latest from memory/storage
       const data = StorageService.loadData();
       const normalizedInput = username.toLowerCase();
       const user = data.users.find(u => u.id.toLowerCase() === normalizedInput && u.pass === password);
@@ -61,7 +89,25 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   return (
     <div className="min-h-full flex items-center justify-center p-4 bg-gray-100 font-bold overflow-y-auto">
       <div className="w-full max-w-6xl bg-white rounded-[32px] md:rounded-[48px] shadow-2xl overflow-hidden flex flex-col md:flex-row border border-gray-100 min-h-[auto] md:min-h-[600px] my-4 md:my-0">
-        <div className="w-full md:w-[40%] p-8 md:p-14 flex flex-col justify-center bg-white order-1">
+        <div className="w-full md:w-[40%] p-8 md:p-14 flex flex-col justify-center bg-white order-1 relative">
+          
+          {/* Cloud Sync Status Indicator */}
+          <div className="absolute top-6 right-6 flex items-center gap-2">
+             {isSyncing ? (
+                 <div className="flex items-center gap-1 text-brand-600 text-xs animate-pulse">
+                    <RefreshCw size={14} className="animate-spin" /> 同步雲端資料中...
+                 </div>
+             ) : syncStatus === 'success' ? (
+                 <div className="flex items-center gap-1 text-green-600 text-xs" title="已連接雲端">
+                    <CloudDownload size={14} /> 資料已更新
+                 </div>
+             ) : syncStatus === 'error' ? (
+                 <div className="flex items-center gap-1 text-red-400 text-xs" title="無法連接雲端，使用本地暫存">
+                    <AlertTriangle size={14} /> 離線模式
+                 </div>
+             ) : null}
+          </div>
+
           <div className="flex flex-col items-center mb-8 md:mb-10">
             <div className="w-16 h-16 md:w-20 md:h-20 bg-brand-600 rounded-3xl flex items-center justify-center mb-4 shadow-xl shadow-brand-200">
               <Building2 className="text-white w-8 h-8 md:w-10 md:h-10" />
@@ -77,7 +123,9 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
               記住帳號密碼
             </label>
             {error && <div className="text-red-500 text-sm bg-red-50 p-4 rounded-xl font-black flex items-center gap-2"><AlertTriangle size={16}/> {error}</div>}
-            <Button type="submit" isLoading={isLoading} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl">登入系統</Button>
+            <Button type="submit" isLoading={isLoading} disabled={isSyncing} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl disabled:bg-gray-400">
+                {isSyncing ? '系統同步中...' : '登入系統'}
+            </Button>
           </form>
         </div>
 

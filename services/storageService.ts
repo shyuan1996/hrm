@@ -28,29 +28,68 @@ export const StorageService = {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (!stored) {
       const init = getInitialData();
-      StorageService.saveData(init);
+      // Don't save init immediately to avoid overwriting potential cloud data fetch
+      // unless specifically asked. But for safety we return init.
       return init;
     }
     try {
       const parsed = JSON.parse(stored);
+      // Merge with initial structure to ensure all fields exist
       return { ...getInitialData(), ...parsed };
     } catch (e) {
       return getInitialData();
     }
   },
 
+  /**
+   * 嘗試從雲端 (Google Apps Script) 獲取最新資料
+   * 成功後會更新 LocalStorage
+   */
+  fetchCloudData: async (): Promise<AppData | null> => {
+    const localData = StorageService.loadData();
+    const gasUrl = localData.settings?.gasUrl;
+
+    if (!gasUrl) {
+      console.warn("No GAS URL configured, skipping cloud fetch.");
+      return null;
+    }
+
+    try {
+      // 假設 GAS 部署為 Web App，GET 請求會回傳 JSON 資料
+      const response = await fetch(gasUrl);
+      if (!response.ok) throw new Error('Cloud fetch failed');
+      
+      const cloudData = await response.json();
+      
+      // 驗證回傳的資料結構是否包含必要的欄位，簡單驗證
+      if (cloudData && cloudData.users) {
+        // 更新本地儲存，確保它是最新的
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
+        return cloudData as AppData;
+      }
+    } catch (err) {
+      console.error("Cloud Sync Error (GET):", err);
+    }
+    return null;
+  },
+
   saveData: async (data: AppData) => {
+    // 1. Save locally (as cache/fallback)
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+
+    // 2. Push to Cloud
     if (data.settings.gasUrl) {
       try {
+        // 使用 no-cors 模式或是標準 cors，視 GAS 設定而定
+        // 通常 GAS 需要正確設定回傳 headers 才能用標準 cors
+        // 這裡為了簡單起見，發送 POST 請求
         await fetch(data.settings.gasUrl, {
           method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // GAS 有時對 application/json 處理較嚴格，text/plain 較穩
           body: JSON.stringify(data)
         });
       } catch (err) {
-        console.warn("Cloud Sync Failed", err);
+        console.warn("Cloud Sync Failed (POST)", err);
       }
     }
   },
@@ -196,7 +235,6 @@ export const StorageService = {
     data.holidays.push(h);
     
     // Recalculate hours for ALL leaves (pending, approved, etc.)
-    // because a new holiday might affect existing requests
     data.leaves.forEach(leave => {
         if (leave.status !== 'cancelled' && leave.status !== 'rejected') {
             leave.hours = TimeService.calculateLeaveHours(leave.start, leave.end, data.holidays);
@@ -211,7 +249,6 @@ export const StorageService = {
     data.holidays = data.holidays.filter(h => h.id !== id);
 
     // Recalculate hours for ALL leaves
-    // removing a holiday might increase leave hours
     data.leaves.forEach(leave => {
         if (leave.status !== 'cancelled' && leave.status !== 'rejected') {
             leave.hours = TimeService.calculateLeaveHours(leave.start, leave.end, data.holidays);

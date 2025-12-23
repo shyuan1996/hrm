@@ -19,15 +19,25 @@ const App: React.FC = () => {
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   useEffect(() => {
-    const data = StorageService.loadData();
-    setAppSettings(data.settings);
-    TimeService.getNetworkTimeOffset().then(offset => setTimeOffset(offset));
-    const savedSession = localStorage.getItem(SESSION_KEY);
-    if (savedSession) {
-      const parsed = JSON.parse(savedSession);
-      const user = data.users.find(u => u.id === parsed.id);
-      if (user && !user.deleted) setCurrentUser(user);
-    }
+    // Initialize data logic
+    const init = async () => {
+      // Try to get fresh cloud data first
+      await StorageService.fetchCloudData();
+      
+      // Load whatever we have (local or freshly fetched)
+      const data = StorageService.loadData();
+      setAppSettings(data.settings);
+      
+      TimeService.getNetworkTimeOffset().then(offset => setTimeOffset(offset));
+      
+      const savedSession = localStorage.getItem(SESSION_KEY);
+      if (savedSession) {
+        const parsed = JSON.parse(savedSession);
+        const user = data.users.find(u => u.id === parsed.id);
+        if (user && !user.deleted) setCurrentUser(user);
+      }
+    };
+    init();
   }, []);
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
