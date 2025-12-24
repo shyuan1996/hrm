@@ -29,122 +29,185 @@ export const TimeService = {
   },
 
   /**
-   * 檢查時間偏移是否在容許範圍內（例如 3 分鐘）
+   * 取得台灣時區的日期字串 (YYYY-MM-DD)
    */
-  isTimeIntegrityValid: (offset: number): boolean => {
-    return Math.abs(offset) < 180000; // 3 minutes
+  getTaiwanDate: (dateInput: Date | string | number): string => {
+    try {
+      const d = new Date(dateInput);
+      if (isNaN(d.getTime())) return String(dateInput);
+      return d.toLocaleDateString('zh-TW', {
+        timeZone: 'Asia/Taipei',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).replace(/\//g, '-');
+    } catch {
+      return String(dateInput);
+    }
   },
 
   /**
-   * 格式化 24 小時制日期時間字串
+   * 取得台灣時區的時間字串 (HH:mm:ss)
    */
-  formatFullDateTime: (date: Date): string => {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, '0');
-    const d = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mm = String(date.getMinutes()).padStart(2, '0');
-    const ss = String(date.getSeconds()).padStart(2, '0');
-    return `${y}/${m}/${d} ${hh}:${mm}:${ss}`;
+  getTaiwanTime: (dateInput: Date | string | number): string => {
+    try {
+      const d = new Date(dateInput);
+      if (isNaN(d.getTime())) return '';
+      return d.toLocaleTimeString('zh-TW', {
+        timeZone: 'Asia/Taipei',
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    } catch {
+      return '';
+    }
+  },
+
+  /**
+   * 格式化完整的日期時間字串 (YYYY-MM-DD HH:mm[:ss])
+   * @param dateStr 原始時間字串
+   * @param withSeconds 是否包含秒數 (預設 false)
+   */
+  formatDateTime: (dateStr: string, withSeconds = false): string => {
+    if (!dateStr) return '--';
+    
+    // 嘗試解析
+    try {
+        const d = new Date(dateStr);
+        if (isNaN(d.getTime())) {
+            // 如果解析失敗，且字串看起來像簡單格式，則直接返回
+            return dateStr.replace('T', ' ').replace('Z', '');
+        }
+
+        const datePart = d.toLocaleDateString('zh-TW', {
+            timeZone: 'Asia/Taipei',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        }).replace(/\//g, '-');
+
+        const timePart = d.toLocaleTimeString('zh-TW', {
+            timeZone: 'Asia/Taipei',
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: withSeconds ? '2-digit' : undefined
+        });
+
+        return `${datePart} ${timePart}`;
+    } catch {
+        return dateStr;
+    }
+  },
+
+  /**
+   * 僅取出時間部分 (HH:mm[:ss])
+   * @param rawTime 原始時間字串
+   * @param withSeconds 是否包含秒數 (預設 false)
+   */
+  formatTimeOnly: (rawTime: string, withSeconds = false): string => {
+    if (!rawTime) return '--';
+    
+    // 如果包含 T，通常是 ISO 格式，先轉 Date 再取時間
+    if (rawTime.includes('T') || rawTime.includes('-')) {
+        try {
+            const d = new Date(rawTime);
+            if (!isNaN(d.getTime())) {
+                return d.toLocaleTimeString('zh-TW', {
+                    timeZone: 'Asia/Taipei',
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: withSeconds ? '2-digit' : undefined
+                });
+            }
+        } catch { /* ignore */ }
+    }
+    
+    // 處理純時間字串 HH:mm:ss
+    let timePart = rawTime;
+    // 去除 .000Z 等可能的後綴
+    if (timePart.includes('.')) {
+        timePart = timePart.split('.')[0];
+    }
+    
+    const parts = timePart.split(':');
+    if (parts.length >= 2) {
+        if (withSeconds && parts.length === 3) {
+            return `${parts[0]}:${parts[1]}:${parts[2]}`;
+        }
+        return `${parts[0]}:${parts[1]}`;
+    }
+    
+    return timePart;
   },
 
   /**
    * 格式化民國日期字串
    */
   toROCDateString: (date: Date): string => {
-    const y = date.getFullYear() - 1911;
-    const m = date.getMonth() + 1;
-    const d = date.getDate();
+    const twDateStr = date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: 'numeric', day: 'numeric' });
+    const parts = twDateStr.split('/');
+    if (parts.length < 3) return twDateStr;
+    
+    const y = parseInt(parts[0]) - 1911;
+    const m = parseInt(parts[1]);
+    const d = parseInt(parts[2]);
     const w = ['日', '一', '二', '三', '四', '五', '六'][date.getDay()];
     return `民國 ${y} 年 ${m} 月 ${d} 日 (星期${w})`;
   },
 
   /**
    * 計算請假時數 (核心邏輯)
-   * 排除假期、週末、午休(12:00-13:00)
-   * 工作時間: 08:30 - 17:30
    */
   calculateLeaveHours: (startStr: string, endStr: string, holidays: Holiday[]): number => {
     if (!startStr || !endStr) return 0;
     
-    // Replace space with T for Safari/iOS compatibility
-    const startDateTime = new Date(startStr.replace(' ', 'T'));
-    const endDateTime = new Date(endStr.replace(' ', 'T'));
+    const s = new Date(startStr.replace(' ', 'T'));
+    const e = new Date(endStr.replace(' ', 'T'));
     
-    if (endDateTime <= startDateTime) return 0;
+    if (e <= s) return 0;
 
     let totalHours = 0;
+    let current = new Date(s);
     
-    // Create a cursor date starting at midnight of the start date
-    let current = new Date(startDateTime);
-    current.setHours(0, 0, 0, 0);
-    
-    const endDay = new Date(endDateTime);
-    endDay.setHours(0, 0, 0, 0);
-
-    // Loop through each day from start date to end date
-    while (current <= endDay) {
-        // Construct YYYY-MM-DD using local time explicitly to avoid UTC shift issues
-        const year = current.getFullYear();
-        const month = String(current.getMonth() + 1).padStart(2, '0');
-        const day = String(current.getDate()).padStart(2, '0');
-        const dStr = `${year}-${month}-${day}`;
-
-        // Check against holidays using the local date string
-        const isHoli = holidays.some(h => h.date === dStr) || current.getDay() === 0 || current.getDay() === 6;
+    while (current < e) {
+        const currentDateStr = TimeService.getTaiwanDate(current);
+        const checkDay = new Date(currentDateStr); 
+        const dayOfWeek = checkDay.getDay();
+        
+        const isHoli = holidays.some(h => TimeService.getTaiwanDate(h.date) === currentDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
 
         if (!isHoli) {
-            // Work hours: 08:30 - 17:30 (Construct dates using the current cursor day string)
-            const workStart = new Date(`${dStr}T08:30:00`);
-            const workEnd = new Date(`${dStr}T17:30:00`);
-            
-            // Lunch break: 12:00 - 13:00
-            const lunchStart = new Date(`${dStr}T12:00:00`);
-            const lunchEnd = new Date(`${dStr}T13:00:00`);
+            const workStart = new Date(`${currentDateStr}T08:30:00`);
+            const workEnd = new Date(`${currentDateStr}T17:30:00`);
+            const lunchStart = new Date(`${currentDateStr}T12:00:00`);
+            const lunchEnd = new Date(`${currentDateStr}T13:00:00`);
 
-            // Determine actual start/end for this specific day
-            // If the leave starts on this day, use the leave start time, otherwise use work start time
-            let dayReqStart = (dStr === startDateTime.toISOString().split('T')[0]) ? startDateTime : workStart;
-            // Note: Use simple string comparison for day equality to be safe or rely on logic flow
-            if (current.getTime() === new Date(startDateTime).setHours(0,0,0,0)) {
-                 dayReqStart = startDateTime;
-            }
+            const segmentStart = (s > workStart) ? s : workStart;
+            const segmentEnd = (e < workEnd) ? e : workEnd;
 
-            let dayReqEnd = (dStr === endDateTime.toISOString().split('T')[0]) ? endDateTime : workEnd;
-            if (current.getTime() === new Date(endDateTime).setHours(0,0,0,0)) {
-                 dayReqEnd = endDateTime;
-            }
+            if (segmentEnd > segmentStart) {
+                let duration = segmentEnd.getTime() - segmentStart.getTime();
+                const lunchSegStart = (segmentStart > lunchStart) ? segmentStart : lunchStart;
+                const lunchSegEnd = (segmentEnd < lunchEnd) ? segmentEnd : lunchEnd;
 
-            // Clamp request times to work hours boundaries
-            if (dayReqStart < workStart) dayReqStart = workStart;
-            if (dayReqEnd > workEnd) dayReqEnd = workEnd;
-
-            // Only calculate if there's a valid interval within work hours
-            if (dayReqEnd > dayReqStart) {
-                let durationMs = dayReqEnd.getTime() - dayReqStart.getTime();
-
-                // Check lunch overlap logic
-                const overlapStart = dayReqStart < lunchStart ? lunchStart : dayReqStart;
-                const overlapEnd = dayReqEnd > lunchEnd ? lunchEnd : dayReqEnd;
-
-                if (overlapEnd > overlapStart) {
-                    // There is an overlap with lunch time
-                    // Ensure we are strictly within lunch bounds to deduct
-                    const actualOverlapStart = overlapStart < lunchStart ? lunchStart : overlapStart;
-                    const actualOverlapEnd = overlapEnd > lunchEnd ? lunchEnd : overlapEnd;
-                    
-                    const deduction = actualOverlapEnd.getTime() - actualOverlapStart.getTime();
-                    if(deduction > 0) durationMs -= deduction;
+                if (lunchSegEnd > lunchSegStart) {
+                    duration -= (lunchSegEnd.getTime() - lunchSegStart.getTime());
                 }
-                
-                totalHours += durationMs / (1000 * 60 * 60);
+
+                if (duration > 0) {
+                    totalHours += duration;
+                }
             }
         }
-        // Move to next day
         current.setDate(current.getDate() + 1);
+        current.setHours(0,0,0,0);
     }
 
-    // Round to nearest 0.5
-    return parseFloat((Math.round(totalHours * 2) / 2).toFixed(1));
+    const h = totalHours / (1000 * 60 * 60);
+    return parseFloat((Math.round(h * 2) / 2).toFixed(1));
   }
 };

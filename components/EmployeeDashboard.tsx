@@ -1,11 +1,11 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, AttendanceRecord, AppSettings, Holiday } from '../types';
 import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2 } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -14,21 +14,33 @@ interface EmployeeDashboardProps {
   timeOffset: number;
 }
 
-const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => (
-  <div className="p-4 bg-white border-2 rounded-[24px] shadow-sm transition-all hover:shadow-md flex items-center justify-between">
-    <div className="flex flex-col">
-       <div className={`text-sm font-black ${r.type === 'in' ? 'text-brand-600' : 'text-red-600'}`}>{r.date}</div>
-       <div className="flex items-center gap-2">
-         <div className="text-xs text-gray-400 font-black">{r.type === 'in' ? '上班' : '下班'}打卡</div>
-         {r.status.includes('異常') && <span className="text-[10px] bg-red-100 text-red-600 px-1 rounded font-bold">地點異常</span>}
-       </div>
+const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
+  const dateStr = TimeService.getTaiwanDate(r.date);
+  // 修正：顯示秒數 (true)
+  const displayTime = TimeService.formatTimeOnly(r.time, true);
+
+  return (
+    <div className="p-4 bg-white border-2 rounded-[24px] shadow-sm transition-all hover:shadow-md flex items-center justify-between">
+      <div className="flex flex-col min-w-[100px]">
+         <div className={`text-sm font-black text-gray-500`}>{dateStr}</div>
+         <div className="flex items-center gap-2">
+           <div className={`text-xs font-black ${r.type === 'in' ? 'text-brand-600' : 'text-red-600'}`}>{r.type === 'in' ? '上班' : '下班'}打卡</div>
+         </div>
+      </div>
+      
+      <div className="flex-1 text-center">
+          <div className="text-xl font-mono font-black text-gray-800 tracking-tight">{displayTime}</div>
+      </div>
+
+      <div className="flex flex-col items-end gap-1 min-w-[70px]">
+          <div className={`px-3 py-1 rounded-full text-[10px] font-black text-white text-center w-full ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
+            {r.status === '地點異常' ? '異常' : '成功'}
+          </div>
+          {r.status.includes('異常') && <span className="text-[10px] bg-red-100 text-red-600 px-1 rounded font-bold text-center w-full">地點異常</span>}
+      </div>
     </div>
-    <div className="text-xl font-mono font-black text-gray-800 tracking-tight">{r.time}</div>
-    <div className={`px-3 py-1 rounded-full text-[10px] font-black text-white ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
-      成功
-    </div>
-  </div>
-);
+  );
+};
 
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset }) => {
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
@@ -53,6 +65,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [cancelLeaveChallenge, setCancelLeaveChallenge] = useState<{id: number, q:string, a:number, opts:number[], type: 'leave' | 'ot'} | null>(null);
 
   // Filters
+  const [punchFilterStart, setPunchFilterStart] = useState('');
+  const [punchFilterEnd, setPunchFilterEnd] = useState('');
+
   const [historyFilterStart, setHistoryFilterStart] = useState('');
   const [historyFilterEnd, setHistoryFilterEnd] = useState('');
   const [historyFilterType, setHistoryFilterType] = useState('all');
@@ -79,6 +94,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     endTime: '20:00',
     reason: ''
   });
+
+  const watchIdRef = useRef<number | null>(null);
 
   // Auto-hide notification
   useEffect(() => {
@@ -111,39 +128,47 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return opts;
   }, []);
 
+  // Optimized Geolocation with watchPosition
   useEffect(() => {
-    const updateLoc = () => {
-      if (!navigator.geolocation) {
-        setGpsError("瀏覽器不支援定位");
-        return;
+    if (!navigator.geolocation) {
+      setGpsError("瀏覽器不支援定位");
+      return;
+    }
+
+    const successHandler = (pos: GeolocationPosition) => {
+      setGpsError('');
+      if (settings.companyLat && settings.companyLng) {
+        setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
+      } else {
+         setDistance(0);
       }
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setGpsError('');
-          if (settings.companyLat && settings.companyLng) {
-            setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
-          } else {
-             // If admin hasn't set coords yet, just set a dummy valid distance to allow testing or 0
-             setDistance(0);
-          }
-        }, 
-        (err) => {
-           console.warn("Location error:", err);
-           setGpsError("無法獲取位置資訊");
-           setDistance(null);
-        },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-      );
     };
-    updateLoc();
-    const timer = setInterval(updateLoc, 5000); // Check more frequently
-    return () => clearInterval(timer);
+
+    const errorHandler = (err: GeolocationPositionError) => {
+       console.warn("Location error:", err);
+       setGpsError("無法獲取位置資訊");
+       setDistance(null);
+    };
+
+    // Use watchPosition instead of setInterval to avoid repeated permission prompts
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      successHandler,
+      errorHandler,
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
+    );
+
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
   }, [settings]);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(TimeService.getCorrectedNow(timeOffset)), 1000);
     const data = StorageService.loadData();
-    setRecords(data.records.filter(r => r.userId === user.id));
+    const userRecords = data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id);
+    setRecords(userRecords);
     setHolidays(data.holidays);
     return () => clearInterval(timer);
   }, [timeOffset, user.id]);
@@ -159,31 +184,25 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return () => clearTimeout(timer);
   }, [punchMathChallenge]);
 
-  const todayStr = now.toISOString().split('T')[0];
-  const lastRecordToday = records.find(r => r.date === todayStr);
-  const currentPunchType = lastRecordToday?.type === 'in' ? 'out' : 'in';
+  const todayStr = TimeService.getTaiwanDate(now);
+  const currentTimeStr = TimeService.getTaiwanTime(now);
+  
+  const lastRecord = records.length > 0 ? records[0] : null;
+  const currentPunchType = lastRecord?.type === 'in' ? 'out' : 'in';
+  
   const isLocationReady = distance !== null;
   const inRange = isLocationReady && distance! <= settings.allowedRadius;
 
   const initiatePunch = () => {
-    // 1. Check if GPS is ready
     if (!isLocationReady) {
       setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
       return;
     }
 
-    // 2. Check Logic based on Punch Type
     if (currentPunchType === 'in') {
-        // Clock In: Must be strictly inside radius
         if (settings.companyLat && !inRange) {
            setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
            return;
-        }
-    } else {
-        // Clock Out: Warn if outside, but allow (will be flagged)
-        if (settings.companyLat && !inRange) {
-           // Optional: You could show a confirmation dialog here, but for now we proceed to math challenge
-           // The status will be marked in executePunch
         }
     }
 
@@ -202,10 +221,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     }
     setPunchMathChallenge(null);
 
-    // Determine Status
     let punchStatus = '正常';
     if (currentPunchType === 'out' && settings.companyLat && !inRange) {
-        punchStatus = '地點異常'; // Flag for Admin
+        punchStatus = '地點異常'; 
     }
 
     StorageService.addRecord({
@@ -213,13 +231,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       userId: user.id,
       userName: user.name,
       date: todayStr,
-      time: now.toTimeString().split(' ')[0],
+      time: currentTimeStr,
       type: currentPunchType,
       status: punchStatus,
       lat: 0, lng: 0, 
       dist: distance || 0
     });
-    setRecords(StorageService.loadData().records.filter(r => r.userId === user.id));
+    
+    const data = StorageService.loadData();
+    setRecords(data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id));
     
     if (punchStatus === '地點異常') {
         setNotification({ type: 'success', message: `下班打卡成功 (注意：您在打卡範圍外)` });
@@ -355,7 +375,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100">
                  <div className="text-brand-600 font-black text-lg md:text-2xl mb-1 md:mb-2">{TimeService.toROCDateString(now)}</div>
                  <div className="text-5xl md:text-7xl font-mono font-black tracking-tighter text-gray-800">
-                   {now.toLocaleTimeString('zh-TW', { hour12: false })}
+                   {currentTimeStr}
                  </div>
               </div>
 
@@ -433,7 +453,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                    <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                      <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-brand-800">填寫假單</h3>
                      
-                     {/* Quota Dashboard */}
                      <div className="mb-6 grid grid-cols-3 gap-2 md:gap-3">
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-blue-100 shadow-sm flex flex-col items-center text-center">
                             <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">特休假</div>
@@ -551,7 +570,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                 <div className="text-lg md:text-xl font-black text-brand-600 underline underline-offset-4 decoration-2">{recentLeave.hours} 小時</div>
                              </div>
                              <div className="text-xs md:text-sm text-gray-500 font-mono bg-gray-50 px-3 py-1 rounded-lg inline-block">
-                               {recentLeave.start} ~ {recentLeave.end}
+                               {TimeService.formatDateTime(recentLeave.start)} ~ {TimeService.formatDateTime(recentLeave.end)}
                              </div>
                              <div className="text-xs md:text-sm text-gray-600 border-l-4 border-gray-100 pl-4 py-1 italic">
                                事由：{recentLeave.reason || '無備註'}
@@ -562,7 +581,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                </div>
                              )}
                              <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
-                                <Clock size={12}/> 申請於：{recentLeave.created_at}
+                                <Clock size={12}/> 申請於：{TimeService.formatDateTime(recentLeave.created_at, true)}
                              </div>
                              {recentLeave.status === 'pending' && (
                                <button onClick={() => initiateCancelRequest(recentLeave.id, 'leave')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
@@ -672,7 +691,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                 {recentOT.hours} 小時
                              </div>
                              <div className="text-xs md:text-sm text-gray-500 font-mono bg-gray-50 px-3 py-1 rounded-lg inline-block">
-                               {recentOT.start} ~ {recentOT.end}
+                               {TimeService.formatDateTime(recentOT.start)} ~ {TimeService.formatDateTime(recentOT.end)}
                              </div>
                              <div className="text-xs md:text-sm text-gray-600 border-l-4 border-indigo-100 pl-4 py-1 italic">
                                事由：{recentOT.reason}
@@ -688,7 +707,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                </div>
                              )}
                              <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
-                                <Clock size={12}/> 申請於：{recentOT.created_at}
+                                <Clock size={12}/> 申請於：{TimeService.formatDateTime(recentOT.created_at, true)}
                              </div>
                              {recentOT.status === 'pending' && (
                                <button onClick={() => initiateCancelRequest(recentOT.id, 'ot')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
@@ -710,7 +729,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       </div>
 
-      {/* Mobile Bottom Navigation for Mode Switching */}
+      {/* Mobile Navigation */}
       <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40 pb-safe flex justify-around items-center h-16 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
          <button onClick={() => setMobileView('punch')} className={`flex flex-col items-center justify-center w-full h-full relative transition-all ${mobileView === 'punch' ? 'text-brand-600' : 'text-gray-400'}`}>
             <Zap size={24} className={mobileView === 'punch' ? 'fill-brand-100' : ''}/>
@@ -722,7 +741,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
          </button>
       </div>
 
-      {/* 打卡驗證彈窗 */}
+      {/* Modals */}
+      
+      {/* 1. Punch Math Challenge Modal */}
       {punchMathChallenge && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[1050] flex items-center justify-center p-4 md:p-6 text-black">
            <div className="bg-white rounded-[32px] md:rounded-[48px] p-8 md:p-12 w-full max-w-md shadow-2xl border-4 border-brand-500 animate-in bounce-in duration-500">
@@ -743,7 +764,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* 取消請假驗證彈窗 */}
+      {/* 2. Cancel Leave/OT Challenge Modal */}
       {cancelLeaveChallenge && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[1100] flex items-center justify-center p-4 md:p-6 text-black">
            <div className="bg-white rounded-[32px] md:rounded-[48px] p-8 md:p-12 w-full max-w-md shadow-2xl border-4 border-red-400 animate-in bounce-in duration-500">
@@ -756,7 +777,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               </div>
               <div className="grid grid-cols-3 gap-3 md:gap-4 mb-6 md:mb-10">
                 {cancelLeaveChallenge.opts.map((opt, idx) => (
-                  <button key={idx} onClick={() => executeCancelRequest(opt)} className="p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black text-red-500 hover:bg-red-500 hover:text-white transition-all shadow-md">{opt}</button>
+                  <button key={idx} onClick={() => executeCancelRequest(opt)} className="p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black text-red-600 hover:bg-red-600 hover:text-white transition-all shadow-md">{opt}</button>
                 ))}
               </div>
               <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>setCancelLeaveChallenge(null)}>保留申請</button>
@@ -764,180 +785,183 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* 歷史紀錄區間篩選 */}
+      {/* 3. Punch History Modal */}
       {showPunchHistory && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-[1050] flex items-center justify-center p-4 md:p-6 text-black">
-          <div className="bg-white rounded-[32px] md:rounded-[48px] w-full max-w-2xl h-[85vh] flex flex-col shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
-            <div className="p-6 md:p-8 border-b flex justify-between items-center bg-brand-50 text-brand-800">
-              <h3 className="text-xl md:text-2xl font-black">打卡歷史紀錄查詢</h3>
-              <button onClick={() => setShowPunchHistory(false)} className="hover:rotate-90 transition-all duration-300"><XCircle size={28} className="md:w-8 md:h-8"/></button>
-            </div>
-            <div className="p-6 border-b bg-gray-50 flex flex-col gap-4">
-               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                 <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 ml-2">起始日期</label>
-                    <input type="date" value={historyFilterStart} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setHistoryFilterStart(e.target.value)}/>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-md shadow-2xl font-bold flex flex-col max-h-[85vh]">
+              <div className="flex justify-between items-center mb-6">
+                 <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-gray-800"><Clock className="text-brand-500"/> 打卡歷史紀錄</h3>
+                 <button onClick={() => setShowPunchHistory(false)} className="p-2 bg-gray-100 rounded-full hover:bg-gray-200"><XCircle size={20}/></button>
+              </div>
+
+              {/* Filters for Punch History */}
+              <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
+                 <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件 (可查三個月內)</div>
+                 <div className="flex gap-2">
+                    <input type="date" value={punchFilterStart} onChange={e=>setPunchFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <span className="self-center text-gray-300">~</span>
+                    <input type="date" value={punchFilterEnd} onChange={e=>setPunchFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
                  </div>
-                 <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 ml-2">結束日期</label>
-                    <input type="date" value={historyFilterEnd} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setHistoryFilterEnd(e.target.value)}/>
+                 <div className="flex justify-end">
+                     <button onClick={()=>{setPunchFilterStart(''); setPunchFilterEnd('');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1"><RotateCcw size={10}/> 清除篩選</button>
                  </div>
-               </div>
-               <div className="flex gap-4">
-                 <button className="flex-1 py-4 bg-brand-600 text-white rounded-[20px] font-black flex items-center justify-center gap-2 shadow-xl hover:bg-brand-700 transition-all"><Search size={20}/> 執行篩選</button>
-                 <button onClick={()=>{setHistoryFilterStart(''); setHistoryFilterEnd('');}} className="px-6 md:px-8 py-4 bg-gray-200 text-gray-600 rounded-[20px] font-black flex items-center gap-2 hover:bg-gray-300 transition-all"><RotateCcw size={20}/> 重置</button>
-               </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-4 md:space-y-6 bg-gray-50/20">
-               {records.filter(r => {
-                 if (!historyFilterStart && !historyFilterEnd) return true;
-                 return (!historyFilterStart || r.date >= historyFilterStart) && (!historyFilterEnd || r.date <= historyFilterEnd);
-               }).map(r => <RecordItem key={r.id} r={r} />)}
-            </div>
-          </div>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
+                 {records
+                    .filter(r => {
+                       if (punchFilterStart && r.date < punchFilterStart) return false;
+                       if (punchFilterEnd && r.date > punchFilterEnd) return false;
+                       return true;
+                    })
+                    .map(r => (
+                    <div key={r.id} className="p-4 bg-gray-50 border rounded-2xl flex items-center justify-between">
+                       <div>
+                          <div className="text-xs font-black text-gray-400">{TimeService.getTaiwanDate(r.date)}</div>
+                          <div className={`text-sm font-black ${r.type==='in'?'text-brand-600':'text-red-600'}`}>{r.type==='in'?'上班':'下班'}</div>
+                       </div>
+                       <div className="flex-1 text-center text-xl font-mono font-black text-gray-800">
+                          {TimeService.formatTimeOnly(r.time, true)}
+                       </div>
+                       <div className="flex flex-col items-end gap-1 min-w-[60px]">
+                          <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
+                            {r.status === '地點異常' ? '異常' : '成功'}
+                          </div>
+                          {r.status.includes('異常') && <span className="text-[9px] text-red-500 font-bold">地點異常</span>}
+                       </div>
+                    </div>
+                 ))}
+                 {records.filter(r => {
+                       if (punchFilterStart && r.date < punchFilterStart) return false;
+                       if (punchFilterEnd && r.date > punchFilterEnd) return false;
+                       return true;
+                 }).length === 0 && <div className="text-center text-gray-400 py-10">無歷史紀錄</div>}
+              </div>
+           </div>
         </div>
       )}
 
-      {/* 請假歷史紀錄篩選 */}
+      {/* 4. Leave History Modal */}
       {showLeaveHistory && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-[1050] flex items-center justify-center p-4 md:p-6 text-black">
-          <div className="bg-white rounded-[32px] md:rounded-[48px] w-full max-w-3xl h-[85vh] flex flex-col shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
-            <div className="p-6 md:p-8 border-b flex justify-between items-center bg-indigo-50 text-indigo-800">
-              <h3 className="text-xl md:text-2xl font-black">個人請假申請紀錄</h3>
-              <button onClick={() => setShowLeaveHistory(false)} className="hover:rotate-90 transition-all duration-300"><XCircle size={28} className="md:w-8 md:h-8"/></button>
-            </div>
-            <div className="p-6 border-b bg-gray-50 flex flex-col gap-4">
-               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 ml-2">假別篩選</label>
-                    <select className="w-full p-4 bg-white border border-gray-200 rounded-2xl outline-none font-black" value={historyFilterType} onChange={e=>setHistoryFilterType(e.target.value)}>
-                        <option value="all">所有假別</option>
-                        {LEAVE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-                    </select>
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 ml-2">起始日期</label>
-                    <input type="date" value={historyFilterStart} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setHistoryFilterStart(e.target.value)}/>
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 ml-2">結束日期</label>
-                    <input type="date" value={historyFilterEnd} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setHistoryFilterEnd(e.target.value)}/>
-                  </div>
-               </div>
-               <div className="flex gap-4">
-                 <button className="flex-1 py-4 bg-indigo-600 text-white rounded-[20px] font-black flex items-center justify-center gap-2 shadow-xl hover:bg-indigo-700 transition-all"><Search size={20}/> 執行篩選</button>
-                 <button onClick={()=>{setHistoryFilterStart(''); setHistoryFilterEnd(''); setHistoryFilterType('all');}} className="px-6 md:px-8 py-4 bg-gray-200 text-gray-600 rounded-[20px] font-black flex items-center gap-2 hover:bg-gray-300 transition-all"><RotateCcw size={20}/> 重置</button>
-               </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-4 md:space-y-6 bg-gray-50/20">
-               {allLeaves.filter(l => {
-                 const leaveDate = l.start.split(' ')[0];
-                 const dateMatch = (!historyFilterStart || leaveDate >= historyFilterStart) && (!historyFilterEnd || leaveDate <= historyFilterEnd);
-                 const typeMatch = historyFilterType === 'all' || l.type === historyFilterType;
-                 return dateMatch && typeMatch;
-               }).map(l => (
-                 <div key={l.id} className="p-6 md:p-8 bg-white rounded-[32px] md:rounded-[40px] border-2 flex flex-col gap-4 shadow-sm relative overflow-hidden transition-all hover:border-indigo-100">
-                    <div className="flex justify-between items-start">
-                      <div className="space-y-3 flex-1">
-                        <div className="flex items-center gap-3">
-                           <div className="font-black text-xl md:text-2xl text-gray-800">{l.type}</div>
-                           <div className="text-lg md:text-xl font-black text-indigo-600 underline underline-offset-4 decoration-2">{l.hours} 小時</div>
-                        </div>
-                        <div className="text-xs md:text-sm text-gray-400 font-mono bg-gray-50 px-3 md:px-4 py-1 md:py-2 rounded-xl inline-block">
-                          {l.start} ~ {l.end}
-                        </div>
-                        <div className="text-xs md:text-sm text-gray-600 border-l-4 border-indigo-100 pl-4 py-1">事由：{l.reason || '無備註'}</div>
-                        {l.status === 'rejected' && l.rejectReason && (
-                           <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1">
-                             審核不通過原因：{l.rejectReason}
-                           </div>
-                        )}
-                        <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
-                           <Clock size={12}/> 申請於：{l.created_at}
-                        </div>
-                        {l.status === 'pending' && (
-                          <button onClick={() => initiateCancelRequest(l.id, 'leave')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
-                             <XCircle size={14}/> 取消此申請
-                          </button>
-                        )}
-                      </div>
-                      <span className={`px-3 py-1 md:px-5 md:py-2 rounded-full text-[10px] md:text-xs font-black shadow-sm ${getLeaveStatusStyle(l.status)}`}>
-                        {getLeaveStatusText(l.status)}
-                      </span>
-                    </div>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
+              <div className="flex justify-between items-center mb-6">
+                 <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-gray-800"><Calendar className="text-brand-500"/> 請假歷史紀錄</h3>
+                 <button onClick={() => setShowLeaveHistory(false)} className="p-2 bg-gray-100 rounded-full hover:bg-gray-200"><XCircle size={20}/></button>
+              </div>
+
+              {/* Filters */}
+              <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
+                 <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件</div>
+                 <div className="flex gap-2">
+                    <input type="date" value={historyFilterStart} onChange={e=>setHistoryFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <span className="self-center text-gray-300">~</span>
+                    <input type="date" value={historyFilterEnd} onChange={e=>setHistoryFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
                  </div>
-               ))}
-               {allLeaves.length === 0 && <div className="p-20 text-center text-gray-400 italic font-black">目前無請假紀錄</div>}
-            </div>
-          </div>
+                 <div className="flex gap-2">
+                    <select 
+                      value={historyFilterType} 
+                      onChange={(e) => setHistoryFilterType(e.target.value)}
+                      className="w-full p-2 rounded-lg text-xs border outline-none font-black bg-white"
+                    >
+                      <option value="all">全部假別</option>
+                      {LEAVE_TYPES.map(t => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                    <button onClick={()=>{setHistoryFilterStart(''); setHistoryFilterEnd(''); setHistoryFilterType('all');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1 whitespace-nowrap"><RotateCcw size={10}/> 清除</button>
+                 </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
+                 {allLeaves
+                    .filter(l => {
+                        if (historyFilterType !== 'all' && l.type !== historyFilterType) return false;
+                        if (historyFilterStart && l.start < historyFilterStart) return false;
+                        if (historyFilterEnd && l.start > historyFilterEnd) return false;
+                        return true;
+                    })
+                    .sort((a, b) => b.id - a.id)
+                    .map(l => (
+                    <div key={l.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
+                       <div className="flex justify-between items-start">
+                          <div>
+                             <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(l.status)}`}>{getLeaveStatusText(l.status)}</span>
+                             <div className="text-lg font-black text-brand-600 mt-1">{l.type} <span className="text-black text-sm">({l.hours}hr)</span></div>
+                          </div>
+                          {l.status === 'pending' && (
+                             <button onClick={() => initiateCancelRequest(l.id, 'leave')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
+                          )}
+                       </div>
+                       <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
+                          {TimeService.formatDateTime(l.start)} ~ <br/>{TimeService.formatDateTime(l.end)}
+                       </div>
+                       {l.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{l.reason}</div>}
+                       {l.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{l.rejectReason}</div>}
+                       <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
+                          申請時間：{TimeService.formatDateTime(l.created_at, true)}
+                       </div>
+                    </div>
+                 ))}
+                 {allLeaves.length === 0 && <div className="text-center text-gray-400 py-10">無請假紀錄</div>}
+              </div>
+           </div>
         </div>
       )}
 
-      {/* 加班歷史紀錄篩選 */}
+      {/* 5. Overtime History Modal */}
       {showOTHistory && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-[1050] flex items-center justify-center p-4 md:p-6 text-black">
-          <div className="bg-white rounded-[32px] md:rounded-[48px] w-full max-w-3xl h-[85vh] flex flex-col shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
-            <div className="p-6 md:p-8 border-b flex justify-between items-center bg-indigo-50 text-indigo-800">
-              <h3 className="text-xl md:text-2xl font-black">個人加班申請紀錄</h3>
-              <button onClick={() => setShowOTHistory(false)} className="hover:rotate-90 transition-all duration-300"><XCircle size={28} className="md:w-8 md:h-8"/></button>
-            </div>
-            <div className="p-6 border-b bg-gray-50 flex flex-col gap-4">
-               <div className="space-y-1">
-                  <label className="text-[10px] font-black text-gray-400 ml-2">加班日期區間</label>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <input type="date" value={otFilterStart} className="p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setOtFilterStart(e.target.value)}/>
-                    <input type="date" value={otFilterEnd} className="p-4 bg-black text-white border-2 border-gray-100 rounded-2xl outline-none shadow-lg font-black" onChange={e => setOtFilterEnd(e.target.value)}/>
-                  </div>
-               </div>
-               <div className="flex gap-4">
-                 <button className="flex-1 py-4 bg-indigo-600 text-white rounded-[20px] font-black flex items-center justify-center gap-2 shadow-xl hover:bg-indigo-700 transition-all"><Search size={20}/> 執行篩選</button>
-                 <button onClick={()=>{setOtFilterStart(''); setOtFilterEnd('');}} className="px-6 md:px-8 py-4 bg-gray-200 text-gray-600 rounded-[20px] font-black flex items-center gap-2 hover:bg-gray-300 transition-all"><RotateCcw size={20}/> 重置</button>
-               </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-4 md:space-y-6 bg-gray-50/20">
-               {allOvertime.filter(o => {
-                 const otDate = o.start.split(' ')[0];
-                 if (!otFilterStart && !otFilterEnd) return true;
-                 return (!otFilterStart || otDate >= otFilterStart) && (!otFilterEnd || otDate <= otFilterEnd);
-               }).map(o => (
-                 <div key={o.id} className="p-6 md:p-8 bg-white rounded-[32px] md:rounded-[40px] border-2 flex flex-col gap-4 shadow-sm relative overflow-hidden transition-all hover:border-indigo-100">
-                    <div className="flex justify-between items-start">
-                      <div className="space-y-3 flex-1">
-                        <div className="text-lg md:text-xl font-black text-indigo-600 underline underline-offset-4 decoration-2">
-                           {o.hours} 小時
-                        </div>
-                        <div className="text-xs md:text-sm text-gray-400 font-mono bg-gray-50 px-3 md:px-4 py-1 md:py-2 rounded-xl inline-block">
-                          {o.start} ~ {o.end}
-                        </div>
-                        <div className="text-xs md:text-sm text-gray-600 border-l-4 border-indigo-100 pl-4 py-1">事由：{o.reason}</div>
-                        {o.status === 'rejected' && o.rejectReason && (
-                           <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1">
-                             審核不通過原因：{o.rejectReason}
-                           </div>
-                        )}
-                        {o.adminNote && (
-                           <div className="text-xs md:text-sm text-brand-600 font-bold border-l-4 border-brand-200 pl-4 py-1">
-                             管理員修改備註：{o.adminNote}
-                           </div>
-                        )}
-                        <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
-                           <Clock size={12}/> 申請於：{o.created_at}
-                        </div>
-                        {o.status === 'pending' && (
-                          <button onClick={() => initiateCancelRequest(o.id, 'ot')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
-                             <XCircle size={14}/> 取消此申請
-                          </button>
-                        )}
-                      </div>
-                      <span className={`px-3 py-1 md:px-5 md:py-2 rounded-full text-[10px] md:text-xs font-black shadow-sm ${getLeaveStatusStyle(o.status)}`}>
-                        {getLeaveStatusText(o.status)}
-                      </span>
-                    </div>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
+              <div className="flex justify-between items-center mb-6">
+                 <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-gray-800"><BadgeCheck className="text-indigo-500"/> 加班歷史紀錄</h3>
+                 <button onClick={() => setShowOTHistory(false)} className="p-2 bg-gray-100 rounded-full hover:bg-gray-200"><XCircle size={20}/></button>
+              </div>
+
+              {/* Filters */}
+              <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
+                 <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件</div>
+                 <div className="flex gap-2">
+                    <input type="date" value={otFilterStart} onChange={e=>setOtFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <span className="self-center text-gray-300">~</span>
+                    <input type="date" value={otFilterEnd} onChange={e=>setOtFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
+                    <button onClick={()=>{setOtFilterStart(''); setOtFilterEnd('');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1 whitespace-nowrap"><RotateCcw size={10}/> 清除</button>
                  </div>
-               ))}
-               {allOvertime.length === 0 && <div className="p-20 text-center text-gray-400 italic font-black">目前無加班紀錄</div>}
-            </div>
-          </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
+                 {allOvertime
+                    .filter(o => {
+                        if (otFilterStart && o.start < otFilterStart) return false;
+                        if (otFilterEnd && o.start > otFilterEnd) return false;
+                        return true;
+                    })
+                    .sort((a, b) => b.id - a.id)
+                    .map(o => (
+                    <div key={o.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
+                       <div className="flex justify-between items-start">
+                          <div>
+                             <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(o.status)}`}>{getLeaveStatusText(o.status)}</span>
+                             <div className="text-lg font-black text-indigo-600 mt-1">加班 <span className="text-black text-sm">({o.hours}hr)</span></div>
+                          </div>
+                          {o.status === 'pending' && (
+                             <button onClick={() => initiateCancelRequest(o.id, 'ot')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
+                          )}
+                       </div>
+                       <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
+                          {TimeService.formatDateTime(o.start)} ~ <br/>{TimeService.formatDateTime(o.end)}
+                       </div>
+                       {o.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{o.reason}</div>}
+                       {o.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{o.rejectReason}</div>}
+                       {o.adminNote && <div className="text-xs text-brand-600 pl-2 border-l-2 border-brand-200">管理員備註：{o.adminNote}</div>}
+                       <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
+                          申請時間：{TimeService.formatDateTime(o.created_at, true)}
+                       </div>
+                    </div>
+                 ))}
+                 {allOvertime.length === 0 && <div className="text-center text-gray-400 py-10">無加班紀錄</div>}
+              </div>
+           </div>
         </div>
       )}
     </div>
