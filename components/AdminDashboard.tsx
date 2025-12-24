@@ -386,6 +386,13 @@ export const AdminDashboard: React.FC = () => {
             } else if (!alertMsg) {
                 statusColor = "text-gray-600";
             }
+
+            // check location mismatch
+            if (lastOut.status === '地點異常' || (data.settings.companyLat && lastOut.dist > data.settings.allowedRadius)) {
+               alertMsg = alertMsg ? `${alertMsg} / 下班地點異常` : "下班地點異常";
+               statusColor = "text-red-600 font-black border border-red-500 bg-red-50 px-2 py-0.5 rounded";
+            }
+
         } else {
             status = "上班中";
             const nowH = new Date().getHours();
@@ -540,7 +547,9 @@ export const AdminDashboard: React.FC = () => {
                                  <td className="p-4 md:p-6 text-gray-500">{u.dept}</td>
                                  <td className="p-4 md:p-6 font-mono">{status.inTime}</td>
                                  <td className="p-4 md:p-6 font-mono">{status.outTime}</td>
-                                 <td className={`p-4 md:p-6 ${status.statusColor}`}>{status.status}</td>
+                                 <td className={`p-4 md:p-6`}>
+                                   <span className={status.statusColor}>{status.status}</span>
+                                 </td>
                                  <td className="p-4 md:p-6 text-right flex justify-end gap-2">
                                     {!showArchived ? (
                                       <>
@@ -565,8 +574,9 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* Leaves Review View */}
+          {/* ... (Other views remain the same until holiday) ... */}
           {activeView === 'leaves' && (
+             // Content of leaves view (unchanged from previous file content provided in context, keeping placeholder to save token space if desired, but providing full content for correctness)
             <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-brand-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核假單</h3>
@@ -655,9 +665,9 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* OT Review View */}
           {activeView === 'ot' && (
-            <div className="space-y-8 md:space-y-12">
+              // Content of OT view
+              <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-indigo-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核加班</h3>
                   <div className="flex flex-wrap gap-2 items-center w-full md:w-auto">
@@ -747,6 +757,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'news' && (
+            // Content of News (unchanged)
             <div className="max-w-4xl space-y-8 md:space-y-12">
                <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                   <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8">{editAnnId ? '編輯公告' : '發布公告'}</h3>
@@ -818,6 +829,8 @@ export const AdminDashboard: React.FC = () => {
                       const dateInput = e.currentTarget.elements.namedItem('hdate') as HTMLInputElement;
                       const noteInput = e.currentTarget.elements.namedItem('hnote') as HTMLInputElement;
                       if (!noteInput.value.trim()) return showToast("請填寫假期備註", "error");
+                      
+                      // Explicitly take just the value string (YYYY-MM-DD)
                       StorageService.addHoliday({ id: Date.now(), date: dateInput.value, note: noteInput.value });
                       refreshData();
                       showToast("假期已成功加入系統", 'success');
@@ -856,6 +869,7 @@ export const AdminDashboard: React.FC = () => {
                        .map(h => (
                        <div key={h.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl border flex items-center justify-between">
                           <div className="flex items-center gap-4 md:gap-6">
+                             {/* Display simple date string only */}
                              <div className="font-mono text-lg md:text-2xl font-black text-gray-800 tracking-wider">{h.date}</div>
                              <div className="font-bold text-gray-600 text-sm md:text-base">{h.note}</div>
                           </div>
@@ -871,6 +885,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'system' && (
+            // Content of system view (unchanged)
              <div className="max-w-2xl bg-white p-6 md:p-12 rounded-[40px] md:rounded-[56px] shadow-2xl border animate-in zoom-in-95 duration-500">
                 <h3 className="text-2xl md:text-3xl font-black mb-8 md:mb-12 flex items-center gap-4 text-gray-800"><Settings className="text-brand-600" size={32}/> 核心參數設定</h3>
                 <form className="space-y-6 md:space-y-10" onSubmit={(e) => {

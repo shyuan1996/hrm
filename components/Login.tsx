@@ -4,6 +4,7 @@ import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
 import { Button } from './ui/Button';
 import { Building2, AlertTriangle, Megaphone, CloudDownload, RefreshCw } from 'lucide-react';
+import { DEFAULT_SETTINGS } from '../constants';
 
 interface LoginProps {
   onLogin: (user: User) => void;
@@ -29,11 +30,14 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                 setAnnouncements(cloudData.announcements);
                 setSyncStatus('success');
             } else {
-                // If no cloud data (or no URL), load local
+                // If no cloud data, load local
                 setAnnouncements(StorageService.loadData().announcements);
-                // If no URL configured, it's not strictly an error, just idle
-                const settings = StorageService.loadData().settings;
-                setSyncStatus(settings.gasUrl ? 'error' : 'idle');
+                
+                // Check if we have a valid URL in settings OR defaults
+                const currentSettings = StorageService.loadData().settings;
+                const hasUrl = currentSettings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
+                
+                setSyncStatus(hasUrl ? 'error' : 'idle');
             }
         } catch (e) {
             console.error(e);
@@ -67,8 +71,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
       // Normalize input: trim whitespace and lowercase
       const normalizedInput = username.trim().toLowerCase();
       
+      // Fix: Ensure comparison handles both string and number types from backend
+      // Google Sheets often returns numeric IDs/Passwords as numbers, causing strict equality checks to fail
       const user = data.users.find(u => 
-        u.id && u.id.toLowerCase() === normalizedInput && u.pass === password
+        u.id && String(u.id).trim().toLowerCase() === normalizedInput && String(u.pass) === password
       );
       
       if (user) {
@@ -121,7 +127,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-5 md:space-y-6">
-            <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號 (例如: user)" />
+            <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號" />
             <input type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="密碼" />
             <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
               <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />

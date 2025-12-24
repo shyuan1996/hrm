@@ -5,7 +5,7 @@ import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -18,7 +18,10 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => (
   <div className="p-4 bg-white border-2 rounded-[24px] shadow-sm transition-all hover:shadow-md flex items-center justify-between">
     <div className="flex flex-col">
        <div className={`text-sm font-black ${r.type === 'in' ? 'text-brand-600' : 'text-red-600'}`}>{r.date}</div>
-       <div className="text-xs text-gray-400 font-black">{r.type === 'in' ? '上班' : '下班'}打卡</div>
+       <div className="flex items-center gap-2">
+         <div className="text-xs text-gray-400 font-black">{r.type === 'in' ? '上班' : '下班'}打卡</div>
+         {r.status.includes('異常') && <span className="text-[10px] bg-red-100 text-red-600 px-1 rounded font-bold">地點異常</span>}
+       </div>
     </div>
     <div className="text-xl font-mono font-black text-gray-800 tracking-tight">{r.time}</div>
     <div className={`px-3 py-1 rounded-full text-[10px] font-black text-white ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
@@ -30,10 +33,11 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => (
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset }) => {
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
+  const [gpsError, setGpsError] = useState<string>('');
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [holidays, setHolidays] = useState<Holiday[]>([]);
   
-  // Mobile View State: 'punch' (Left Col) or 'apply' (Right Col)
+  // Mobile View State
   const [mobileView, setMobileView] = useState<'punch' | 'apply'>('punch');
 
   // Custom Notification
@@ -109,16 +113,30 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   useEffect(() => {
     const updateLoc = () => {
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition((pos) => {
+      if (!navigator.geolocation) {
+        setGpsError("瀏覽器不支援定位");
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setGpsError('');
           if (settings.companyLat && settings.companyLng) {
             setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
+          } else {
+             // If admin hasn't set coords yet, just set a dummy valid distance to allow testing or 0
+             setDistance(0);
           }
-        }, (err) => console.warn("Location error:", err));
-      }
+        }, 
+        (err) => {
+           console.warn("Location error:", err);
+           setGpsError("無法獲取位置資訊");
+           setDistance(null);
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
     };
     updateLoc();
-    const timer = setInterval(updateLoc, 10000); 
+    const timer = setInterval(updateLoc, 5000); // Check more frequently
     return () => clearInterval(timer);
   }, [settings]);
 
@@ -144,13 +162,31 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const todayStr = now.toISOString().split('T')[0];
   const lastRecordToday = records.find(r => r.date === todayStr);
   const currentPunchType = lastRecordToday?.type === 'in' ? 'out' : 'in';
-  const inRange = distance !== null && distance <= settings.allowedRadius;
+  const isLocationReady = distance !== null;
+  const inRange = isLocationReady && distance! <= settings.allowedRadius;
 
   const initiatePunch = () => {
-    if (settings.companyLat && !inRange) {
-      setNotification({ type: 'error', message: `距離過遠無法打卡 (目前距離：${distance?.toFixed(0)}m)` });
+    // 1. Check if GPS is ready
+    if (!isLocationReady) {
+      setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
       return;
     }
+
+    // 2. Check Logic based on Punch Type
+    if (currentPunchType === 'in') {
+        // Clock In: Must be strictly inside radius
+        if (settings.companyLat && !inRange) {
+           setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
+           return;
+        }
+    } else {
+        // Clock Out: Warn if outside, but allow (will be flagged)
+        if (settings.companyLat && !inRange) {
+           // Optional: You could show a confirmation dialog here, but for now we proceed to math challenge
+           // The status will be marked in executePunch
+        }
+    }
+
     const n1 = Math.floor(Math.random() * 9) + 1;
     const n2 = Math.floor(Math.random() * 9) + 1;
     const ans = n1 + n2;
@@ -165,6 +201,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       return;
     }
     setPunchMathChallenge(null);
+
+    // Determine Status
+    let punchStatus = '正常';
+    if (currentPunchType === 'out' && settings.companyLat && !inRange) {
+        punchStatus = '地點異常'; // Flag for Admin
+    }
+
     StorageService.addRecord({
       id: Date.now(),
       userId: user.id,
@@ -172,11 +215,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       date: todayStr,
       time: now.toTimeString().split(' ')[0],
       type: currentPunchType,
-      status: '正常',
-      lat: 0, lng: 0, dist: distance || 0
+      status: punchStatus,
+      lat: 0, lng: 0, 
+      dist: distance || 0
     });
     setRecords(StorageService.loadData().records.filter(r => r.userId === user.id));
-    setNotification({ type: 'success', message: `${currentPunchType === 'in' ? '上班' : '下班'}打卡成功！` });
+    
+    if (punchStatus === '地點異常') {
+        setNotification({ type: 'success', message: `下班打卡成功 (注意：您在打卡範圍外)` });
+    } else {
+        setNotification({ type: 'success', message: `${currentPunchType === 'in' ? '上班' : '下班'}打卡成功！` });
+    }
   };
 
   const allLeaves = StorageService.loadData().leaves.filter(l => l.userId === user.id);
@@ -297,7 +346,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* Main Content Area - Split View on Desktop, Switched View on Mobile */}
+      {/* Main Content Area */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden p-4 md:p-8 gap-4 md:gap-8 items-stretch relative mb-16 md:mb-0">
         
         {/* Punch Section (Left) */}
@@ -313,21 +362,40 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="flex flex-col items-center w-full max-w-sm">
                 <Button 
                   variant="tech-circle" 
-                  onClick={initiatePunch} 
-                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
+                  onClick={initiatePunch}
+                  disabled={!isLocationReady}
+                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${!isLocationReady ? 'from-gray-400 to-gray-500 grayscale opacity-80' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
                 >
-                  <Zap size={48} className="text-white fill-white animate-pulse mb-2 md:mb-4 md:w-16 md:h-16" />
-                  <span className="text-3xl md:text-5xl font-black tracking-widest text-white">
-                    {currentPunchType === 'in' ? '上班' : '下班'}
-                  </span>
+                  {!isLocationReady ? (
+                     <div className="flex flex-col items-center">
+                       <Loader2 size={40} className="animate-spin text-white mb-2" />
+                       <span className="text-xl md:text-2xl font-black text-white">定位中...</span>
+                     </div>
+                  ) : (
+                     <>
+                        <Zap size={48} className="text-white fill-white animate-pulse mb-2 md:mb-4 md:w-16 md:h-16" />
+                        <span className="text-3xl md:text-5xl font-black tracking-widest text-white">
+                            {currentPunchType === 'in' ? '上班' : '下班'}
+                        </span>
+                     </>
+                  )}
                 </Button>
                 
-                <div className={`w-full py-3 md:py-4 px-4 md:px-6 rounded-2xl font-black flex items-center justify-center gap-2 md:gap-3 shadow-md transition-all text-sm md:text-xl ${settings.companyLat ? (inRange ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700') : 'bg-gray-100 text-gray-400'}`}>
-                   <MapPin size={20} className="md:w-6 md:h-6" />
-                   {settings.companyLat ? (
+                <div className={`w-full py-3 md:py-4 px-4 md:px-6 rounded-2xl font-black flex items-center justify-center gap-2 md:gap-3 shadow-md transition-all text-sm md:text-xl ${
+                    gpsError ? 'bg-red-100 text-red-600' :
+                    !isLocationReady ? 'bg-gray-100 text-gray-400' : 
+                    settings.companyLat ? (inRange ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700') : 
+                    'bg-gray-100 text-gray-400'
+                }`}>
+                   <MapPin size={20} className={`md:w-6 md:h-6 ${!isLocationReady && !gpsError ? 'animate-bounce' : ''}`} />
+                   {gpsError ? (
+                     <span>{gpsError}</span>
+                   ) : !isLocationReady ? (
+                     <span className="animate-pulse">正在獲取位置...</span>
+                   ) : settings.companyLat ? (
                      <span>距離：{distance?.toFixed(1) || '--'} m ({inRange ? '範圍內' : '範圍外'})</span>
                    ) : (
-                     <span className="animate-pulse">管理員尚未設定座標</span>
+                     <span>管理員尚未設定座標 (不限距離)</span>
                    )}
                 </div>
               </div>

@@ -27,8 +27,7 @@ export const StorageService = {
   loadData: (): AppData => {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (!stored) {
-      const init = getInitialData();
-      return init;
+      return getInitialData();
     }
     try {
       const parsed = JSON.parse(stored);
@@ -36,9 +35,15 @@ export const StorageService = {
       const data = { ...getInitialData(), ...parsed };
       
       // SAFETY NET: If for some reason (bad sync/corruption) users are empty, restore defaults
-      // This prevents the "cannot log in" issue if cloud overwrites with empty list
       if (!data.users || data.users.length === 0) {
           data.users = [INITIAL_ADMIN as User, DEFAULT_EMPLOYEE as User];
+      }
+      
+      // Ensure settings exist and fallback to defaults if URL is missing
+      if (!data.settings) {
+          data.settings = DEFAULT_SETTINGS;
+      } else if (!data.settings.gasUrl) {
+          data.settings.gasUrl = DEFAULT_SETTINGS.gasUrl;
       }
       
       return data;
@@ -53,7 +58,8 @@ export const StorageService = {
    */
   fetchCloudData: async (): Promise<AppData | null> => {
     const localData = StorageService.loadData();
-    const gasUrl = localData.settings?.gasUrl;
+    // 使用本地設定的 URL，如果沒有則使用預設常數，確保第一次載入能連線
+    const gasUrl = localData.settings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
 
     if (!gasUrl) {
       console.warn("No GAS URL configured, skipping cloud fetch.");
@@ -61,20 +67,27 @@ export const StorageService = {
     }
 
     try {
-      // 假設 GAS 部署為 Web App，GET 請求會回傳 JSON 資料
       const response = await fetch(gasUrl);
       if (!response.ok) throw new Error('Cloud fetch failed');
       
       const cloudData = await response.json();
       
-      // 驗證回傳的資料結構是否包含必要的欄位，簡單驗證
-      if (cloudData && Array.isArray(cloudData.users)) {
-        // Prevent overwriting local with empty user list from cloud if cloud is fresh/empty
-        if (cloudData.users.length === 0) {
-             cloudData.users = [INITIAL_ADMIN as User, DEFAULT_EMPLOYEE as User];
+      // 驗證回傳的資料結構
+      if (cloudData && typeof cloudData === 'object') {
+        // 如果雲端回傳的是空的或者使用者列表為空 (新建立的Sheet)
+        if (!cloudData.users || !Array.isArray(cloudData.users) || cloudData.users.length === 0) {
+             console.log("Cloud seems empty. Initializing with default data...");
+             // 保持原本的資料結構，不被空資料覆蓋，但標記為同步成功
+             // 如果是全新部屬，可以考慮將本地初始資料推送到雲端
+             const initData = getInitialData();
+             // 保留設定
+             if (localData.settings) initData.settings = localData.settings;
+             
+             await StorageService.saveData(initData);
+             return initData;
         }
 
-        // 更新本地儲存，確保它是最新的
+        // 更新本地儲存
         localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
         return cloudData as AppData;
       }
@@ -89,14 +102,14 @@ export const StorageService = {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 
     // 2. Push to Cloud
-    if (data.settings.gasUrl) {
+    // 優先使用資料內的設定，若無則使用預設
+    const gasUrl = data.settings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
+
+    if (gasUrl) {
       try {
-        // 使用 no-cors 模式或是標準 cors，視 GAS 設定而定
-        // 通常 GAS 需要正確設定回傳 headers 才能用標準 cors
-        // 這裡為了簡單起見，發送 POST 請求
-        await fetch(data.settings.gasUrl, {
+        await fetch(gasUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // GAS 有時對 application/json 處理較嚴格，text/plain 較穩
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify(data)
         });
       } catch (err) {
@@ -230,8 +243,8 @@ export const StorageService = {
   addAnnouncement: (ann: Announcement) => {
     const data = StorageService.loadData();
     const idx = data.announcements.findIndex(a => a.id === ann.id);
-    if (idx !== -1) data.announcements[idx] = ann; // Edit
-    else data.announcements.unshift(ann); // Add
+    if (idx !== -1) data.announcements[idx] = ann;
+    else data.announcements.unshift(ann);
     StorageService.saveData(data);
   },
 
@@ -244,28 +257,22 @@ export const StorageService = {
   addHoliday: (h: Holiday) => {
     const data = StorageService.loadData();
     data.holidays.push(h);
-    
-    // Recalculate hours for ALL leaves (pending, approved, etc.)
     data.leaves.forEach(leave => {
         if (leave.status !== 'cancelled' && leave.status !== 'rejected') {
             leave.hours = TimeService.calculateLeaveHours(leave.start, leave.end, data.holidays);
         }
     });
-
     StorageService.saveData(data);
   },
 
   removeHoliday: (id: number) => {
     const data = StorageService.loadData();
     data.holidays = data.holidays.filter(h => h.id !== id);
-
-    // Recalculate hours for ALL leaves
     data.leaves.forEach(leave => {
         if (leave.status !== 'cancelled' && leave.status !== 'rejected') {
             leave.hours = TimeService.calculateLeaveHours(leave.start, leave.end, data.holidays);
         }
     });
-
     StorageService.saveData(data);
   }
 };

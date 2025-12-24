@@ -18,17 +18,30 @@ const App: React.FC = () => {
   const [newSelfPwd, setNewSelfPwd] = useState({ p1: '', p2: '' });
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  // Initial Load
   useEffect(() => {
+    const init = async () => {
+      await StorageService.fetchCloudData();
+      loadSettings(); // Extract settings loading
+      
+      TimeService.getNetworkTimeOffset().then(offset => setTimeOffset(offset));
+      
+      const savedSession = localStorage.getItem(SESSION_KEY);
+      if (savedSession) {
+        const data = StorageService.loadData();
+        const parsed = JSON.parse(savedSession);
+        const user = data.users.find(u => u.id === parsed.id);
+        if (user && !user.deleted) setCurrentUser(user);
+      }
+    };
+    init();
+  }, []);
+
+  // Helper to refresh settings from local storage
+  const loadSettings = () => {
     const data = StorageService.loadData();
     setAppSettings(data.settings);
-    TimeService.getNetworkTimeOffset().then(offset => setTimeOffset(offset));
-    const savedSession = localStorage.getItem(SESSION_KEY);
-    if (savedSession) {
-      const parsed = JSON.parse(savedSession);
-      const user = data.users.find(u => u.id === parsed.id);
-      if (user && !user.deleted) setCurrentUser(user);
-    }
-  }, []);
+  };
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setNotification({ type, message });
@@ -47,6 +60,13 @@ const App: React.FC = () => {
     showNotification("您的密碼已成功修改！", 'success');
   };
 
+  // Wrapper for Login to ensure settings are fresh when switching users
+  const handleLogin = (u: User) => {
+    loadSettings(); // Force reload settings on login
+    setCurrentUser(u);
+    localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role}));
+  };
+
   if (!appSettings) return null;
 
   return (
@@ -61,18 +81,18 @@ const App: React.FC = () => {
 
       {currentUser && (
          <header className="bg-white border-b px-4 md:px-8 py-3 flex justify-between items-center z-50 shadow-sm flex-shrink-0 relative">
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 min-w-0">
                <div className="w-10 h-10 rounded-xl bg-brand-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">
                   {currentUser.name[0]}
                </div>
-               <div className="flex flex-col justify-center">
-                 <div className="text-sm font-black text-gray-800 leading-tight">{currentUser.name}</div>
-                 <div className="text-[10px] text-gray-500 font-bold uppercase flex items-center gap-1 mt-0.5">
-                    <UserCircle size={12} /> {currentUser.id}
+               <div className="flex flex-col justify-center min-w-0">
+                 <div className="text-sm font-black text-gray-800 leading-tight truncate">{currentUser.name}</div>
+                 <div className="text-[10px] text-gray-500 font-bold uppercase flex items-center gap-1 mt-0.5 truncate">
+                    <UserCircle size={12} className="flex-shrink-0" /> {currentUser.id}
                  </div>
                </div>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-shrink-0">
               <button onClick={() => setIsSelfPwdModalOpen(true)} className="flex items-center gap-1 md:gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-gray-500 hover:bg-gray-100 rounded-xl transition-all">
                 <Key size={16}/> <span className="hidden md:inline">更改密碼</span>
               </button>
@@ -85,7 +105,7 @@ const App: React.FC = () => {
 
       <div className="flex-1 overflow-hidden relative">
         {!currentUser ? (
-          <Login onLogin={(u) => { setCurrentUser(u); localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role})); }} />
+          <Login onLogin={handleLogin} />
         ) : currentUser.role === 'admin' ? (
           <AdminDashboard />
         ) : (
