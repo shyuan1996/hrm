@@ -14,21 +14,48 @@ const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [timeOffset, setTimeOffset] = useState(0);
+  const [isTimeSynced, setIsTimeSynced] = useState(false); // 狀態：是否已完成時間校正
   const [isSelfPwdModalOpen, setIsSelfPwdModalOpen] = useState(false);
   const [newSelfPwd, setNewSelfPwd] = useState({ p1: '', p2: '' });
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // Initial Load
+  // 獨立的時間校正函式，支援失敗重試
+  const performTimeSync = async () => {
+    setIsTimeSynced(false);
+    const offset = await TimeService.getNetworkTimeOffset();
+    if (offset !== null) {
+      setTimeOffset(offset);
+      setIsTimeSynced(true);
+    } else {
+      // 若失敗，保持 isTimeSynced = false，Dashboard 會顯示校正中
+      // 可以選擇在這裡做自動重試，或者依賴使用者重新操作
+      console.warn("時間校正失敗，請檢查網路連線");
+      // 簡單重試機制 (3秒後重試一次)
+      setTimeout(async () => {
+         const retryOffset = await TimeService.getNetworkTimeOffset();
+         if (retryOffset !== null) {
+            setTimeOffset(retryOffset);
+            setIsTimeSynced(true);
+         }
+      }, 3000);
+    }
+  };
+
   useEffect(() => {
+    // Initialize data logic
     const init = async () => {
+      // Try to get fresh cloud data first
       await StorageService.fetchCloudData();
-      loadSettings(); // Extract settings loading
       
-      TimeService.getNetworkTimeOffset().then(offset => setTimeOffset(offset));
+      // Load whatever we have (local or freshly fetched)
+      const data = StorageService.loadData();
+      setAppSettings(data.settings);
+      
+      // Initial time sync
+      performTimeSync();
       
       const savedSession = localStorage.getItem(SESSION_KEY);
       if (savedSession) {
-        const data = StorageService.loadData();
         const parsed = JSON.parse(savedSession);
         const user = data.users.find(u => u.id === parsed.id);
         if (user && !user.deleted) setCurrentUser(user);
@@ -36,12 +63,6 @@ const App: React.FC = () => {
     };
     init();
   }, []);
-
-  // Helper to refresh settings from local storage
-  const loadSettings = () => {
-    const data = StorageService.loadData();
-    setAppSettings(data.settings);
-  };
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setNotification({ type, message });
@@ -60,9 +81,14 @@ const App: React.FC = () => {
     showNotification("您的密碼已成功修改！", 'success');
   };
 
-  // Wrapper for Login to ensure settings are fresh when switching users
   const handleLogin = (u: User) => {
-    loadSettings(); // Force reload settings on login
+    // Force reload settings on login
+    const data = StorageService.loadData();
+    setAppSettings(data.settings);
+    
+    // 安全機制：登入時強制重置同步狀態，並重新校正時間
+    performTimeSync();
+
     setCurrentUser(u);
     localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role}));
   };
@@ -109,7 +135,7 @@ const App: React.FC = () => {
         ) : currentUser.role === 'admin' ? (
           <AdminDashboard />
         ) : (
-          <EmployeeDashboard user={currentUser} settings={appSettings} timeOffset={timeOffset} />
+          <EmployeeDashboard user={currentUser} settings={appSettings} timeOffset={timeOffset} isTimeSynced={isTimeSynced} />
         )}
       </div>
 

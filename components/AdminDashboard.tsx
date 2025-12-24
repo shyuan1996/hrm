@@ -424,11 +424,17 @@ export const AdminDashboard: React.FC = () => {
     // 員工總覽的時間顯示：使用 formatTimeOnly(..., true) 顯示秒數
     const inDisplay = firstIn ? `${TimeService.getTaiwanDate(firstIn.date)} ${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
     const outDisplay = lastOut ? `${TimeService.getTaiwanDate(lastOut.date)} ${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
+    
+    // 新增：實際打卡座標
+    const inLoc = firstIn ? `${firstIn.lat.toFixed(5)}, ${firstIn.lng.toFixed(5)}` : '';
+    const outLoc = lastOut ? `${lastOut.lat.toFixed(5)}, ${lastOut.lng.toFixed(5)}` : '';
 
     return { 
       tags: statusTags, 
       inTime: inDisplay, 
-      outTime: outDisplay 
+      outTime: outDisplay,
+      inLoc,
+      outLoc
     };
   };
 
@@ -561,8 +567,14 @@ export const AdminDashboard: React.FC = () => {
                                  <td className="p-4 md:p-6 font-mono font-black text-brand-600">{u.id}</td>
                                  <td className="p-4 md:p-6 font-black">{u.name}</td>
                                  <td className="p-4 md:p-6 text-gray-500">{u.dept}</td>
-                                 <td className="p-4 md:p-6 font-mono text-xs">{status.inTime}</td>
-                                 <td className="p-4 md:p-6 font-mono text-xs">{status.outTime}</td>
+                                 <td className="p-4 md:p-6">
+                                    <div className="font-mono text-xs">{status.inTime}</div>
+                                    {status.inLoc && <div className="text-[10px] text-gray-400 font-mono">{status.inLoc}</div>}
+                                 </td>
+                                 <td className="p-4 md:p-6">
+                                    <div className="font-mono text-xs">{status.outTime}</div>
+                                    {status.outLoc && <div className="text-[10px] text-gray-400 font-mono">{status.outLoc}</div>}
+                                 </td>
                                  <td className={`p-4 md:p-6`}>
                                    <div className="flex flex-wrap gap-2">
                                      {status.tags.length > 0 ? status.tags.map((tag, idx) => (
@@ -597,6 +609,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'leaves' && (
+            // ... (Content identical to previous version, truncated for brevity)
             <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-brand-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核假單</h3>
@@ -690,6 +703,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'ot' && (
+             // ... (Content identical to previous version, truncated for brevity)
               <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-indigo-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核加班</h3>
@@ -784,7 +798,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'news' && (
-            // ... (news section remains unchanged)
+            // ... (Content identical to previous version, truncated for brevity)
             <div className="max-w-4xl space-y-8 md:space-y-12">
                <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                   <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8">{editAnnId ? '編輯公告' : '發布公告'}</h3>
@@ -848,7 +862,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'holiday' && (
-             // ... (holiday section remains unchanged)
+             // ... (Content identical to previous version, truncated for brevity)
              <div className="max-w-2xl space-y-8 md:space-y-12">
                 <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                    <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-10 flex items-center gap-3"><Palmtree className="text-brand-500" /> 設定休假日</h3>
@@ -913,7 +927,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'system' && (
-             // ... (system section remains unchanged)
+             // ... (Content identical to previous version, truncated for brevity)
              <div className="max-w-2xl bg-white p-6 md:p-12 rounded-[40px] md:rounded-[56px] shadow-2xl border animate-in zoom-in-95 duration-500">
                 <h3 className="text-2xl md:text-3xl font-black mb-8 md:mb-12 flex items-center gap-4 text-gray-800"><Settings className="text-brand-600" size={32}/> 核心參數設定</h3>
                 <form className="space-y-6 md:space-y-10" onSubmit={(e) => {
@@ -1086,7 +1100,8 @@ export const AdminDashboard: React.FC = () => {
                                     <div>
                                         <span className={`px-1.5 py-0.5 rounded text-[10px] ${l.type==='特休'?'bg-blue-100 text-blue-700':l.type==='補休'?'bg-purple-100 text-purple-700':l.type==='生日假'?'bg-pink-100 text-pink-700':'bg-gray-100 text-gray-600'}`}>{l.type}</span>
                                     </div>
-                                    <div className="font-mono text-gray-500 text-[10px] whitespace-nowrap overflow-hidden">{l.start.split(' ')[0]}</div>
+                                    {/* Fix: Correct Date Display */}
+                                    <div className="font-mono text-gray-500 text-[10px] whitespace-nowrap overflow-hidden">{TimeService.getTaiwanDate(l.start)}</div>
                                     <div className="font-black text-gray-800">{l.hours}hr</div>
                                     <div className="text-right text-gray-400 truncate">{l.reason}</div>
                                 </div>

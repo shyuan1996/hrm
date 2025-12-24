@@ -4,20 +4,90 @@ import { Holiday } from '../types';
 export const TimeService = {
   /**
    * 取得網路標準時間與本地時間的差值（毫秒）
-   * 使用 timeapi.io
+   * 優化：同時請求多個來源，取最快回應者。
+   * 嚴格模式：若全失敗，回傳 null (禁止使用本地時間)。
    */
-  getNetworkTimeOffset: async (): Promise<number> => {
+  getNetworkTimeOffset: async (): Promise<number | null> => {
+    const fetchWithTimeout = async (url: string, timeout = 5000) => {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url, { 
+            signal: controller.signal,
+            cache: 'no-store',
+            headers: { 'Accept': 'application/json, text/plain, */*' }
+        });
+        clearTimeout(id);
+        if (!response.ok) throw new Error(`API Error ${response.status}`);
+        
+        const text = await response.text();
+        let serverTime = 0;
+
+        // Try parsing as JSON first
+        try {
+            const data = JSON.parse(text);
+            // Support multiple API formats
+            // timeapi.io: dateTime
+            // worldtimeapi.org: datetime
+            // general: utc_datetime, iso
+            const dateTimeStr = data.dateTime || data.datetime || data.utc_datetime || data.iso;
+            if (dateTimeStr) {
+                serverTime = new Date(dateTimeStr).getTime();
+            }
+        } catch (e) {
+            // Ignore JSON parse error, try text
+        }
+
+        // If JSON parsing failed or didn't find time, try parsing text directly (e.g. Adafruit returns raw ISO string)
+        if (!serverTime) {
+            const trimmed = text.trim().replace(/^"|"$/g, ''); // Remove surrounding quotes if present
+            const d = new Date(trimmed);
+            if (!isNaN(d.getTime())) {
+                serverTime = d.getTime();
+            }
+        }
+
+        if (!serverTime) throw new Error('Invalid Data Format');
+        
+        const localTime = Date.now();
+        return serverTime - localTime;
+      } catch (e) {
+        clearTimeout(id);
+        throw e;
+      }
+    };
+
+    // Helper to simulate Promise.any behavior for older environments/TS configs
+    const promiseAny = <T>(promises: Promise<T>[]): Promise<T> => {
+      return new Promise((resolve, reject) => {
+        let rejectedCount = 0;
+        if (promises.length === 0) {
+          return reject(new Error('No promises passed'));
+        }
+        promises.forEach(p => {
+          Promise.resolve(p).then(resolve).catch((e) => {
+            rejectedCount++;
+            if (rejectedCount === promises.length) {
+              reject(new Error('All promises rejected: ' + e?.message));
+            }
+          });
+        });
+      });
+    };
+
     try {
-      // 使用 timeapi.io 取得台北時間
-      const response = await fetch('https://www.timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei');
-      if (!response.ok) throw new Error('Time API failed');
-      const data = await response.json();
-      const serverTime = new Date(data.dateTime).getTime();
-      const localTime = Date.now();
-      return serverTime - localTime;
+      // Race 模式：誰先回來就用誰，大幅縮短體感等待時間
+      // Added Adafruit IO as a fallback source
+      const offset = await promiseAny([
+        fetchWithTimeout('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei'),
+        fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
+        fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601')
+      ]);
+      return offset;
     } catch (e) {
-      console.warn("無法從 timeapi.io 取得時間，回退至本地時間", e);
-      return 0;
+      console.error("無法取得網路時間 (嚴格模式: 禁止使用本地時間)", e);
+      // 回傳 null 表示校正失敗，UI 應保持鎖定
+      return null;
     }
   },
 

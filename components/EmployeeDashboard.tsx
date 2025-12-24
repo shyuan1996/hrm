@@ -12,6 +12,7 @@ interface EmployeeDashboardProps {
   user: User;
   settings: AppSettings;
   timeOffset: number;
+  isTimeSynced: boolean; // 新增 Props
 }
 
 const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
@@ -32,22 +33,24 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
           <div className="text-xl font-mono font-black text-gray-800 tracking-tight">{displayTime}</div>
       </div>
 
-      <div className="flex flex-col items-end gap-1 min-w-[70px]">
-          <div className={`px-3 py-1 rounded-full text-[10px] font-black text-white text-center w-full ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
+      <div className="flex flex-col items-end gap-1 min-w-[50px]">
+          {/* 調整寬度與Padding，使其更小巧 */}
+          <div className={`px-1.5 py-0.5 rounded-full text-[10px] font-black text-white text-center w-auto min-w-[35px] ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
             {r.status === '地點異常' ? '異常' : '成功'}
           </div>
-          {r.status.includes('異常') && <span className="text-[10px] bg-red-100 text-red-600 px-1 rounded font-bold text-center w-full">地點異常</span>}
+          {r.status.includes('異常') && <span className="text-[9px] bg-red-100 text-red-600 px-1 rounded font-bold text-center w-auto min-w-[35px]">異常</span>}
       </div>
     </div>
   );
 };
 
-export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset }) => {
+export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset, isTimeSynced }) => {
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [holidays, setHolidays] = useState<Holiday[]>([]);
+  const [isVerifying, setIsVerifying] = useState(false);
   
   // Mobile View State
   const [mobileView, setMobileView] = useState<'punch' | 'apply'>('punch');
@@ -178,8 +181,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     if (punchMathChallenge) {
       timer = setTimeout(() => {
         setPunchMathChallenge(null);
+        setIsVerifying(false);
         setNotification({ type: 'error', message: '回答超時，打卡動作已取消' });
-      }, 10000);
+      }, 10000); // 這裡維持 10 秒
     }
     return () => clearTimeout(timer);
   }, [punchMathChallenge]);
@@ -194,11 +198,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const inRange = isLocationReady && distance! <= settings.allowedRadius;
 
   const initiatePunch = () => {
+    // 0. 系統檢查 (System Validations)
+    // 檢查時間是否已同步 (最優先)
+    if (!isTimeSynced) {
+        setNotification({ type: 'error', message: "系統時間正在校正中，請稍候..." });
+        return;
+    }
+
+    // 1. 防呆檢查 (Validation FIRST)
+    // 檢查時間誤差是否超過 1 分鐘 (60000ms)
+    if (Math.abs(timeOffset) > 60000) {
+       setNotification({ type: 'error', message: "時間錯誤：系統偵測到您的裝置時間與標準時間誤差過大 (>1分鐘)，請校準裝置時間後再進行打卡。" });
+       return;
+    }
+
+    // 檢查定位狀態
     if (!isLocationReady) {
       setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
       return;
     }
 
+    // 上班打卡距離檢查
     if (currentPunchType === 'in') {
         if (settings.companyLat && !inRange) {
            setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
@@ -206,24 +226,75 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         }
     }
 
-    const n1 = Math.floor(Math.random() * 9) + 1;
-    const n2 = Math.floor(Math.random() * 9) + 1;
-    const ans = n1 + n2;
-    const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
-    setPunchMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
+    // 2. 通過檢查後，鎖定按鈕，顯示處理中 (Gray out button AFTER validation)
+    setIsVerifying(true);
+
+    // 3. 延遲後顯示驗證碼，確保 UI 有時間更新狀態
+    setTimeout(() => {
+        const n1 = Math.floor(Math.random() * 9) + 1;
+        const n2 = Math.floor(Math.random() * 9) + 1;
+        const ans = n1 + n2;
+        const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
+        setPunchMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
+        // 注意：這裡不設定 setIsVerifying(false)，保持按鈕鎖定直到打卡完成
+    }, 500); 
   };
 
   const executePunch = (choice: number) => {
     if (choice !== punchMathChallenge?.a) {
       setPunchMathChallenge(null);
+      setIsVerifying(false);
       setNotification({ type: 'error', message: "驗證錯誤，打卡動作取消" });
       return;
     }
     setPunchMathChallenge(null);
+    // 此時 isVerifying 仍為 true (從 initiatePunch 設定)
+
+    // 設定 20 秒核對超時 (Check Verification Timeout)
+    let isCheckDone = false;
+    const checkTimeout = setTimeout(() => {
+        if (!isCheckDone) {
+            isCheckDone = true;
+            setIsVerifying(false); // 恢復按鈕
+            setNotification({ type: 'error', message: "核對超時 (超過20秒)，驗證失敗請重新驗證" });
+        }
+    }, 20000);
+
+    const completePunch = (lat: number, lng: number) => {
+        if (isCheckDone) return; // 如果已經超時，則不執行後續
+        isCheckDone = true;
+        clearTimeout(checkTimeout); // 清除超時倒數
+        
+        finishPunch('正常', lat, lng);
+        setIsVerifying(false); // 打卡成功，恢復按鈕
+    };
 
     let punchStatus = '正常';
-    if (currentPunchType === 'out' && settings.companyLat && !inRange) {
-        punchStatus = '地點異常'; 
+    let currentLat = 0;
+    let currentLng = 0;
+
+    // 嘗試獲取最新一次精確座標 (競賽條件: 20秒內要完成)
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition((pos) => {
+            currentLat = pos.coords.latitude;
+            currentLng = pos.coords.longitude;
+            completePunch(currentLat, currentLng);
+        }, () => {
+             // 無法獲取則使用 0, 0
+             completePunch(0, 0);
+        }, { timeout: 15000 }); // 定位本身 timeout 設定比 20秒短一些，保留緩衝
+    } else {
+        completePunch(0, 0);
+    }
+  };
+
+  const finishPunch = (status: string, lat: number, lng: number) => {
+    // 再次確認下班地點
+    let finalStatus = status;
+    if (currentPunchType === 'out' && settings.companyLat) {
+        // Recalculate distance just to be sure
+        const d = getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng);
+        if (d > settings.allowedRadius) finalStatus = '地點異常';
     }
 
     StorageService.addRecord({
@@ -233,15 +304,16 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       date: todayStr,
       time: currentTimeStr,
       type: currentPunchType,
-      status: punchStatus,
-      lat: 0, lng: 0, 
+      status: finalStatus,
+      lat: lat, 
+      lng: lng, 
       dist: distance || 0
     });
     
     const data = StorageService.loadData();
     setRecords(data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id));
     
-    if (punchStatus === '地點異常') {
+    if (finalStatus === '地點異常') {
         setNotification({ type: 'success', message: `下班打卡成功 (注意：您在打卡範圍外)` });
     } else {
         setNotification({ type: 'success', message: `${currentPunchType === 'in' ? '上班' : '下班'}打卡成功！` });
@@ -383,13 +455,23 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 <Button 
                   variant="tech-circle" 
                   onClick={initiatePunch}
-                  disabled={!isLocationReady}
-                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${!isLocationReady ? 'from-gray-400 to-gray-500 grayscale opacity-80' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
+                  disabled={!isTimeSynced || !isLocationReady || isVerifying}
+                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!isTimeSynced || !isLocationReady || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
                 >
-                  {!isLocationReady ? (
+                  {!isTimeSynced ? (
+                     <div className="flex flex-col items-center">
+                       <Loader2 size={40} className="animate-spin text-white mb-2" />
+                       <span className="text-xl md:text-2xl font-black text-white">時間校正中...</span>
+                     </div>
+                  ) : !isLocationReady ? (
                      <div className="flex flex-col items-center">
                        <Loader2 size={40} className="animate-spin text-white mb-2" />
                        <span className="text-xl md:text-2xl font-black text-white">定位中...</span>
+                     </div>
+                  ) : isVerifying ? (
+                     <div className="flex flex-col items-center">
+                       <Loader2 size={40} className="animate-spin text-white mb-2" />
+                       <span className="text-xl md:text-2xl font-black text-white">資料核對中...</span>
                      </div>
                   ) : (
                      <>
@@ -403,13 +485,16 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 
                 <div className={`w-full py-3 md:py-4 px-4 md:px-6 rounded-2xl font-black flex items-center justify-center gap-2 md:gap-3 shadow-md transition-all text-sm md:text-xl ${
                     gpsError ? 'bg-red-100 text-red-600' :
+                    (!isTimeSynced) ? 'bg-orange-100 text-orange-600' :
                     !isLocationReady ? 'bg-gray-100 text-gray-400' : 
                     settings.companyLat ? (inRange ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700') : 
                     'bg-gray-100 text-gray-400'
                 }`}>
-                   <MapPin size={20} className={`md:w-6 md:h-6 ${!isLocationReady && !gpsError ? 'animate-bounce' : ''}`} />
+                   <MapPin size={20} className={`md:w-6 md:h-6 ${(!isTimeSynced || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
                    {gpsError ? (
                      <span>{gpsError}</span>
+                   ) : !isTimeSynced ? (
+                     <span className="animate-pulse">正在校正系統時間...</span>
                    ) : !isLocationReady ? (
                      <span className="animate-pulse">正在獲取位置...</span>
                    ) : settings.companyLat ? (
@@ -420,10 +505,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 </div>
               </div>
 
-              <div className="w-full max-w-xl p-4 md:p-6 bg-gray-50 rounded-[24px] md:rounded-[32px] border border-gray-100 mt-auto">
+              <div className="w-full max-w-xl p-4 md:p-6 bg-gray-50 rounded-[24px] md:rounded-[32px] border border-gray-100">
                 <div className="flex justify-between items-center mb-3 md:mb-5">
                   <h4 className="text-xs md:text-sm font-black text-gray-400 uppercase tracking-widest">最近打卡紀錄 (近2筆)</h4>
-                  <button onClick={() => setShowPunchHistory(true)} className="text-xs font-black text-brand-600 hover:underline">查看更多紀錄</button>
+                  <button type="button" onClick={() => setShowPunchHistory(true)} className="text-xs font-black text-brand-600 hover:underline relative z-10 cursor-pointer p-1">查看更多紀錄</button>
                 </div>
                 <div className="grid grid-cols-1 gap-2 md:gap-3">
                   {records.slice(0, 2).map((r) => (
@@ -431,6 +516,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                   ))}
                   {records.length === 0 && <div className="p-6 md:p-10 text-center text-gray-300 italic">尚無打卡紀錄</div>}
                 </div>
+              </div>
+
+              {/* Reminder Text */}
+              <div className="mt-auto w-full text-center pb-2">
+                 <p className="text-red-500 font-black text-sm md:text-base animate-pulse">※ 請確認有打卡紀錄後再離開公司</p>
               </div>
             </div>
         </div>
@@ -452,7 +542,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  <div className="space-y-6 md:space-y-8">
                    <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                      <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-brand-800">填寫假單</h3>
-                     
+                     {/* ... Leave Form ... */}
                      <div className="mb-6 grid grid-cols-3 gap-2 md:gap-3">
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-blue-100 shadow-sm flex flex-col items-center text-center">
                             <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">特休假</div>
@@ -559,7 +649,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                    <div className="p-6 md:p-8 bg-white border-2 border-gray-100 rounded-[28px] md:rounded-[36px] space-y-4 md:space-y-6">
                      <div className="flex justify-between items-center border-b pb-4">
                        <h4 className="text-xs md:text-sm font-black text-gray-400 uppercase">最新一筆請假預覽</h4>
-                       <button onClick={() => setShowLeaveHistory(true)} className="text-xs font-black text-brand-600 hover:underline">歷史紀錄查詢</button>
+                       <button type="button" onClick={() => setShowLeaveHistory(true)} className="text-xs font-black text-brand-600 hover:underline relative z-10 cursor-pointer p-1">歷史紀錄查詢</button>
                      </div>
                      {recentLeave ? (
                        <div className="flex flex-col gap-4">
@@ -601,6 +691,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  <div className="space-y-6 md:space-y-8">
                     <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                        <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-indigo-800">填寫加班單</h3>
+                       {/* ... OT Form ... */}
                        <div className="space-y-4 md:space-y-6">
                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                              <div className="space-y-2">
@@ -681,7 +772,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     <div className="p-6 md:p-8 bg-white border-2 border-gray-100 rounded-[28px] md:rounded-[36px] space-y-4 md:space-y-6">
                      <div className="flex justify-between items-center border-b pb-4">
                        <h4 className="text-xs md:text-sm font-black text-gray-400 uppercase">最新一筆加班預覽</h4>
-                       <button onClick={() => setShowOTHistory(true)} className="text-xs font-black text-indigo-600 hover:underline">歷史紀錄查詢</button>
+                       <button type="button" onClick={() => setShowOTHistory(true)} className="text-xs font-black text-indigo-600 hover:underline relative z-10 cursor-pointer p-1">歷史紀錄查詢</button>
                      </div>
                      {recentOT ? (
                        <div className="flex flex-col gap-4">
@@ -759,7 +850,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                   <button key={idx} onClick={() => executePunch(opt)} className="p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black text-brand-600 hover:bg-brand-600 hover:text-white transition-all shadow-md">{opt}</button>
                 ))}
               </div>
-              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>setPunchMathChallenge(null)}>取消本次打卡</button>
+              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>{setPunchMathChallenge(null); setIsVerifying(false);}}>取消本次打卡</button>
            </div>
         </div>
       )}

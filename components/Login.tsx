@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
 import { Button } from './ui/Button';
-import { Building2, AlertTriangle, Megaphone, CloudDownload, RefreshCw } from 'lucide-react';
+import { Building2, AlertTriangle, Megaphone, CloudDownload, RefreshCw, XCircle } from 'lucide-react';
 import { DEFAULT_SETTINGS } from '../constants';
 
 interface LoginProps {
@@ -19,6 +19,26 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
+
+  // Obfuscation helpers to hide credentials in storage (not high security, but hides from casual view)
+  const KEY_USER = '_app_usr';
+  const KEY_PASS = '_app_psw';
+  
+  const obfuscate = (str: string) => {
+      try {
+          // Simple XOR with a fixed key + Base64
+          const key = 123;
+          return btoa(str.split('').map(c => String.fromCharCode(c.charCodeAt(0) ^ key)).join(''));
+      } catch { return ''; }
+  };
+
+  const deobfuscate = (str: string) => {
+      try {
+          const key = 123;
+          return atob(str).split('').map(c => String.fromCharCode(c.charCodeAt(0) ^ key)).join('');
+      } catch { return ''; }
+  };
 
   useEffect(() => {
     // Attempt to sync from cloud immediately on load
@@ -28,13 +48,16 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
             const cloudData = await StorageService.fetchCloudData();
             if (cloudData) {
                 setAnnouncements(cloudData.announcements);
+                if (cloudData.announcements.length > 0) setShowAnnouncementModal(true);
                 setSyncStatus('success');
             } else {
                 // If no cloud data, load local
-                setAnnouncements(StorageService.loadData().announcements);
+                const localData = StorageService.loadData();
+                setAnnouncements(localData.announcements);
+                if (localData.announcements.length > 0) setShowAnnouncementModal(true);
                 
                 // Check if we have a valid URL in settings OR defaults
-                const currentSettings = StorageService.loadData().settings;
+                const currentSettings = localData.settings;
                 const hasUrl = currentSettings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
                 
                 setSyncStatus(hasUrl ? 'error' : 'idle');
@@ -42,7 +65,9 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         } catch (e) {
             console.error(e);
             setSyncStatus('error');
-            setAnnouncements(StorageService.loadData().announcements);
+            const localAnn = StorageService.loadData().announcements;
+            setAnnouncements(localAnn);
+            if (localAnn.length > 0) setShowAnnouncementModal(true);
         } finally {
             setIsSyncing(false);
         }
@@ -50,11 +75,11 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
     syncData();
 
-    const savedUser = localStorage.getItem('remembered_user');
-    const savedPass = localStorage.getItem('remembered_pass');
+    const savedUser = localStorage.getItem(KEY_USER);
+    const savedPass = localStorage.getItem(KEY_PASS);
     if (savedUser && savedPass) {
-      setUsername(savedUser);
-      setPassword(atob(savedPass));
+      setUsername(deobfuscate(savedUser));
+      setPassword(deobfuscate(savedPass));
       setRememberMe(true);
     }
   }, []);
@@ -82,11 +107,11 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           setError('此帳號已被封存，無法登入系統');
         } else {
           if (rememberMe) {
-            localStorage.setItem('remembered_user', username.trim());
-            localStorage.setItem('remembered_pass', btoa(password));
+            localStorage.setItem(KEY_USER, obfuscate(username.trim()));
+            localStorage.setItem(KEY_PASS, obfuscate(password));
           } else {
-            localStorage.removeItem('remembered_user');
-            localStorage.removeItem('remembered_pass');
+            localStorage.removeItem(KEY_USER);
+            localStorage.removeItem(KEY_PASS);
           }
           onLogin(user);
         }
@@ -98,72 +123,91 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   };
 
   return (
-    <div className="min-h-full flex items-center justify-center p-4 bg-gray-100 font-bold overflow-y-auto">
-      <div className="w-full max-w-6xl bg-white rounded-[32px] md:rounded-[48px] shadow-2xl overflow-hidden flex flex-col md:flex-row border border-gray-100 min-h-[auto] md:min-h-[600px] my-4 md:my-0">
-        <div className="w-full md:w-[40%] p-8 md:p-14 flex flex-col justify-center bg-white order-1 relative">
-          
-          {/* Cloud Sync Status Indicator */}
-          <div className="absolute top-6 right-6 flex items-center gap-2">
-             {isSyncing ? (
-                 <div className="flex items-center gap-1 text-brand-600 text-xs animate-pulse">
-                    <RefreshCw size={14} className="animate-spin" /> 同步雲端資料中...
-                 </div>
-             ) : syncStatus === 'success' ? (
-                 <div className="flex items-center gap-1 text-green-600 text-xs" title="已連接雲端">
-                    <CloudDownload size={14} /> 資料已更新
-                 </div>
-             ) : syncStatus === 'error' ? (
-                 <div className="flex items-center gap-1 text-red-400 text-xs" title="無法連接雲端，使用本地暫存">
-                    <AlertTriangle size={14} /> 離線模式
-                 </div>
-             ) : null}
-          </div>
-
-          <div className="flex flex-col items-center mb-8 md:mb-10">
-            <div className="w-16 h-16 md:w-20 md:h-20 bg-brand-600 rounded-3xl flex items-center justify-center mb-4 shadow-xl shadow-brand-200">
-              <Building2 className="text-white w-8 h-8 md:w-10 md:h-10" />
-            </div>
-            <h1 className="text-2xl md:text-3xl font-bold text-gray-800 tracking-tight text-center">考勤管理系統</h1>
-          </div>
-
-          <form onSubmit={handleSubmit} className="space-y-5 md:space-y-6">
-            <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號" />
-            <input type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="密碼" />
-            <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
-              <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />
-              記住帳號密碼
-            </label>
-            {error && <div className="text-red-500 text-sm bg-red-50 p-4 rounded-xl font-black flex items-center gap-2"><AlertTriangle size={16}/> {error}</div>}
-            <Button type="submit" isLoading={isLoading} disabled={isSyncing} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl disabled:bg-gray-400">
-                {isSyncing ? '系統同步中...' : '登入系統'}
-            </Button>
-          </form>
-        </div>
-
-        <div className="w-full md:w-[60%] bg-brand-50 p-8 md:p-14 flex flex-col border-t md:border-t-0 md:border-l border-brand-100 order-2 h-[400px] md:h-auto">
-          <h3 className="text-xl md:text-2xl font-black text-gray-800 mb-6 md:mb-8 flex items-center gap-2 sticky top-0 bg-brand-50 z-10 py-2">
-            <Megaphone className="text-brand-600" size={24} /> 企業最新公告
-          </h3>
-          <div className="flex-1 overflow-y-auto space-y-4 md:space-y-5 pr-2 custom-scroll">
-            {announcements.length === 0 && <p className="text-gray-400 font-bold italic text-center py-20">目前無最新公告</p>}
-            {announcements.map(ann => (
-              <div key={ann.id} className="bg-white p-6 md:p-8 rounded-[32px] border border-gray-100 shadow-sm transition-all hover:shadow-md break-words">
-                <div className="flex items-center gap-2 mb-3">
-                  <span className={`px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${ann.category === 'urgent' ? 'bg-red-100 text-red-600' : ann.category === 'system' ? 'bg-gray-100 text-gray-500' : 'bg-blue-100 text-blue-600'}`}>
-                    {ann.category === 'urgent' ? '緊急' : ann.category === 'system' ? '系統' : '一般'}
-                  </span>
-                  <span className="text-[10px] text-gray-400 font-black font-mono">
-                    {/* Show Only Date */}
-                    {ann.date.split(' ')[0].split('T')[0]}
-                  </span>
+    <div className="min-h-full flex items-center justify-center p-4 bg-gray-100 font-bold overflow-y-auto relative">
+      
+      {/* Login Card */}
+      <div className="w-full max-w-md bg-white rounded-[40px] shadow-2xl overflow-hidden flex flex-col border border-gray-100 relative p-8 md:p-12">
+        
+        {/* Cloud Sync Status Indicator */}
+        <div className="absolute top-6 right-6 flex items-center gap-2">
+            {isSyncing ? (
+                <div className="flex items-center gap-1 text-brand-600 text-xs animate-pulse">
+                  <RefreshCw size={14} className="animate-spin" />
                 </div>
-                <h4 className="font-black text-gray-800 text-lg mb-4">{ann.title}</h4>
-                <div className="text-sm text-gray-500 prose prose-sm max-w-none font-bold leading-relaxed break-words" dangerouslySetInnerHTML={{ __html: ann.content }} />
-              </div>
-            ))}
-          </div>
+            ) : syncStatus === 'success' ? (
+                <div className="flex items-center gap-1 text-green-600 text-xs" title="已連接雲端">
+                  <CloudDownload size={14} />
+                </div>
+            ) : syncStatus === 'error' ? (
+                <div className="flex items-center gap-1 text-red-400 text-xs" title="無法連接雲端，使用本地暫存">
+                  <AlertTriangle size={14} />
+                </div>
+            ) : null}
         </div>
+
+        <div className="flex flex-col items-center mb-8 md:mb-10">
+          <div className="w-20 h-20 bg-brand-600 rounded-3xl flex items-center justify-center mb-4 shadow-xl shadow-brand-200">
+            <Building2 className="text-white w-10 h-10" />
+          </div>
+          <h1 className="text-2xl md:text-3xl font-bold text-gray-800 tracking-tight text-center">考勤管理系統</h1>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-5 md:space-y-6">
+          <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號" />
+          <input type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="密碼" />
+          <div className="flex justify-between items-center">
+             <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
+                <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />
+                記住帳號密碼
+             </label>
+             {announcements.length > 0 && (
+                <button type="button" onClick={() => setShowAnnouncementModal(true)} className="text-xs font-black text-brand-600 hover:underline flex items-center gap-1">
+                   <Megaphone size={12} /> 查看最新公告
+                </button>
+             )}
+          </div>
+          
+          {error && <div className="text-red-500 text-sm bg-red-50 p-4 rounded-xl font-black flex items-center gap-2"><AlertTriangle size={16}/> {error}</div>}
+          <Button type="submit" isLoading={isLoading} disabled={isSyncing || showAnnouncementModal} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl disabled:bg-gray-400">
+              {isSyncing ? '系統同步中...' : showAnnouncementModal ? '請先閱讀公告' : '登入系統'}
+          </Button>
+        </form>
       </div>
+
+      {/* Announcement Modal Overlay */}
+      {showAnnouncementModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[9999] flex items-center justify-center p-4">
+           <div className="bg-white w-full max-w-2xl max-h-[80vh] rounded-[32px] md:rounded-[48px] shadow-2xl flex flex-col overflow-hidden animate-in zoom-in-95 duration-300">
+              <div className="p-6 md:p-8 border-b bg-brand-50 flex justify-between items-center shrink-0">
+                  <h3 className="text-xl md:text-2xl font-black text-gray-800 flex items-center gap-2">
+                    <Megaphone className="text-brand-600" size={24} /> 企業最新公告
+                  </h3>
+                  {/* Close button is hidden, user must scroll/read or click bottom button */}
+              </div>
+              <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 custom-scroll">
+                 {announcements.map(ann => (
+                  <div key={ann.id} className="bg-white p-6 rounded-[24px] border border-gray-100 shadow-sm break-words">
+                    <div className="flex items-center gap-2 mb-3">
+                      <span className={`px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${ann.category === 'urgent' ? 'bg-red-100 text-red-600' : ann.category === 'system' ? 'bg-gray-100 text-gray-500' : 'bg-blue-100 text-blue-600'}`}>
+                        {ann.category === 'urgent' ? '緊急' : ann.category === 'system' ? '系統' : '一般'}
+                      </span>
+                      <span className="text-[10px] text-gray-400 font-black font-mono">
+                        {ann.date.split(' ')[0].split('T')[0]}
+                      </span>
+                    </div>
+                    <h4 className="font-black text-gray-800 text-lg mb-4">{ann.title}</h4>
+                    <div className="text-sm text-gray-500 prose prose-sm max-w-none font-bold leading-relaxed break-words" dangerouslySetInnerHTML={{ __html: ann.content }} />
+                  </div>
+                 ))}
+              </div>
+              <div className="p-6 md:p-8 border-t bg-gray-50 shrink-0 flex justify-center">
+                 <Button onClick={() => setShowAnnouncementModal(false)} className="w-full md:w-auto px-12 py-4 rounded-2xl text-lg font-black shadow-lg">
+                    我已閱讀並了解
+                 </Button>
+              </div>
+           </div>
+        </div>
+      )}
     </div>
   );
 };
