@@ -12,25 +12,27 @@ import { Button } from './components/ui/Button';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  
+  // [OPTIMIZATION] Initialize synchronously from local storage.
+  // This ensures the UI renders instantly without a loading blink.
+  const [appSettings, setAppSettings] = useState<AppSettings>(() => StorageService.loadData().settings);
+  
   const [timeOffset, setTimeOffset] = useState(0);
-  const [isTimeSynced, setIsTimeSynced] = useState(false); // 狀態：是否已完成時間校正
+  const [isTimeSynced, setIsTimeSynced] = useState(false);
   const [isSelfPwdModalOpen, setIsSelfPwdModalOpen] = useState(false);
   const [newSelfPwd, setNewSelfPwd] = useState({ p1: '', p2: '' });
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // 獨立的時間校正函式，支援失敗重試
   const performTimeSync = async () => {
-    setIsTimeSynced(false);
+    if (!isTimeSynced) setIsTimeSynced(false);
+    
     const offset = await TimeService.getNetworkTimeOffset();
     if (offset !== null) {
       setTimeOffset(offset);
       setIsTimeSynced(true);
+      console.log("Time synced successfully.");
     } else {
-      // 若失敗，保持 isTimeSynced = false，Dashboard 會顯示校正中
-      // 可以選擇在這裡做自動重試，或者依賴使用者重新操作
       console.warn("時間校正失敗，請檢查網路連線");
-      // 簡單重試機制 (3秒後重試一次)
       setTimeout(async () => {
          const retryOffset = await TimeService.getNetworkTimeOffset();
          if (retryOffset !== null) {
@@ -42,26 +44,45 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    // Initialize data logic
     const init = async () => {
-      // Try to get fresh cloud data first
-      await StorageService.fetchCloudData();
+      // 1. Initial State is already set via useState lazy initializer (Instant UI)
+
+      // 2. Perform Cloud Sync in Background (Stale-While-Revalidate)
+      // fetchCloudData is idempotent and likely already started by the module import.
+      // We just await the result here.
+      const cloudData = await StorageService.fetchCloudData();
+      if (cloudData) {
+          setAppSettings(cloudData.settings);
+      }
       
-      // Load whatever we have (local or freshly fetched)
-      const data = StorageService.loadData();
-      setAppSettings(data.settings);
-      
-      // Initial time sync
+      // 3. Time Sync
       performTimeSync();
       
+      // 4. Session Check
       const savedSession = localStorage.getItem(SESSION_KEY);
       if (savedSession) {
         const parsed = JSON.parse(savedSession);
-        const user = data.users.find(u => u.id === parsed.id);
+        // Use data from memory which might be fresher if cloud sync finished
+        const currentData = StorageService.loadData();
+        const user = currentData.users.find(u => u.id === parsed.id);
         if (user && !user.deleted) setCurrentUser(user);
       }
     };
     init();
+
+    const handleVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+            console.log("App visible, re-syncing time...");
+            performTimeSync();
+            // Optional: Re-fetch cloud data on visibility change
+            StorageService.fetchCloudData().then(d => { if(d) setAppSettings(d.settings); });
+        }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, []);
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
@@ -82,13 +103,9 @@ const App: React.FC = () => {
   };
 
   const handleLogin = (u: User) => {
-    // Force reload settings on login
     const data = StorageService.loadData();
     setAppSettings(data.settings);
-    
-    // 安全機制：登入時強制重置同步狀態，並重新校正時間
     performTimeSync();
-
     setCurrentUser(u);
     localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role}));
   };
@@ -99,9 +116,9 @@ const App: React.FC = () => {
     <div className="font-sans text-gray-900 antialiased h-screen flex flex-col bg-gray-50 relative">
       {/* Global Center Header Notification */}
       {notification && (
-        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-bounce font-black text-sm md:text-base border-2 transition-all duration-300 ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
-           {notification.type === 'success' ? <CheckCircle size={20} className="flex-shrink-0" /> : <AlertTriangle size={20} className="flex-shrink-0" />}
-           <span className="whitespace-nowrap">{notification.message}</span>
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
+           {notification.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
+           <span className="flex-1">{notification.message}</span>
         </div>
       )}
 
@@ -131,7 +148,7 @@ const App: React.FC = () => {
 
       <div className="flex-1 overflow-hidden relative">
         {!currentUser ? (
-          <Login onLogin={handleLogin} />
+          <Login onLogin={(u) => { setCurrentUser(u); localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role})); }} />
         ) : currentUser.role === 'admin' ? (
           <AdminDashboard />
         ) : (

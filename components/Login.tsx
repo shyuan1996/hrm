@@ -16,7 +16,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [rememberMe, setRememberMe] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  
+  // [OPTIMIZATION] Load from local cache immediately so the UI is instant
+  const [announcements, setAnnouncements] = useState<Announcement[]>(() => StorageService.loadData().announcements);
+  
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
@@ -27,7 +30,6 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   
   const obfuscate = (str: string) => {
       try {
-          // Simple XOR with a fixed key + Base64
           const key = 123;
           return btoa(str.split('').map(c => String.fromCharCode(c.charCodeAt(0) ^ key)).join(''));
       } catch { return ''; }
@@ -41,39 +43,36 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   };
 
   useEffect(() => {
-    // Attempt to sync from cloud immediately on load
-    const syncData = async () => {
+    // Determine initial sync status based on cache presence
+    if (announcements.length > 0) {
+        setSyncStatus('success'); // Assume success if we have cache, will update if fetch fails
+        setShowAnnouncementModal(true);
+    }
+
+    const checkBackgroundSync = async () => {
         setIsSyncing(true);
         try {
+            // This promise is likely already running or resolved from App.tsx/StorageService
             const cloudData = await StorageService.fetchCloudData();
             if (cloudData) {
                 setAnnouncements(cloudData.announcements);
-                if (cloudData.announcements.length > 0) setShowAnnouncementModal(true);
+                if (cloudData.announcements.length > 0 && announcements.length === 0) {
+                    setShowAnnouncementModal(true); // Only popup if we didn't have data before
+                }
                 setSyncStatus('success');
             } else {
-                // If no cloud data, load local
+                // If fetch returns null (error or no URL), keep local data
                 const localData = StorageService.loadData();
-                setAnnouncements(localData.announcements);
-                if (localData.announcements.length > 0) setShowAnnouncementModal(true);
-                
-                // Check if we have a valid URL in settings OR defaults
-                const currentSettings = localData.settings;
-                const hasUrl = currentSettings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
-                
-                setSyncStatus(hasUrl ? 'error' : 'idle');
+                setSyncStatus(localData.settings.gasUrl ? 'error' : 'idle');
             }
         } catch (e) {
-            console.error(e);
             setSyncStatus('error');
-            const localAnn = StorageService.loadData().announcements;
-            setAnnouncements(localAnn);
-            if (localAnn.length > 0) setShowAnnouncementModal(true);
         } finally {
             setIsSyncing(false);
         }
     };
 
-    syncData();
+    checkBackgroundSync();
 
     const savedUser = localStorage.getItem(KEY_USER);
     const savedPass = localStorage.getItem(KEY_PASS);
@@ -89,15 +88,12 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setIsLoading(true);
     setError('');
 
+    // Simulate a tiny delay for UX (so user sees the button press)
+    // but process logic immediately
     setTimeout(() => {
-      // Re-load data to ensure we use the latest from memory/storage
       const data = StorageService.loadData();
-      
-      // Normalize input: trim whitespace and lowercase
       const normalizedInput = username.trim().toLowerCase();
       
-      // Fix: Ensure comparison handles both string and number types from backend
-      // Google Sheets often returns numeric IDs/Passwords as numbers, causing strict equality checks to fail
       const user = data.users.find(u => 
         u.id && String(u.id).trim().toLowerCase() === normalizedInput && String(u.pass) === password
       );
@@ -119,7 +115,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         setError('帳號或密碼錯誤');
       }
       setIsLoading(false);
-    }, 500);
+    }, 300);
   };
 
   return (
@@ -168,8 +164,8 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           </div>
           
           {error && <div className="text-red-500 text-sm bg-red-50 p-4 rounded-xl font-black flex items-center gap-2"><AlertTriangle size={16}/> {error}</div>}
-          <Button type="submit" isLoading={isLoading} disabled={isSyncing || showAnnouncementModal} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl disabled:bg-gray-400">
-              {isSyncing ? '系統同步中...' : showAnnouncementModal ? '請先閱讀公告' : '登入系統'}
+          <Button type="submit" isLoading={isLoading} disabled={showAnnouncementModal} className="w-full py-5 rounded-2xl text-lg font-black shadow-xl disabled:bg-gray-400">
+              {showAnnouncementModal ? '請先閱讀公告' : '登入系統'}
           </Button>
         </form>
       </div>
@@ -182,7 +178,6 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                   <h3 className="text-xl md:text-2xl font-black text-gray-800 flex items-center gap-2">
                     <Megaphone className="text-brand-600" size={24} /> 企業最新公告
                   </h3>
-                  {/* Close button is hidden, user must scroll/read or click bottom button */}
               </div>
               <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 custom-scroll">
                  {announcements.map(ann => (

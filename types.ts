@@ -28,6 +28,7 @@ export interface AttendanceRecord {
   lat: number;
   lng: number;
   dist: number;
+  photo?: string; // Base64 string of the selfie
 }
 
 export interface LeaveRequest {

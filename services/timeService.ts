@@ -1,11 +1,15 @@
 
 import { Holiday } from '../types';
 
+// 使用模組級變數作為 Singleton 狀態儲存
+// 這是為了確保時間計算基準點 (Anchor) 唯一且不受元件重繪影響
+let _anchorServerTime: number | null = null; // 基準網路時間 (毫秒)
+let _anchorPerfTime: number = 0;             // 取得基準時的 performance.now() (毫秒)
+
 export const TimeService = {
   /**
    * 取得網路標準時間與本地時間的差值（毫秒）
-   * 優化：同時請求多個來源，取最快回應者。
-   * 嚴格模式：若全失敗，回傳 null (禁止使用本地時間)。
+   * 並且建立單調計時器錨點 (Monotonic Anchor)，防止使用者修改系統時間作弊。
    */
   getNetworkTimeOffset: async (): Promise<number | null> => {
     const fetchWithTimeout = async (url: string, timeout = 5000) => {
@@ -49,6 +53,11 @@ export const TimeService = {
 
         if (!serverTime) throw new Error('Invalid Data Format');
         
+        // 核心邏輯：建立時間錨點
+        // 即使系統時間之後被修改，performance.now() 仍會穩定遞增
+        _anchorServerTime = serverTime;
+        _anchorPerfTime = performance.now();
+
         const localTime = Date.now();
         return serverTime - localTime;
       } catch (e) {
@@ -77,7 +86,6 @@ export const TimeService = {
 
     try {
       // Race 模式：誰先回來就用誰，大幅縮短體感等待時間
-      // Added Adafruit IO as a fallback source
       const offset = await promiseAny([
         fetchWithTimeout('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei'),
         fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
@@ -85,16 +93,26 @@ export const TimeService = {
       ]);
       return offset;
     } catch (e) {
-      console.error("無法取得網路時間 (嚴格模式: 禁止使用本地時間)", e);
-      // 回傳 null 表示校正失敗，UI 應保持鎖定
+      console.error("無法取得網路時間", e);
+      // 如果完全無法連網，且之前沒有錨點，則回傳 null
+      if (_anchorServerTime !== null) {
+          return 0; // 只要有錨點，offset 多少不重要，因為我們改用 anchor 計算
+      }
       return null;
     }
   },
 
   /**
    * 取得校正後的目前 Date 物件
+   * 優先使用 performance.now() 進行推算，完全忽略系統本地時間的變化
    */
   getCorrectedNow: (offset: number): Date => {
+    // 如果曾經成功對時過，使用「單調時鐘」算法
+    if (_anchorServerTime !== null) {
+        const elapsed = performance.now() - _anchorPerfTime;
+        return new Date(_anchorServerTime + elapsed);
+    }
+    // 降級方案：如果尚未對時成功，只能依賴本地時間 + 偏移量
     return new Date(Date.now() + offset);
   },
 

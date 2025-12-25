@@ -5,36 +5,34 @@ import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2 } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, Image as ImageIcon } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
   user: User;
   settings: AppSettings;
   timeOffset: number;
-  isTimeSynced: boolean; // 新增 Props
+  isTimeSynced: boolean;
 }
 
 const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
   const dateStr = TimeService.getTaiwanDate(r.date);
-  // 修正：顯示秒數 (true)
   const displayTime = TimeService.formatTimeOnly(r.time, true);
 
   return (
     <div className="p-4 bg-white border-2 rounded-[24px] shadow-sm transition-all hover:shadow-md flex items-center justify-between">
-      <div className="flex flex-col min-w-[100px]">
+      <div className="flex flex-col min-w-[90px]">
          <div className={`text-sm font-black text-gray-500`}>{dateStr}</div>
          <div className="flex items-center gap-2">
            <div className={`text-xs font-black ${r.type === 'in' ? 'text-brand-600' : 'text-red-600'}`}>{r.type === 'in' ? '上班' : '下班'}打卡</div>
          </div>
       </div>
       
-      <div className="flex-1 text-center">
+      <div className="flex-1 text-center flex flex-col items-center justify-center">
           <div className="text-xl font-mono font-black text-gray-800 tracking-tight">{displayTime}</div>
       </div>
 
       <div className="flex flex-col items-end gap-1 min-w-[50px]">
-          {/* 調整寬度與Padding，使其更小巧 */}
           <div className={`px-1.5 py-0.5 rounded-full text-[10px] font-black text-white text-center w-auto min-w-[35px] ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
             {r.status === '地點異常' ? '異常' : '成功'}
           </div>
@@ -62,6 +60,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [showPunchHistory, setShowPunchHistory] = useState(false);
   const [showLeaveHistory, setShowLeaveHistory] = useState(false);
   const [showOTHistory, setShowOTHistory] = useState(false);
+  const [viewPhotoUrl, setViewPhotoUrl] = useState<string | null>(null);
   
   // Challenges
   const [punchMathChallenge, setPunchMathChallenge] = useState<{q:string, a:number, opts:number[]} | null>(null);
@@ -70,11 +69,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   // Filters
   const [punchFilterStart, setPunchFilterStart] = useState('');
   const [punchFilterEnd, setPunchFilterEnd] = useState('');
-
   const [historyFilterStart, setHistoryFilterStart] = useState('');
   const [historyFilterEnd, setHistoryFilterEnd] = useState('');
   const [historyFilterType, setHistoryFilterType] = useState('all');
-
   const [otFilterStart, setOtFilterStart] = useState('');
   const [otFilterEnd, setOtFilterEnd] = useState('');
 
@@ -131,34 +128,51 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return opts;
   }, []);
 
-  // Optimized Geolocation with watchPosition
+  // Optimized Geolocation with Fallback Strategy
   useEffect(() => {
     if (!navigator.geolocation) {
       setGpsError("瀏覽器不支援定位");
       return;
     }
 
-    const successHandler = (pos: GeolocationPosition) => {
-      setGpsError('');
-      if (settings.companyLat && settings.companyLng) {
-        setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
-      } else {
-         setDistance(0);
+    const startWatching = (enableHighAccuracy: boolean) => {
+      if (watchIdRef.current !== null) {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+          watchIdRef.current = null;
       }
+
+      const successHandler = (pos: GeolocationPosition) => {
+        setGpsError('');
+        if (settings.companyLat && settings.companyLng) {
+          setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
+        } else {
+           setDistance(0);
+        }
+      };
+
+      const errorHandler = (err: GeolocationPositionError) => {
+         console.warn(`Location error (HighAccuracy: ${enableHighAccuracy}):`, err);
+         if (enableHighAccuracy) {
+             console.log("Attempting fallback to low accuracy mode...");
+             startWatching(false); 
+         } else {
+             setGpsError("無法獲取位置資訊 (請檢查系統權限)");
+             setDistance(null);
+         }
+      };
+
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        successHandler,
+        errorHandler,
+        { 
+            enableHighAccuracy: enableHighAccuracy, 
+            timeout: enableHighAccuracy ? 15000 : 30000, 
+            maximumAge: 10000 
+        }
+      );
     };
 
-    const errorHandler = (err: GeolocationPositionError) => {
-       console.warn("Location error:", err);
-       setGpsError("無法獲取位置資訊");
-       setDistance(null);
-    };
-
-    // Use watchPosition instead of setInterval to avoid repeated permission prompts
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      successHandler,
-      errorHandler,
-      { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
-    );
+    startWatching(true);
 
     return () => {
       if (watchIdRef.current !== null) {
@@ -183,7 +197,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         setPunchMathChallenge(null);
         setIsVerifying(false);
         setNotification({ type: 'error', message: '回答超時，打卡動作已取消' });
-      }, 10000); // 這裡維持 10 秒
+      }, 10000); // 10 seconds
     }
     return () => clearTimeout(timer);
   }, [punchMathChallenge]);
@@ -198,27 +212,18 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const inRange = isLocationReady && distance! <= settings.allowedRadius;
 
   const initiatePunch = () => {
-    // 0. 系統檢查 (System Validations)
-    // 檢查時間是否已同步 (最優先)
     if (!isTimeSynced) {
         setNotification({ type: 'error', message: "系統時間正在校正中，請稍候..." });
         return;
     }
-
-    // 1. 防呆檢查 (Validation FIRST)
-    // 檢查時間誤差是否超過 1 分鐘 (60000ms)
     if (Math.abs(timeOffset) > 60000) {
        setNotification({ type: 'error', message: "時間錯誤：系統偵測到您的裝置時間與標準時間誤差過大 (>1分鐘)，請校準裝置時間後再進行打卡。" });
        return;
     }
-
-    // 檢查定位狀態
     if (!isLocationReady) {
       setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
       return;
     }
-
-    // 上班打卡距離檢查
     if (currentPunchType === 'in') {
         if (settings.companyLat && !inRange) {
            setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
@@ -226,17 +231,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         }
     }
 
-    // 2. 通過檢查後，鎖定按鈕，顯示處理中 (Gray out button AFTER validation)
     setIsVerifying(true);
-
-    // 3. 延遲後顯示驗證碼，確保 UI 有時間更新狀態
     setTimeout(() => {
         const n1 = Math.floor(Math.random() * 9) + 1;
         const n2 = Math.floor(Math.random() * 9) + 1;
         const ans = n1 + n2;
         const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
         setPunchMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
-        // 注意：這裡不設定 setIsVerifying(false)，保持按鈕鎖定直到打卡完成
     }, 500); 
   };
 
@@ -248,51 +249,41 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       return;
     }
     setPunchMathChallenge(null);
-    // 此時 isVerifying 仍為 true (從 initiatePunch 設定)
+    // isVerifying remains true
 
-    // 設定 20 秒核對超時 (Check Verification Timeout)
     let isCheckDone = false;
     const checkTimeout = setTimeout(() => {
         if (!isCheckDone) {
             isCheckDone = true;
-            setIsVerifying(false); // 恢復按鈕
+            setIsVerifying(false);
             setNotification({ type: 'error', message: "核對超時 (超過20秒)，驗證失敗請重新驗證" });
         }
     }, 20000);
 
     const completePunch = (lat: number, lng: number) => {
-        if (isCheckDone) return; // 如果已經超時，則不執行後續
+        if (isCheckDone) return;
         isCheckDone = true;
-        clearTimeout(checkTimeout); // 清除超時倒數
+        clearTimeout(checkTimeout);
         
         finishPunch('正常', lat, lng);
-        setIsVerifying(false); // 打卡成功，恢復按鈕
+        setIsVerifying(false);
     };
 
-    let punchStatus = '正常';
-    let currentLat = 0;
-    let currentLng = 0;
-
-    // 嘗試獲取最新一次精確座標 (競賽條件: 20秒內要完成)
+    // Get fresh position
     if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition((pos) => {
-            currentLat = pos.coords.latitude;
-            currentLng = pos.coords.longitude;
-            completePunch(currentLat, currentLng);
+            completePunch(pos.coords.latitude, pos.coords.longitude);
         }, () => {
-             // 無法獲取則使用 0, 0
              completePunch(0, 0);
-        }, { timeout: 15000 }); // 定位本身 timeout 設定比 20秒短一些，保留緩衝
+        }, { timeout: 15000 });
     } else {
         completePunch(0, 0);
     }
   };
 
   const finishPunch = (status: string, lat: number, lng: number) => {
-    // 再次確認下班地點
     let finalStatus = status;
     if (currentPunchType === 'out' && settings.companyLat) {
-        // Recalculate distance just to be sure
         const d = getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng);
         if (d > settings.allowedRadius) finalStatus = '地點異常';
     }
@@ -310,6 +301,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       dist: distance || 0
     });
     
+    setIsVerifying(false);
+    
     const data = StorageService.loadData();
     setRecords(data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id));
     
@@ -322,7 +315,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const allLeaves = StorageService.loadData().leaves.filter(l => l.userId === user.id);
   const recentLeave = allLeaves[0];
-  
   const allOvertime = StorageService.loadData().overtimes.filter(o => o.userId === user.id);
   const recentOT = allOvertime[0];
 
@@ -432,9 +424,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       
       {/* Global Notification */}
       {notification && (
-        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-bounce font-black text-sm md:text-base border-2 transition-all duration-300 ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
-           {notification.type === 'success' ? <CheckCircle size={20} className="flex-shrink-0" /> : <AlertTriangle size={20} className="flex-shrink-0" />}
-           <span className="truncate">{notification.message}</span>
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
+           {notification.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
+           <span className="flex-1">{notification.message}</span>
         </div>
       )}
 
@@ -542,7 +534,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  <div className="space-y-6 md:space-y-8">
                    <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                      <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-brand-800">填寫假單</h3>
-                     {/* ... Leave Form ... */}
+                     
                      <div className="mb-6 grid grid-cols-3 gap-2 md:gap-3">
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-blue-100 shadow-sm flex flex-col items-center text-center">
                             <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">特休假</div>
@@ -562,11 +554,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                            <div className="space-y-2">
                              <label className="text-xs font-black text-gray-400">開始日期</label>
-                             <input type="date" value={leaveForm.startDate} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-300 transition-all" onChange={e => setLeaveForm({...leaveForm, startDate: e.target.value})} />
+                             <input type="date" value={leaveForm.startDate} className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-300 transition-all [color-scheme:light]" onChange={e => setLeaveForm({...leaveForm, startDate: e.target.value})} />
                            </div>
                            <div className="space-y-2">
                              <label className="text-xs font-black text-gray-400">結束日期</label>
-                             <input type="date" value={leaveForm.endDate} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-300 transition-all" onChange={e => setLeaveForm({...leaveForm, endDate: e.target.value})} />
+                             <input type="date" value={leaveForm.endDate} className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-300 transition-all [color-scheme:light]" onChange={e => setLeaveForm({...leaveForm, endDate: e.target.value})} />
                            </div>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -691,16 +683,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  <div className="space-y-6 md:space-y-8">
                     <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                        <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-indigo-800">填寫加班單</h3>
-                       {/* ... OT Form ... */}
                        <div className="space-y-4 md:space-y-6">
                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                              <div className="space-y-2">
                                <label className="text-xs font-black text-gray-400">開始日期</label>
-                               <input type="date" className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-indigo-300 transition-all" onChange={e=>setOtForm({...otForm, startDate: e.target.value})} value={otForm.startDate} required />
+                               <input type="date" className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-indigo-300 transition-all [color-scheme:light]" onChange={e=>setOtForm({...otForm, startDate: e.target.value})} value={otForm.startDate} required />
                              </div>
                              <div className="space-y-2">
                                <label className="text-xs font-black text-gray-400">結束日期</label>
-                               <input type="date" className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-indigo-300 transition-all" onChange={e=>setOtForm({...otForm, endDate: e.target.value})} value={otForm.endDate} required />
+                               <input type="date" className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-indigo-300 transition-all [color-scheme:light]" onChange={e=>setOtForm({...otForm, endDate: e.target.value})} value={otForm.endDate} required />
                              </div>
                            </div>
                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -834,7 +825,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
       {/* Modals */}
       
-      {/* 1. Punch Math Challenge Modal */}
+      {/* 1. Punch Math Challenge Modal (Restored) */}
       {punchMathChallenge && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[1050] flex items-center justify-center p-4 md:p-6 text-black">
            <div className="bg-white rounded-[32px] md:rounded-[48px] p-8 md:p-12 w-full max-w-md shadow-2xl border-4 border-brand-500 animate-in bounce-in duration-500">
@@ -889,9 +880,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
                  <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件 (可查三個月內)</div>
                  <div className="flex gap-2">
-                    <input type="date" value={punchFilterStart} onChange={e=>setPunchFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <input type="date" value={punchFilterStart} onChange={e=>setPunchFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="開始" />
                     <span className="self-center text-gray-300">~</span>
-                    <input type="date" value={punchFilterEnd} onChange={e=>setPunchFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
+                    <input type="date" value={punchFilterEnd} onChange={e=>setPunchFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="結束" />
                  </div>
                  <div className="flex justify-end">
                      <button onClick={()=>{setPunchFilterStart(''); setPunchFilterEnd('');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1"><RotateCcw size={10}/> 清除篩選</button>
@@ -911,8 +902,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                           <div className="text-xs font-black text-gray-400">{TimeService.getTaiwanDate(r.date)}</div>
                           <div className={`text-sm font-black ${r.type==='in'?'text-brand-600':'text-red-600'}`}>{r.type==='in'?'上班':'下班'}</div>
                        </div>
-                       <div className="flex-1 text-center text-xl font-mono font-black text-gray-800">
-                          {TimeService.formatTimeOnly(r.time, true)}
+                       <div className="flex-1 text-center">
+                          <div className="text-xl font-mono font-black text-gray-800">{TimeService.formatTimeOnly(r.time, true)}</div>
                        </div>
                        <div className="flex flex-col items-end gap-1 min-w-[60px]">
                           <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
@@ -932,7 +923,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* 4. Leave History Modal */}
+      {/* 4. Leave History Modal (Unchanged) */}
       {showLeaveHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
@@ -945,9 +936,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
                  <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件</div>
                  <div className="flex gap-2">
-                    <input type="date" value={historyFilterStart} onChange={e=>setHistoryFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <input type="date" value={historyFilterStart} onChange={e=>setHistoryFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="開始" />
                     <span className="self-center text-gray-300">~</span>
-                    <input type="date" value={historyFilterEnd} onChange={e=>setHistoryFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
+                    <input type="date" value={historyFilterEnd} onChange={e=>setHistoryFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="結束" />
                  </div>
                  <div className="flex gap-2">
                     <select 
@@ -1000,7 +991,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* 5. Overtime History Modal */}
+      {/* 5. Overtime History Modal (Unchanged logic) */}
       {showOTHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
@@ -1013,9 +1004,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
                  <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件</div>
                  <div className="flex gap-2">
-                    <input type="date" value={otFilterStart} onChange={e=>setOtFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="開始" />
+                    <input type="date" value={otFilterStart} onChange={e=>setOtFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="開始" />
                     <span className="self-center text-gray-300">~</span>
-                    <input type="date" value={otFilterEnd} onChange={e=>setOtFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border outline-none font-black" placeholder="結束" />
+                    <input type="date" value={otFilterEnd} onChange={e=>setOtFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="結束" />
                     <button onClick={()=>{setOtFilterStart(''); setOtFilterEnd('');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1 whitespace-nowrap"><RotateCcw size={10}/> 清除</button>
                  </div>
               </div>
@@ -1055,6 +1046,19 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
            </div>
         </div>
       )}
+
+      {/* Photo Viewer Modal */}
+      {viewPhotoUrl && (
+        <div className="fixed inset-0 bg-black/90 z-[3000] flex items-center justify-center p-4 cursor-pointer" onClick={() => setViewPhotoUrl(null)}>
+           <div className="relative max-w-full max-h-full">
+              <img src={viewPhotoUrl} alt="Proof" className="rounded-2xl shadow-2xl max-w-[90vw] max-h-[80vh] border-4 border-white" />
+              <div className="absolute top-2 right-2 bg-black/50 text-white p-2 rounded-full hover:bg-black/70 transition-all">
+                 <XCircle size={24} />
+              </div>
+           </div>
+        </div>
+      )}
+
     </div>
   );
 };

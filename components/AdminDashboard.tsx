@@ -7,7 +7,7 @@ import { Button } from './ui/Button';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -219,9 +219,7 @@ export const AdminDashboard: React.FC = () => {
 
     let csv = "\uFEFF打卡日期,員工帳號,員工姓名,部門,打卡時間,類型,距離(M),狀態\n";
     enhancedRecords.forEach(r => {
-        // 使用 TimeService.getTaiwanDate 強制修正日期格式為 YYYY-MM-DD
         const safeDate = TimeService.getTaiwanDate(r.date);
-        // 使用 TimeService.formatTimeOnly(..., true) 確保顯示秒數
         csv += `${safeDate},${r.userId},${r.userName},${r.dept},${TimeService.formatTimeOnly(r.time, true)},${r.type==='in'?'上班':'下班'},${r.dist.toFixed(0)},${r.status}\n`;
     });
 
@@ -322,7 +320,7 @@ export const AdminDashboard: React.FC = () => {
     const items = type === 'leave' ? data.leaves : data.overtimes;
     
     const filtered = items.filter(i => {
-      // 安全地處理開始日期，處理可能存在的 T 或格式問題
+      // 安全地處理開始日期
       if (!i.start) return false;
       const d = i.start.replace('T', ' ').split(' ')[0];
       return d >= exportStart && d <= exportEnd;
@@ -340,7 +338,6 @@ export const AdminDashboard: React.FC = () => {
         const startStr = TimeService.formatDateTime(i.start, true);
         const endStr = TimeService.formatDateTime(i.end, true);
         const reason = i.reason ? String(i.reason) : '';
-        // 修正加班匯出時 type 欄位的顯示
         const exportType = type === 'leave' ? i.type : '加班';
         csv += `${i.userId},${i.userName},${exportType},${startStr},${endStr},${i.hours},${getStatusText(i.status)},${reason.replace(/,/g, ' ')}\n`;
     });
@@ -394,10 +391,6 @@ export const AdminDashboard: React.FC = () => {
                     statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
                 }
             }
-
-            if (lastOut.status === '地點異常' || (data.settings.companyLat && lastOut.dist > data.settings.allowedRadius)) {
-               statusTags.push({ label: '地點異常', color: 'text-red-700 bg-red-100 border-red-300' });
-            }
         } else {
             const nowH = new Date().getHours();
             if (nowH >= 18 && !isHoliday) {
@@ -421,13 +414,13 @@ export const AdminDashboard: React.FC = () => {
         }
     }
 
-    // 員工總覽的時間顯示：使用 formatTimeOnly(..., true) 顯示秒數
+    // Prepare Display Data
     const inDisplay = firstIn ? `${TimeService.getTaiwanDate(firstIn.date)} ${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
     const outDisplay = lastOut ? `${TimeService.getTaiwanDate(lastOut.date)} ${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
     
-    // 新增：實際打卡座標
-    const inLoc = firstIn ? `${firstIn.lat.toFixed(5)}, ${firstIn.lng.toFixed(5)}` : '';
-    const outLoc = lastOut ? `${lastOut.lat.toFixed(5)}, ${lastOut.lng.toFixed(5)}` : '';
+    // Coordinates & Distance
+    const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist } : null;
+    const outLoc = lastOut ? { lat: lastOut.lat, lng: lastOut.lng, dist: lastOut.dist } : null;
 
     return { 
       tags: statusTags, 
@@ -469,9 +462,9 @@ export const AdminDashboard: React.FC = () => {
   return (
     <div className="flex flex-col h-full bg-gray-50 overflow-hidden relative">
       {toast && (
-        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-bounce font-black text-sm md:text-base border-2 transition-all duration-300 ${toast.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
-           {toast.type === 'success' ? <CheckCircle size={20} className="flex-shrink-0" /> : <AlertTriangle size={20} className="flex-shrink-0" />}
-           <span className="whitespace-nowrap">{toast.message}</span>
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${toast.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
+           {toast.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
+           <span className="flex-1">{toast.message}</span>
         </div>
       )}
 
@@ -557,23 +550,41 @@ export const AdminDashboard: React.FC = () => {
                  <div className="overflow-x-auto">
                    <table className="w-full text-left min-w-[800px]">
                       <thead className="bg-gray-50 text-xs font-black uppercase text-gray-400">
-                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班</th><th className="p-4 md:p-6">下班</th><th className="p-4 md:p-6">狀態</th><th className="p-4 md:p-6 text-right">操作</th></tr>
+                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班打卡</th><th className="p-4 md:p-6">下班打卡</th><th className="p-4 md:p-6">狀態</th><th className="p-4 md:p-6 text-right">操作</th></tr>
                       </thead>
                       <tbody className="divide-y text-black font-bold text-sm">
                          {data.users.filter(u => u.role !== 'admin' && (showArchived ? u.deleted : !u.deleted)).map(u => {
                             const status = getEmployeeStatus(u.id);
+                            // Helper to render Location info
+                            const renderLocInfo = (info: {lat: number, lng: number, dist: number} | null) => {
+                                if(!info) return null;
+                                const allowed = data.settings.allowedRadius;
+                                const isFar = info.dist > (allowed + 50); // Specifically highlight if > 50m over
+                                return (
+                                    <div className="mt-1 space-y-0.5">
+                                        <div className="text-[10px] text-gray-400 font-mono flex items-center gap-1">
+                                            <MapPin size={10} /> {info.lat.toFixed(5)}, {info.lng.toFixed(5)}
+                                        </div>
+                                        <div className={`text-[10px] font-black ${isFar ? 'text-red-500 animate-pulse flex items-center gap-1' : 'text-gray-400'}`}>
+                                            {isFar && <AlertTriangle size={10} />}
+                                            距離: {info.dist.toFixed(0)}m
+                                        </div>
+                                    </div>
+                                );
+                            };
+
                             return (
                               <tr key={u.id} className="hover:bg-gray-50">
                                  <td className="p-4 md:p-6 font-mono font-black text-brand-600">{u.id}</td>
                                  <td className="p-4 md:p-6 font-black">{u.name}</td>
                                  <td className="p-4 md:p-6 text-gray-500">{u.dept}</td>
                                  <td className="p-4 md:p-6">
-                                    <div className="font-mono text-xs">{status.inTime}</div>
-                                    {status.inLoc && <div className="text-[10px] text-gray-400 font-mono">{status.inLoc}</div>}
+                                    <div className="font-mono text-xs font-black text-gray-800">{status.inTime}</div>
+                                    {renderLocInfo(status.inLoc)}
                                  </td>
                                  <td className="p-4 md:p-6">
-                                    <div className="font-mono text-xs">{status.outTime}</div>
-                                    {status.outLoc && <div className="text-[10px] text-gray-400 font-mono">{status.outLoc}</div>}
+                                    <div className="font-mono text-xs font-black text-gray-800">{status.outTime}</div>
+                                    {renderLocInfo(status.outLoc)}
                                  </td>
                                  <td className={`p-4 md:p-6`}>
                                    <div className="flex flex-wrap gap-2">
@@ -608,8 +619,9 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
+          {/* ... (Rest of the component remains the same, just keeping the structure intact) ... */}
           {activeView === 'leaves' && (
-            // ... (Content identical to previous version, truncated for brevity)
+            // ... (Same as before)
             <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-brand-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核假單</h3>
@@ -703,7 +715,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'ot' && (
-             // ... (Content identical to previous version, truncated for brevity)
+             // ... (Same as before)
               <div className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-indigo-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核加班</h3>
@@ -796,9 +808,10 @@ export const AdminDashboard: React.FC = () => {
                </div>
             </div>
           )}
-
+          
+          {/* ... (Other views remain unchanged) */}
           {activeView === 'news' && (
-            // ... (Content identical to previous version, truncated for brevity)
+            // ... (Same as before)
             <div className="max-w-4xl space-y-8 md:space-y-12">
                <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                   <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8">{editAnnId ? '編輯公告' : '發布公告'}</h3>
@@ -862,7 +875,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'holiday' && (
-             // ... (Content identical to previous version, truncated for brevity)
+             // ... (Same as before)
              <div className="max-w-2xl space-y-8 md:space-y-12">
                 <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                    <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-10 flex items-center gap-3"><Palmtree className="text-brand-500" /> 設定休假日</h3>
@@ -927,7 +940,7 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'system' && (
-             // ... (Content identical to previous version, truncated for brevity)
+             // ... (Same as before)
              <div className="max-w-2xl bg-white p-6 md:p-12 rounded-[40px] md:rounded-[56px] shadow-2xl border animate-in zoom-in-95 duration-500">
                 <h3 className="text-2xl md:text-3xl font-black mb-8 md:mb-12 flex items-center gap-4 text-gray-800"><Settings className="text-brand-600" size={32}/> 核心參數設定</h3>
                 <form className="space-y-6 md:space-y-10" onSubmit={(e) => {
@@ -1100,7 +1113,6 @@ export const AdminDashboard: React.FC = () => {
                                     <div>
                                         <span className={`px-1.5 py-0.5 rounded text-[10px] ${l.type==='特休'?'bg-blue-100 text-blue-700':l.type==='補休'?'bg-purple-100 text-purple-700':l.type==='生日假'?'bg-pink-100 text-pink-700':'bg-gray-100 text-gray-600'}`}>{l.type}</span>
                                     </div>
-                                    {/* Fix: Correct Date Display */}
                                     <div className="font-mono text-gray-500 text-[10px] whitespace-nowrap overflow-hidden">{TimeService.getTaiwanDate(l.start)}</div>
                                     <div className="font-black text-gray-800">{l.hours}hr</div>
                                     <div className="text-right text-gray-400 truncate">{l.reason}</div>

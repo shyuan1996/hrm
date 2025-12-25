@@ -23,6 +23,9 @@ const getInitialData = (): AppData => ({
   settings: DEFAULT_SETTINGS
 });
 
+// Singleton promise to store the active fetch request
+let _activeCloudFetch: Promise<AppData | null> | null = null;
+
 export const StorageService = {
   loadData: (): AppData => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -54,47 +57,56 @@ export const StorageService = {
 
   /**
    * 嘗試從雲端 (Google Apps Script) 獲取最新資料
-   * 成功後會更新 LocalStorage
+   * 採用 Singleton Promise 模式：
+   * 1. 如果已經有正在進行的請求，直接回傳該請求的 Promise (避免重複發送)。
+   * 2. 請求完成後會自動更新 LocalStorage。
    */
-  fetchCloudData: async (): Promise<AppData | null> => {
+  fetchCloudData: (): Promise<AppData | null> => {
+    // Return existing promise if request is already in flight
+    if (_activeCloudFetch) return _activeCloudFetch;
+
     const localData = StorageService.loadData();
     // 使用本地設定的 URL，如果沒有則使用預設常數，確保第一次載入能連線
     const gasUrl = localData.settings?.gasUrl || DEFAULT_SETTINGS.gasUrl;
 
     if (!gasUrl) {
       console.warn("No GAS URL configured, skipping cloud fetch.");
-      return null;
+      return Promise.resolve(null);
     }
 
-    try {
-      const response = await fetch(gasUrl);
-      if (!response.ok) throw new Error('Cloud fetch failed');
-      
-      const cloudData = await response.json();
-      
-      // 驗證回傳的資料結構
-      if (cloudData && typeof cloudData === 'object') {
-        // 如果雲端回傳的是空的或者使用者列表為空 (新建立的Sheet)
-        if (!cloudData.users || !Array.isArray(cloudData.users) || cloudData.users.length === 0) {
-             console.log("Cloud seems empty. Initializing with default data...");
-             // 保持原本的資料結構，不被空資料覆蓋，但標記為同步成功
-             // 如果是全新部屬，可以考慮將本地初始資料推送到雲端
-             const initData = getInitialData();
-             // 保留設定
-             if (localData.settings) initData.settings = localData.settings;
-             
-             await StorageService.saveData(initData);
-             return initData;
+    _activeCloudFetch = fetch(gasUrl)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Cloud fetch failed');
+        const cloudData = await response.json();
+        
+        // 驗證回傳的資料結構
+        if (cloudData && typeof cloudData === 'object') {
+          // 如果雲端回傳的是空的或者使用者列表為空 (新建立的Sheet)
+          if (!cloudData.users || !Array.isArray(cloudData.users) || cloudData.users.length === 0) {
+               console.log("Cloud seems empty. Initializing with default data...");
+               const initData = getInitialData();
+               if (localData.settings) initData.settings = localData.settings;
+               await StorageService.saveData(initData);
+               return initData;
+          }
+
+          // 更新本地儲存
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
+          return cloudData as AppData;
         }
+        return null;
+      })
+      .catch((err) => {
+        console.error("Cloud Sync Error (GET):", err);
+        return null;
+      })
+      .finally(() => {
+        // Reset promise so subsequent calls can trigger a new fetch if needed
+        // We delay clearing it slightly to let concurrent components use the cached result
+        setTimeout(() => { _activeCloudFetch = null; }, 1000);
+      });
 
-        // 更新本地儲存
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
-        return cloudData as AppData;
-      }
-    } catch (err) {
-      console.error("Cloud Sync Error (GET):", err);
-    }
-    return null;
+    return _activeCloudFetch;
   },
 
   saveData: async (data: AppData) => {
@@ -276,3 +288,10 @@ export const StorageService = {
     StorageService.saveData(data);
   }
 };
+
+// [CRITICAL] Pre-fetch cloud data immediately upon module load.
+// This ensures that by the time React mounts the App, the request is already flight.
+// This effectively creates a "Zero Latency" feel for the user.
+setTimeout(() => {
+    StorageService.fetchCloudData();
+}, 0);
