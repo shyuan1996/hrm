@@ -322,8 +322,7 @@ export const StorageService = {
         gasUrl: settings.gasUrl || "disabled",
         companyLat: Number(settings.companyLat) || 0,
         companyLng: Number(settings.companyLng) || 0,
-        allowedRadius: Number(settings.allowedRadius) || 100,
-        systemVersion: settings.systemVersion || '0.0.0'
+        allowedRadius: Number(settings.allowedRadius) || 100
     };
     await setDoc(doc(db, 'system', 'settings'), safeSettings);
   }

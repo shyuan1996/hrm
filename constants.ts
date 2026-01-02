@@ -15,8 +15,7 @@ export const DEFAULT_SETTINGS = {
   gasUrl: 'https://script.google.com/macros/s/AKfycbyGuWxWuv61c67Adsd48ABkhUSAiiNd0dPaOcXnORRAZ_5BaJ4QsNOydCos92vCRn7DoQ/exec',
   companyLat: 0, 
   companyLng: 0,
-  allowedRadius: 100,
-  systemVersion: '0.0.0' // 預設版本，等待 Admin 更新
+  allowedRadius: 100 
 };
 
 export const LEAVE_TYPES = [
