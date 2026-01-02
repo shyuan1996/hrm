@@ -5,7 +5,7 @@ export const REMEMBER_USER_KEY = 'attendance_remember_user_v3';
 
 // 系統版本號：每次發布更新時，請修改此版本號 (例如 1.0.0 -> 1.0.1)
 // 系統偵測到版本變更時，會自動清除使用者的 LocalStorage 快取並強制重新整理
-export const APP_VERSION = '1.0.2'; 
+export const APP_VERSION = '1.0.1'; 
 export const VERSION_KEY = 'sas_app_version';
 
 // 預設系統參數
@@ -16,7 +16,7 @@ export const DEFAULT_SETTINGS = {
   companyLat: 0, 
   companyLng: 0,
   allowedRadius: 100,
-  systemVersion: '0.0.0' // 預設版本
+  systemVersion: '0.0.0' // 預設版本，等待 Admin 更新
 };
 
 export const LEAVE_TYPES = [

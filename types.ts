@@ -83,5 +83,5 @@ export interface AppSettings {
   companyLat: number;
   companyLng: number;
   allowedRadius: number;
-  systemVersion: string; // 新增：用於版本控制
+  systemVersion: string; // 新增：資料庫中紀錄的最新系統版本
 }
