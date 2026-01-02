@@ -6,7 +6,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { User, AppSettings } from './types';
 import { StorageService } from './services/storageService';
 import { TimeService } from './services/timeService';
-import { SESSION_KEY, DEFAULT_SETTINGS } from './constants';
+import { SESSION_KEY, DEFAULT_SETTINGS, APP_VERSION, VERSION_KEY, REMEMBER_USER_KEY, STORAGE_KEY } from './constants';
 import { Key, LogOut, CheckCircle, UserCircle, AlertTriangle } from 'lucide-react';
 import { Button } from './components/ui/Button';
 import { auth } from './services/firebase';
@@ -42,6 +42,41 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // 0. Version Check Logic
+    // 如果資料庫的版本號 (systemVersion) 比當前程式碼版本 (APP_VERSION) 還新
+    // 代表使用者目前跑的是舊版快取，需要強制重整
+    const currentSystemVersion = appSettings.systemVersion;
+    if (currentSystemVersion && currentSystemVersion > APP_VERSION) {
+       console.warn(`Version Mismatch! Code: ${APP_VERSION}, DB: ${currentSystemVersion}. Cleaning cache and reloading...`);
+       
+       // 1. 保留重要的「記住我」設定
+       const savedUsername = localStorage.getItem(REMEMBER_USER_KEY);
+       
+       // 2. 清除所有 LocalStorage 快取 (包含舊的 JS/CSS 版本快取)
+       // 注意：這會登出使用者，但為了確保載入新版程式這是必要的
+       localStorage.clear();
+       
+       // 3. 還原「記住我」
+       if (savedUsername) {
+           localStorage.setItem(REMEMBER_USER_KEY, savedUsername);
+       }
+       
+       // 4. 清除 Service Worker 快取 (如果有)
+       if ('caches' in window) {
+          caches.keys().then((names) => {
+              names.forEach((name) => {
+                  caches.delete(name);
+              });
+          });
+       }
+
+       // 5. 強制重新整理頁面，並加上時間戳記以避開瀏覽器快取
+       const url = new URL(window.location.href);
+       url.searchParams.set('v', currentSystemVersion);
+       window.location.href = url.toString();
+       return;
+    }
+
     // 1. Initial Load from Cache (with defensive checks)
     const cachedData = safeLoadData();
     setAppSettings(cachedData.settings);
@@ -130,7 +165,7 @@ const App: React.FC = () => {
       }
       unsubscribeAuth();
     };
-  }, [safeLoadData]);
+  }, [safeLoadData, appSettings.systemVersion]);
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
     setNotification({ type, message });
