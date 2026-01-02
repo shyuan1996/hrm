@@ -5,7 +5,8 @@ export enum UserRole {
 }
 
 export interface User {
-  id: string;
+  id: string; // Username (e.g. 'admin')
+  uid?: string; // Firebase Auth UID (Critical for Security Rules)
   pass: string;
   name: string;
   role: UserRole;

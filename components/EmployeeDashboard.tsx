@@ -34,9 +34,9 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
 
       <div className="flex flex-col items-end gap-1 min-w-[50px]">
           <div className={`px-1.5 py-0.5 rounded-full text-[10px] font-black text-white text-center w-auto min-w-[35px] ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
-            {r.status === '地點異常' ? '異常' : '成功'}
+            成功
           </div>
-          {r.status.includes('異常') && <span className="text-[9px] bg-red-100 text-red-600 px-1 rounded font-bold text-center w-auto min-w-[35px]">異常</span>}
+          {r.status.includes('異常') && <span className="text-[9px] bg-red-100 text-red-600 px-1 rounded font-bold text-center w-auto min-w-[35px]">地點異常</span>}
       </div>
     </div>
   );
@@ -46,8 +46,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
+  
+  // Use state to hold data instead of relying on prop updates to avoid flicker
+  const [localData, setLocalData] = useState(StorageService.loadData());
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [holidays, setHolidays] = useState<Holiday[]>([]);
+  
   const [isVerifying, setIsVerifying] = useState(false);
   
   // Mobile View State
@@ -181,14 +185,34 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     };
   }, [settings]);
 
+  // Data Sync and Time
   useEffect(() => {
     const timer = setInterval(() => setNow(TimeService.getCorrectedNow(timeOffset)), 1000);
-    const data = StorageService.loadData();
-    const userRecords = data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id);
-    setRecords(userRecords);
-    setHolidays(data.holidays);
-    return () => clearInterval(timer);
+    
+    const updateLocalData = () => {
+        const newData = StorageService.loadData();
+        // CRITICAL FIX: Spread object to force React to detect change even if reference is same
+        setLocalData({ ...newData }); 
+    };
+
+    // Initial load
+    updateLocalData();
+
+    // Listen for updates
+    window.addEventListener('storage-update', updateLocalData);
+
+    return () => {
+        clearInterval(timer);
+        window.removeEventListener('storage-update', updateLocalData);
+    };
   }, [timeOffset, user.id]);
+
+  // Derive state from localData whenever it changes
+  useEffect(() => {
+      const userRecords = localData.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id);
+      setRecords(userRecords);
+      setHolidays(localData.holidays);
+  }, [localData, user.id]);
 
   useEffect(() => {
     let timer: any;
@@ -213,7 +237,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const initiatePunch = () => {
     if (!isTimeSynced) {
-        setNotification({ type: 'error', message: "系統時間正在校正中，請稍候..." });
+        setNotification({ type: 'error', message: "無法連接網路時間伺服器，禁止打卡，請檢查網路連線。" });
         return;
     }
     if (Math.abs(timeOffset) > 60000) {
@@ -266,29 +290,60 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         clearTimeout(checkTimeout);
         
         finishPunch('正常', lat, lng);
-        setIsVerifying(false);
     };
 
-    // Get fresh position
+    // Get fresh position with High Accuracy
     if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition((pos) => {
             completePunch(pos.coords.latitude, pos.coords.longitude);
-        }, () => {
-             completePunch(0, 0);
-        }, { timeout: 15000 });
+        }, (err) => {
+             console.warn("High accuracy geolocation failed", err);
+             // If high accuracy fails, try standard but verify last known valid location
+             if (distance !== null && settings.companyLat && settings.companyLng) {
+                 // Fallback to currently watched position if valid
+                 // But for security, if fresh pull fails, we should be cautious. 
+                 // Here we will proceed with watched value if high accuracy fetch fails to avoid blocking user completely in bad signal areas, 
+                 // but we log it. Ideally we should block if critical.
+                 completePunch(0, 0); // Using 0,0 to indicate failed fresh fetch, distance logic might fail verification
+             } else {
+                 completePunch(0, 0);
+             }
+        }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }); // maximumAge: 0 forces fresh reading
     } else {
         completePunch(0, 0);
     }
   };
 
-  const finishPunch = (status: string, lat: number, lng: number) => {
+  const finishPunch = async (status: string, lat: number, lng: number) => {
     let finalStatus = status;
-    if (currentPunchType === 'out' && settings.companyLat) {
-        const d = getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng);
-        if (d > settings.allowedRadius) finalStatus = '地點異常';
+    
+    // Server-side check simulation: Re-verify distance with fresh coords
+    if (settings.companyLat) {
+        // If we got 0,0 from error handler, fallback or error out. 
+        // For now, if lat/lng are 0, we assume location failed.
+        if (lat === 0 && lng === 0) {
+             setNotification({ type: 'error', message: "無法獲取精確位置，請稍後再試" });
+             setIsVerifying(false);
+             return;
+        }
+
+        const freshDistance = getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng);
+        // Record the actual calculated distance
+        setDistance(freshDistance); 
+
+        // Strictly check IN punch range again with fresh data
+        if (currentPunchType === 'in' && freshDistance > settings.allowedRadius) {
+             setNotification({ type: 'error', message: `即時定位距離過遠 (${freshDistance.toFixed(0)}m)，打卡失敗` });
+             setIsVerifying(false);
+             return;
+        }
+
+        if (currentPunchType === 'out' && freshDistance > settings.allowedRadius) {
+            finalStatus = '地點異常';
+        }
     }
 
-    StorageService.addRecord({
+    const newRecord: AttendanceRecord = {
       id: Date.now(),
       userId: user.id,
       userName: user.name,
@@ -298,25 +353,30 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       status: finalStatus,
       lat: lat, 
       lng: lng, 
-      dist: distance || 0
-    });
+      dist: settings.companyLat ? getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng) : 0
+    };
+
+    try {
+        await StorageService.addRecord(newRecord);
+        
+        if (finalStatus === '地點異常') {
+            setNotification({ type: 'success', message: `下班打卡成功 (注意：您在打卡範圍外)` });
+        } else {
+            setNotification({ type: 'success', message: `${currentPunchType === 'in' ? '上班' : '下班'}打卡成功！` });
+        }
+    } catch (e) {
+        console.error("Punch Error:", e);
+        setNotification({ type: 'error', message: "打卡失敗：無法寫入資料庫，請檢查網路連線或權限" });
+    }
     
     setIsVerifying(false);
-    
-    const data = StorageService.loadData();
-    setRecords(data.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id));
-    
-    if (finalStatus === '地點異常') {
-        setNotification({ type: 'success', message: `下班打卡成功 (注意：您在打卡範圍外)` });
-    } else {
-        setNotification({ type: 'success', message: `${currentPunchType === 'in' ? '上班' : '下班'}打卡成功！` });
-    }
   };
 
-  const allLeaves = StorageService.loadData().leaves.filter(l => l.userId === user.id);
-  const recentLeave = allLeaves[0];
-  const allOvertime = StorageService.loadData().overtimes.filter(o => o.userId === user.id);
-  const recentOT = allOvertime[0];
+  const allLeaves = localData.leaves.filter(l => l.userId === user.id).sort((a,b) => b.id - a.id);
+  const recentLeave = allLeaves.length > 0 ? allLeaves[0] : null;
+  
+  const allOvertime = localData.overtimes.filter(o => o.userId === user.id).sort((a,b) => b.id - a.id);
+  const recentOT = allOvertime.length > 0 ? allOvertime[0] : null;
 
   const quotaStats = useMemo(() => {
     const calculateUsed = (type: string) => 
@@ -453,7 +513,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                   {!isTimeSynced ? (
                      <div className="flex flex-col items-center">
                        <Loader2 size={40} className="animate-spin text-white mb-2" />
-                       <span className="text-xl md:text-2xl font-black text-white">時間校正中...</span>
+                       <span className="text-xl md:text-2xl font-black text-white">連線中...</span>
                      </div>
                   ) : !isLocationReady ? (
                      <div className="flex flex-col items-center">
@@ -907,7 +967,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                        </div>
                        <div className="flex flex-col items-end gap-1 min-w-[60px]">
                           <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
-                            {r.status === '地點異常' ? '異常' : '成功'}
+                            成功
                           </div>
                           {r.status.includes('異常') && <span className="text-[9px] text-red-500 font-bold">地點異常</span>}
                        </div>
@@ -923,7 +983,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         </div>
       )}
 
-      {/* 4. Leave History Modal (Unchanged) */}
+      {/* 4. Leave History Modal (Unchanged logic) */}
       {showLeaveHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">

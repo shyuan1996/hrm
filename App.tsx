@@ -6,82 +6,66 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { User, AppSettings } from './types';
 import { StorageService } from './services/storageService';
 import { TimeService } from './services/timeService';
-import { SESSION_KEY } from './constants';
+import { SESSION_KEY, DEFAULT_SETTINGS } from './constants';
 import { Key, LogOut, CheckCircle, UserCircle, AlertTriangle } from 'lucide-react';
 import { Button } from './components/ui/Button';
+import { auth } from './services/firebase';
+import { signOut, onAuthStateChanged } from 'firebase/auth';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  
-  // [OPTIMIZATION] Initialize synchronously from local storage.
-  // This ensures the UI renders instantly without a loading blink.
-  const [appSettings, setAppSettings] = useState<AppSettings>(() => StorageService.loadData().settings);
-  
+  const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [timeOffset, setTimeOffset] = useState(0);
-  const [isTimeSynced, setIsTimeSynced] = useState(false);
+  const [isTimeSynced, setIsTimeSynced] = useState(false); // New state to track time sync status
   const [isSelfPwdModalOpen, setIsSelfPwdModalOpen] = useState(false);
   const [newSelfPwd, setNewSelfPwd] = useState({ p1: '', p2: '' });
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
-
-  const performTimeSync = async () => {
-    if (!isTimeSynced) setIsTimeSynced(false);
-    
-    const offset = await TimeService.getNetworkTimeOffset();
-    if (offset !== null) {
-      setTimeOffset(offset);
-      setIsTimeSynced(true);
-      console.log("Time synced successfully.");
-    } else {
-      console.warn("時間校正失敗，請檢查網路連線");
-      setTimeout(async () => {
-         const retryOffset = await TimeService.getNetworkTimeOffset();
-         if (retryOffset !== null) {
-            setTimeOffset(retryOffset);
-            setIsTimeSynced(true);
-         }
-      }, 3000);
-    }
-  };
-
+  
   useEffect(() => {
-    const init = async () => {
-      // 1. Initial State is already set via useState lazy initializer (Instant UI)
+    // 1. Initial Load from Cache
+    const cachedData = StorageService.loadData();
+    setAppSettings(cachedData.settings);
 
-      // 2. Perform Cloud Sync in Background (Stale-While-Revalidate)
-      // fetchCloudData is idempotent and likely already started by the module import.
-      // We just await the result here.
-      const cloudData = await StorageService.fetchCloudData();
-      if (cloudData) {
-          setAppSettings(cloudData.settings);
-      }
-      
-      // 3. Time Sync
-      performTimeSync();
-      
-      // 4. Session Check
-      const savedSession = localStorage.getItem(SESSION_KEY);
-      if (savedSession) {
-        const parsed = JSON.parse(savedSession);
-        // Use data from memory which might be fresher if cloud sync finished
-        const currentData = StorageService.loadData();
-        const user = currentData.users.find(u => u.id === parsed.id);
-        if (user && !user.deleted) setCurrentUser(user);
-      }
+    // 2. Listen for updates from StorageService to update App-level settings
+    const handleStorageUpdate = () => {
+        const freshData = StorageService.loadData();
+        setAppSettings(freshData.settings);
     };
-    init();
+    window.addEventListener('storage-update', handleStorageUpdate);
 
-    const handleVisibilityChange = () => {
-        if (document.visibilityState === 'visible') {
-            console.log("App visible, re-syncing time...");
-            performTimeSync();
-            // Optional: Re-fetch cloud data on visibility change
-            StorageService.fetchCloudData().then(d => { if(d) setAppSettings(d.settings); });
+    // 3. Time Sync
+    TimeService.getNetworkTimeOffset().then(offset => {
+        if (offset !== null) {
+            setTimeOffset(offset);
+            setIsTimeSynced(true);
+        } else {
+            setIsTimeSynced(false);
+            showNotification("網路時間校正失敗，為確保數據正確，請檢查網路連線", "error");
         }
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    });
+
+    // 4. Session & Auth State Listener
+    const unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser) => {
+        const savedSession = localStorage.getItem(SESSION_KEY);
+        
+        if (firebaseUser && savedSession) {
+            // 用戶已登入且有 Session
+            const parsed = JSON.parse(savedSession);
+            const user = cachedData.users.find(u => u.id === parsed.id);
+            if (user && !user.deleted) {
+                setCurrentUser(user);
+                StorageService.initRealtimeSync(user.id, user.role);
+            }
+        } else if (!firebaseUser) {
+            // Firebase 已登出，強制清除本地狀態
+            setCurrentUser(null);
+            localStorage.removeItem(SESSION_KEY);
+        }
+    });
 
     return () => {
-        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        window.removeEventListener('storage-update', handleStorageUpdate);
+        unsubscribeAuth();
     };
   }, []);
 
@@ -90,24 +74,41 @@ const App: React.FC = () => {
     setTimeout(() => setNotification(null), 3000);
   };
 
-  const handleUpdateSelfPwd = () => {
+  const handleUpdateSelfPwd = async () => {
     if (!newSelfPwd.p1 || newSelfPwd.p1 !== newSelfPwd.p2) {
       showNotification("密碼輸入不一致或不得為空", 'error');
       return;
     }
     if (!currentUser) return;
-    StorageService.updateUser(currentUser.id, { pass: newSelfPwd.p1 });
-    setIsSelfPwdModalOpen(false);
-    setNewSelfPwd({ p1: '', p2: '' });
-    showNotification("您的密碼已成功修改！", 'success');
+    try {
+        await StorageService.updateUser(currentUser.id, { pass: newSelfPwd.p1 });
+        setIsSelfPwdModalOpen(false);
+        setNewSelfPwd({ p1: '', p2: '' });
+        showNotification("您的密碼已成功修改！", 'success');
+    } catch (error) {
+        showNotification("密碼修改失敗，請稍後再試", 'error');
+    }
   };
 
-  const handleLogin = (u: User) => {
-    const data = StorageService.loadData();
-    setAppSettings(data.settings);
-    performTimeSync();
-    setCurrentUser(u);
-    localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role}));
+  // Called when Login component succeeds
+  const handleLoginSuccess = (u: User) => {
+      setCurrentUser(u);
+      localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role}));
+      // Start listening to this user's data
+      StorageService.initRealtimeSync(u.id, u.role);
+  };
+
+  const handleLogout = async () => {
+    try {
+        await signOut(auth);
+    } catch (error) {
+        console.error("Logout failed", error);
+    } finally {
+        // 重點修正：僅清除 Session 並重置 currentUser 為 null，
+        // 讓 React 重新渲染 Login 組件，而不是重新整理頁面 (這會導致 404)
+        localStorage.removeItem(SESSION_KEY);
+        setCurrentUser(null); 
+    }
   };
 
   if (!appSettings) return null;
@@ -116,9 +117,9 @@ const App: React.FC = () => {
     <div className="font-sans text-gray-900 antialiased h-screen flex flex-col bg-gray-50 relative">
       {/* Global Center Header Notification */}
       {notification && (
-        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
-           {notification.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
-           <span className="flex-1">{notification.message}</span>
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-bounce font-black text-sm md:text-base border-2 transition-all duration-300 ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
+           {notification.type === 'success' ? <CheckCircle size={20} className="flex-shrink-0" /> : <AlertTriangle size={20} className="flex-shrink-0" />}
+           <span className="whitespace-nowrap">{notification.message}</span>
         </div>
       )}
 
@@ -139,7 +140,7 @@ const App: React.FC = () => {
               <button onClick={() => setIsSelfPwdModalOpen(true)} className="flex items-center gap-1 md:gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-gray-500 hover:bg-gray-100 rounded-xl transition-all">
                 <Key size={16}/> <span className="hidden md:inline">更改密碼</span>
               </button>
-              <button onClick={() => { setCurrentUser(null); localStorage.removeItem(SESSION_KEY); }} className="flex items-center gap-1 md:gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-red-500 hover:bg-red-50 rounded-xl transition-all">
+              <button onClick={handleLogout} className="flex items-center gap-1 md:gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-red-500 hover:bg-red-50 rounded-xl transition-all">
                 <LogOut size={16}/> <span className="hidden md:inline">安全登出</span><span className="md:hidden">登出</span>
               </button>
             </div>
@@ -148,7 +149,7 @@ const App: React.FC = () => {
 
       <div className="flex-1 overflow-hidden relative">
         {!currentUser ? (
-          <Login onLogin={(u) => { setCurrentUser(u); localStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id, role: u.role})); }} />
+          <Login onLogin={handleLoginSuccess} />
         ) : currentUser.role === 'admin' ? (
           <AdminDashboard />
         ) : (

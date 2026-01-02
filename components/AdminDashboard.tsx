@@ -4,10 +4,12 @@ import { User, OvertimeRequest, Announcement, UserRole } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { Button } from './ui/Button';
+import { auth } from '../services/firebase';
+import { sendPasswordResetEmail } from 'firebase/auth';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -21,6 +23,8 @@ export const AdminDashboard: React.FC = () => {
   const [isEditUserModalOpen, setIsEditUserModalOpen] = useState(false);
   const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  // Loading state for async actions
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
   // Export All Attendance Modal
   const [isExportAttendanceModalOpen, setIsExportAttendanceModalOpen] = useState(false);
@@ -28,7 +32,7 @@ export const AdminDashboard: React.FC = () => {
   const [attExportEnd, setAttExportEnd] = useState('');
   
   const [targetUser, setTargetUser] = useState<User | null>(null);
-  const [editUserForm, setEditUserForm] = useState({ name: '', dept: '', pass: '', passConfirm: '' });
+  const [editUserForm, setEditUserForm] = useState({ name: '', dept: '' });
   const [addUserForm, setAddUserForm] = useState({ id: '', pass: '', name: '', dept: '' });
   
   // Settings Modal State
@@ -73,7 +77,18 @@ export const AdminDashboard: React.FC = () => {
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-    return () => clearInterval(timer);
+    
+    // Subscribe to storage updates locally to avoid parent remounting us
+    const handleDataUpdate = () => {
+        // CRITICAL: Spread object to force React re-render
+        setData({ ...StorageService.loadData() });
+    };
+    window.addEventListener('storage-update', handleDataUpdate);
+
+    return () => {
+        clearInterval(timer);
+        window.removeEventListener('storage-update', handleDataUpdate);
+    };
   }, []);
 
   useEffect(() => {
@@ -92,15 +107,26 @@ export const AdminDashboard: React.FC = () => {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const refreshData = () => setData(StorageService.loadData());
+  const getErrorMessage = (e: any) => {
+      if (e.code === 'permission-denied') {
+          return '權限不足 (Permission Denied)：請檢查 Firestore Rules 中的 isAdmin() 是否正確指向 users/admin';
+      }
+      return e.message || '未知錯誤';
+  };
 
-  const handleAction = (type: 'leave' | 'ot', id: number, status: 'approved' | 'rejected', reason?: string) => {
-    if (type === 'leave') StorageService.updateLeaveStatus(id, status, reason);
-    else StorageService.updateOvertimeStatus(id, status, reason);
-    refreshData();
-    showToast("操作成功", 'success');
-    setRejectModal(null);
-    setRejectReason('');
+  const refreshData = () => setData({ ...StorageService.loadData() });
+
+  const handleAction = async (type: 'leave' | 'ot', id: number, status: 'approved' | 'rejected', reason?: string) => {
+    try {
+        if (type === 'leave') await StorageService.updateLeaveStatus(id, status, reason);
+        else await StorageService.updateOvertimeStatus(id, status, reason);
+        refreshData();
+        showToast("操作成功", 'success');
+        setRejectModal(null);
+        setRejectReason('');
+    } catch (e: any) {
+        showToast("操作失敗: " + getErrorMessage(e), 'error');
+    }
   };
 
   // Trigger Delete Challenge
@@ -113,16 +139,20 @@ export const AdminDashboard: React.FC = () => {
     setDeleteTarget({ id, type });
   };
 
-  const handleDeleteResponse = (choice: number) => {
+  const handleDeleteResponse = async (choice: number) => {
     if (choice === mathChallenge.a && deleteTarget) {
-      if (deleteTarget.type === 'user') StorageService.permanentDeleteUser(deleteTarget.id as string);
-      else if (deleteTarget.type === 'leave') StorageService.deleteLeave(deleteTarget.id as number);
-      else if (deleteTarget.type === 'ot') StorageService.deleteOvertime(deleteTarget.id as number);
-      else if (deleteTarget.type === 'announcement') StorageService.removeAnnouncement(deleteTarget.id as number);
-      else if (deleteTarget.type === 'holiday') StorageService.removeHoliday(deleteTarget.id as number);
-      
-      refreshData();
-      showToast("資料已刪除", 'success');
+      try {
+          if (deleteTarget.type === 'user') await StorageService.permanentDeleteUser(deleteTarget.id as string);
+          else if (deleteTarget.type === 'leave') await StorageService.deleteLeave(deleteTarget.id as number);
+          else if (deleteTarget.type === 'ot') await StorageService.deleteOvertime(deleteTarget.id as number);
+          else if (deleteTarget.type === 'announcement') await StorageService.removeAnnouncement(deleteTarget.id as number);
+          else if (deleteTarget.type === 'holiday') await StorageService.removeHoliday(deleteTarget.id as number);
+          
+          refreshData();
+          showToast("資料已刪除", 'success');
+      } catch (e: any) {
+          showToast("刪除失敗: " + getErrorMessage(e), 'error');
+      }
     } else {
       showToast("驗證錯誤，取消操作", 'error');
     }
@@ -131,7 +161,7 @@ export const AdminDashboard: React.FC = () => {
 
   const openEditUserModal = (user: User) => {
     setTargetUser(user);
-    setEditUserForm({ name: user.name, dept: user.dept, pass: '', passConfirm: '' });
+    setEditUserForm({ name: user.name, dept: user.dept });
     setIsEditUserModalOpen(true);
   };
 
@@ -172,17 +202,21 @@ export const AdminDashboard: React.FC = () => {
     setSeniorityCalc(`年資約 ${years.toFixed(1)} 年，依法規建議特休：${suggestedDays * 8} 小時 (${suggestedDays} 天)`);
   };
 
-  const handleSaveSettings = () => {
+  const handleSaveSettings = async () => {
     if (!targetUser) return;
-    StorageService.updateUser(targetUser.id, {
-        onboard_date: settingsForm.onboardDate,
-        quota_annual: Number(settingsForm.quotaAnnual),
-        quota_birthday: Number(settingsForm.quotaBirthday),
-        quota_comp: Number(settingsForm.quotaComp)
-    });
-    setIsSettingsModalOpen(false);
-    refreshData();
-    showToast("員工額度設定已更新", 'success');
+    try {
+        await StorageService.updateUser(targetUser.id, {
+            onboard_date: settingsForm.onboardDate,
+            quota_annual: Number(settingsForm.quotaAnnual),
+            quota_birthday: Number(settingsForm.quotaBirthday),
+            quota_comp: Number(settingsForm.quotaComp)
+        });
+        setIsSettingsModalOpen(false);
+        refreshData();
+        showToast("員工額度設定已更新", 'success');
+    } catch (e: any) {
+        showToast("設定更新失敗: " + getErrorMessage(e), 'error');
+    }
   };
 
   const handleExportSingleUser = (userId: string) => {
@@ -232,42 +266,66 @@ export const AdminDashboard: React.FC = () => {
     showToast("匯出成功", 'success');
   };
 
-  const handleEditUser = () => {
+  const handleEditUser = async () => {
     if (!targetUser) return;
-    if (editUserForm.pass && editUserForm.pass !== editUserForm.passConfirm) return alert("密碼不一致");
     if (!editUserForm.name) return alert("姓名不得為空");
 
     const updates: Partial<User> = { name: editUserForm.name, dept: editUserForm.dept };
-    if (editUserForm.pass) updates.pass = editUserForm.pass;
 
-    StorageService.updateUser(targetUser.id, updates);
-    setIsEditUserModalOpen(false);
-    setTargetUser(null);
-    refreshData();
-    showToast("員工資料更新成功", 'success');
+    try {
+        await StorageService.updateUser(targetUser.id, updates);
+        setIsEditUserModalOpen(false);
+        setTargetUser(null);
+        refreshData();
+        showToast("員工資料更新成功", 'success');
+    } catch (e: any) {
+        showToast("更新失敗: " + getErrorMessage(e), 'error');
+    }
   };
 
-  const handleAddUser = () => {
+  const handleSendResetEmail = async () => {
+      if(!targetUser) return;
+      let email = targetUser.id;
+      if (!email.includes('@')) {
+          email = `${email}@shyuan-hrm.com`;
+      }
+      try {
+          await sendPasswordResetEmail(auth, email);
+          alert(`密碼重設信件已發送至：${email}\n請員工查收信件並設定新密碼。`);
+      } catch (e: any) {
+          alert("發送失敗: " + e.message);
+      }
+  };
+
+  const handleAddUser = async () => {
     if (!addUserForm.id || !addUserForm.pass || !addUserForm.name) return showToast("請填寫必要欄位", 'error');
     const normalizedId = addUserForm.id.toLowerCase();
     
+    // Check if ID exists in Firestore (UI check)
     if (data.users.some(u => u.id.toLowerCase() === normalizedId)) {
-        showToast("帳號已存在，請使用其他ID", 'error');
+        showToast("帳號 ID 已存在，請更換", 'error');
         return;
     }
-    
-    StorageService.addUser({
-      id: addUserForm.id, pass: addUserForm.pass, name: addUserForm.name, dept: addUserForm.dept || '未分配',
-      role: UserRole.EMPLOYEE as any, 
-      quota_annual: 0, 
-      quota_birthday: 0, 
-      quota_comp: 0 
-    });
-    
-    setIsAddUserModalOpen(false);
-    setAddUserForm({ id: '', pass: '', name: '', dept: '' });
-    refreshData();
-    showToast("員工新增成功，請設定其休假額度", 'success');
+
+    setIsSubmitting(true);
+    try {
+        await StorageService.addUser({
+          id: addUserForm.id, pass: addUserForm.pass, name: addUserForm.name, dept: addUserForm.dept || '未分配',
+          role: UserRole.EMPLOYEE as any, 
+          quota_annual: 0, 
+          quota_birthday: 0, 
+          quota_comp: 0 
+        });
+        
+        setIsAddUserModalOpen(false);
+        setAddUserForm({ id: '', pass: '', name: '', dept: '' });
+        refreshData();
+        showToast("員工新增成功，請設定其休假額度", 'success');
+    } catch (error: any) {
+        showToast("新增失敗: " + getErrorMessage(error), 'error');
+    } finally {
+        setIsSubmitting(false);
+    }
   };
 
   const execFormat = (cmd: string, val: string = '') => {
@@ -289,7 +347,7 @@ export const AdminDashboard: React.FC = () => {
     }, 0);
   };
 
-  const handleAnnSave = () => {
+  const handleAnnSave = async () => {
     const titleInput = document.getElementById('annTitle') as HTMLInputElement;
     const catInput = document.getElementById('annCat') as HTMLSelectElement;
     if (!titleInput.value || !annContent) return alert("請填寫標題與內容");
@@ -300,16 +358,20 @@ export const AdminDashboard: React.FC = () => {
     const day = String(today.getDate()).padStart(2, '0');
     const dateStr = `${year}-${month}-${day}`;
 
-    StorageService.addAnnouncement({
-      id: editAnnId || Date.now(), title: titleInput.value, content: annContent,
-      category: catInput.value as any, date: dateStr, author: '管理員'
-    });
-    titleInput.value = '';
-    setAnnContent('');
-    if (editorRef.current) editorRef.current.innerHTML = '';
-    setEditAnnId(null);
-    refreshData();
-    showToast("公告儲存成功", 'success');
+    try {
+        await StorageService.addAnnouncement({
+          id: editAnnId || Date.now(), title: titleInput.value, content: annContent,
+          category: catInput.value as any, date: dateStr, author: '管理員'
+        });
+        titleInput.value = '';
+        setAnnContent('');
+        if (editorRef.current) editorRef.current.innerHTML = '';
+        setEditAnnId(null);
+        refreshData();
+        showToast("公告儲存成功", 'success');
+    } catch (e: any) {
+        showToast("公告發布失敗: " + getErrorMessage(e), 'error');
+    }
   };
 
   const handleExport = (type: 'leave' | 'ot') => {
@@ -320,10 +382,13 @@ export const AdminDashboard: React.FC = () => {
     const items = type === 'leave' ? data.leaves : data.overtimes;
     
     const filtered = items.filter(i => {
-      // 安全地處理開始日期
-      if (!i.start) return false;
-      const d = i.start.replace('T', ' ').split(' ')[0];
-      return d >= exportStart && d <= exportEnd;
+      // 判斷是否重疊：ItemStart <= RangeEnd && ItemEnd >= RangeStart
+      if (!i.start || !i.end) return false;
+      
+      const itemStartDay = i.start.replace('T', ' ').split(' ')[0];
+      const itemEndDay = i.end.replace('T', ' ').split(' ')[0];
+
+      return itemStartDay <= exportEnd && itemEndDay >= exportStart;
     });
 
     if (filtered.length === 0) return showToast("該區間無資料", "error");
@@ -431,7 +496,7 @@ export const AdminDashboard: React.FC = () => {
     };
   };
 
-  const saveOtEdit = () => {
+  const saveOtEdit = async () => {
     if (!editOtModal) return;
     if (!editOtForm.reason) return alert("請填寫修改原因給員工查看");
     
@@ -439,15 +504,19 @@ export const AdminDashboard: React.FC = () => {
     const e = new Date(editOtForm.end);
     const h = parseFloat(((e.getTime() - s.getTime()) / 3600000).toFixed(1));
 
-    StorageService.updateOvertime(editOtModal.id, {
-      start: editOtForm.start.replace('T', ' '),
-      end: editOtForm.end.replace('T', ' '),
-      hours: h,
-      adminNote: editOtForm.reason
-    });
-    setEditOtModal(null);
-    refreshData();
-    showToast("加班資料已修正", 'success');
+    try {
+        await StorageService.updateOvertime(editOtModal.id, {
+          start: editOtForm.start.replace('T', ' '),
+          end: editOtForm.end.replace('T', ' '),
+          hours: h,
+          adminNote: editOtForm.reason
+        });
+        setEditOtModal(null);
+        refreshData();
+        showToast("加班資料已修正", 'success');
+    } catch (e: any) {
+        showToast("修正失敗: " + getErrorMessage(e), 'error');
+    }
   };
 
   const navItems = [
@@ -458,6 +527,10 @@ export const AdminDashboard: React.FC = () => {
     { id: 'holiday', icon: Palmtree, label: '假期' },
     { id: 'system', icon: Settings, label: '設定' },
   ];
+
+  const rocYear = currentTime.getFullYear() - 1911;
+  const dateStr = `${rocYear} 年 ${String(currentTime.getMonth()+1).padStart(2,'0')} 月 ${String(currentTime.getDate()).padStart(2,'0')} 日`;
+  const westernDateStr = currentTime.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-');
 
   return (
     <div className="flex flex-col h-full bg-gray-50 overflow-hidden relative">
@@ -479,10 +552,13 @@ export const AdminDashboard: React.FC = () => {
                   <div className="flex items-center gap-1.5 text-brand-600 font-black text-base">
                     <Globe size={18} /> 網路校時 <span className="text-[10px] text-gray-400">(timeapi.io)</span>
                   </div>
-                  <div className="font-mono text-2xl font-black text-gray-800 tracking-tighter">
-                    {currentTime.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' })}
+                  <div className="font-mono text-xl font-black text-gray-800 tracking-tighter">
+                    {dateStr}
                   </div>
-                  <div className="font-mono text-xl font-black text-brand-700">
+                  <div className="font-mono text-xs font-black text-gray-400 mt-[-2px]">
+                    {westernDateStr}
+                  </div>
+                  <div className="font-mono text-xl font-black text-brand-700 mt-1">
                     {currentTime.toLocaleDateString('zh-TW', { weekday: 'long' })}
                   </div>
                   <div className="font-mono text-3xl font-black text-brand-800 mt-1">
@@ -528,6 +604,27 @@ export const AdminDashboard: React.FC = () => {
         </div>
 
         <main className="flex-1 overflow-auto p-4 md:p-12 pb-24 text-black font-bold custom-scroll">
+          {/* Mobile Header for Time & Cloud Status */}
+          <div className="md:hidden w-full mb-6 p-4 bg-brand-50 rounded-[24px] border border-brand-100 flex flex-col gap-2">
+             <div className="flex justify-between items-start">
+                <div className="flex flex-col">
+                   <div className="text-brand-600 font-black text-xs flex items-center gap-1"><Globe size={12}/> 網路校時</div>
+                   <div className="font-mono text-lg font-black text-gray-800">{dateStr}</div>
+                   <div className="font-mono text-[10px] font-black text-gray-400">{westernDateStr}</div>
+                </div>
+                <div className="flex flex-col items-end">
+                   <div className="font-mono text-2xl font-black text-brand-800">{currentTime.toLocaleTimeString('zh-TW', { hour12: false })}</div>
+                   <div className="font-mono text-xs font-black text-brand-700">{currentTime.toLocaleDateString('zh-TW', { weekday: 'long' })}</div>
+                </div>
+             </div>
+             <div className="flex items-center gap-2 mt-1 border-t border-brand-100 pt-2">
+                <div className={`w-2 h-2 rounded-full ${data.settings.gasUrl ? "bg-green-500" : "bg-red-500"} animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]`}></div>
+                <span className={`text-xs font-black ${data.settings.gasUrl ? "text-green-600" : "text-red-500"}`}>
+                  {data.settings.gasUrl ? "雲端已連線" : "雲端未連線"}
+                </span>
+             </div>
+          </div>
+
           {activeView === 'overview' && (
             <div className="space-y-6 md:space-y-8">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -600,11 +697,11 @@ export const AdminDashboard: React.FC = () => {
                                       <>
                                         <button onClick={() => openSettingsModal(u)} className="text-gray-600 hover:bg-gray-100 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-gray-200 transition-all flex items-center gap-1"><Sliders size={14}/> <span className="hidden md:inline">設定</span></button>
                                         <button onClick={() => openEditUserModal(u)} className="text-brand-600 hover:bg-brand-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-brand-100 transition-all flex items-center gap-1"><UserCog size={14}/> <span className="hidden md:inline">編輯</span></button>
-                                        <button onClick={() => { StorageService.archiveUser(u.id); refreshData(); showToast("已將員工移至封存區", 'success'); }} className="text-red-500 hover:bg-red-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-red-100 flex items-center gap-1 transition-all"><UserMinus size={14}/> <span className="hidden md:inline">封存</span></button>
+                                        <button onClick={async () => { try { await StorageService.archiveUser(u.id); refreshData(); showToast("已將員工移至封存區", 'success'); } catch(e) { showToast("封存失敗", 'error'); } }} className="text-red-500 hover:bg-red-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-red-100 flex items-center gap-1 transition-all"><UserMinus size={14}/> <span className="hidden md:inline">封存</span></button>
                                       </>
                                     ) : (
                                       <>
-                                        <button onClick={() => { StorageService.restoreUser(u.id); refreshData(); showToast("員工已恢復權限", 'success'); }} className="text-green-600 hover:bg-green-50 px-4 py-2 rounded-xl text-xs font-black border border-green-100 flex items-center gap-1 transition-all"><RotateCcw size={14}/> 恢復</button>
+                                        <button onClick={async () => { try { await StorageService.restoreUser(u.id); refreshData(); showToast("員工已恢復權限", 'success'); } catch(e) { showToast("恢復失敗", 'error'); } }} className="text-green-600 hover:bg-green-50 px-4 py-2 rounded-xl text-xs font-black border border-green-100 flex items-center gap-1 transition-all"><RotateCcw size={14}/> 恢復</button>
                                         <button onClick={() => confirmDelete(u.id, 'user')} className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-black hover:bg-red-700 shadow-lg !text-white transition-all">永久刪除</button>
                                       </>
                                     )}
@@ -619,31 +716,34 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* ... (Rest of the component remains the same, just keeping the structure intact) ... */}
+          {/* ... Leaves, OT, News, Holiday sections omitted for brevity as they are unchanged ... */}
           {activeView === 'leaves' && (
-            // ... (Same as before)
-            <div className="space-y-8 md:space-y-12">
+             <div className="space-y-8 md:space-y-12">
+               {/* ... Keep existing Leaves content ... */}
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-brand-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核假單</h3>
+                  {/* ... same as before ... */}
                   <div className="flex flex-wrap gap-2 items-center w-full md:w-auto">
                      <span className="text-xs font-black text-gray-400 w-full md:w-auto">匯出區間</span>
                      <div className="flex gap-2 w-full md:w-auto">
-                        <input type="date" value={exportStart} onChange={e=>setExportStart(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" />
+                        <input type="date" value={exportStart} onChange={e=>setExportStart(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" style={{colorScheme:'light'}} />
                         <span className="text-gray-300 self-center">~</span>
-                        <input type="date" value={exportEnd} onChange={e=>setExportEnd(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" />
+                        <input type="date" value={exportEnd} onChange={e=>setExportEnd(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" style={{colorScheme:'light'}} />
                      </div>
                      <button onClick={()=>handleExport('leave')} className="w-full md:w-auto bg-gray-100 text-gray-600 px-4 py-2 rounded-xl text-xs font-black hover:bg-gray-200 flex items-center justify-center gap-1"><Download size={14}/> 匯出</button>
                   </div>
                </div>
-
+               
+               {/* List of Pending Leaves */}
                {data.leaves.filter(l => l.status === 'pending').length === 0 ? (
                  <div className="p-8 md:p-10 bg-white rounded-3xl text-gray-400 font-bold text-center border">目前無待審核項目</div>
                ) : (
                  <div className="grid gap-4 md:gap-6">
                     {data.leaves.filter(l => l.status === 'pending').map(leave => (
                        <div key={leave.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl shadow-sm border flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                           {/* ... Leave Item ... */}
                           <div className="flex items-start md:items-center gap-4 w-full">
-                             <div className="w-10 h-10 md:w-12 md:h-12 bg-brand-100 rounded-full flex items-center justify-center text-brand-600 font-black text-base md:text-lg flex-shrink-0">{leave.userName[0]}</div>
+                             <div className="w-10 h-10 md:w-12 md:h-12 bg-brand-100 rounded-full flex items-center justify-center text-brand-600 font-black text-base md:text-lg flex-shrink-0">{leave.userName?.[0] || '?'}</div>
                              <div className="flex-1">
                                 <div className="font-black text-base md:text-lg">
                                    <span className="font-mono text-gray-500 mr-2 text-sm md:text-base">{leave.userId}</span>
@@ -667,22 +767,30 @@ export const AdminDashboard: React.FC = () => {
                  </div>
                )}
 
+                {/* History */}
                <div>
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-2">
                      <h3 className="text-xl md:text-2xl font-black text-gray-400">歷史審核紀錄</h3>
                      <div className="flex items-center gap-2 w-full md:w-auto">
                         <span className="text-xs font-black text-gray-400 whitespace-nowrap">顯示日期</span>
-                        <input type="date" value={leaveHistoryFilterDate} onChange={e=>setLeaveHistoryFilterDate(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" />
+                        <input type="date" value={leaveHistoryFilterDate} onChange={e=>setLeaveHistoryFilterDate(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" style={{colorScheme:'light'}} />
                         <button onClick={()=>setLeaveHistoryFilterDate('')} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
                      </div>
                   </div>
                   <div className="space-y-4">
                      {data.leaves
                        .filter(l => l.status !== 'pending')
-                       .filter(l => !leaveHistoryFilterDate || l.start.startsWith(leaveHistoryFilterDate))
+                       .filter(l => {
+                          if (!leaveHistoryFilterDate) return true;
+                          const filterDate = leaveHistoryFilterDate;
+                          const startDate = l.start.substring(0, 10);
+                          const endDate = l.end.substring(0, 10);
+                          return filterDate >= startDate && filterDate <= endDate;
+                       })
                        .sort((a,b)=>b.id-a.id)
                        .map(leave => (
                         <div key={leave.id} className="bg-gray-50 p-6 rounded-[24px] md:rounded-3xl border flex flex-col gap-4 opacity-75 hover:opacity-100 transition-all group">
+                           {/* ... Leave History Item ... */}
                            <div className="flex justify-between items-start">
                               <div className="flex items-start md:items-center gap-4">
                                  <span className={`px-2 py-1 md:px-3 rounded-xl text-[10px] md:text-xs font-black whitespace-nowrap ${leave.status === 'approved' ? 'bg-green-100 text-green-700' : leave.status === 'rejected' ? 'bg-red-100 text-red-700' : 'bg-gray-200 text-gray-600'}`}>
@@ -706,38 +814,41 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.leaves.filter(l => l.status !== 'pending' && (!leaveHistoryFilterDate || l.start.startsWith(leaveHistoryFilterDate))).length === 0 && (
+                     {data.leaves.filter(l => l.status !== 'pending' && (!leaveHistoryFilterDate || (leaveHistoryFilterDate >= l.start.substring(0, 10) && leaveHistoryFilterDate <= l.end.substring(0, 10)))).length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>
                </div>
-            </div>
+             </div>
           )}
 
           {activeView === 'ot' && (
-             // ... (Same as before)
               <div className="space-y-8 md:space-y-12">
+               {/* ... Keep existing OT content ... */}
                <div className="flex flex-col md:flex-row justify-between items-start md:items-end bg-white p-6 rounded-[24px] md:rounded-[32px] border gap-4">
                   <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-indigo-600"><Clock size={24} className="md:w-7 md:h-7"/> 待審核加班</h3>
-                  <div className="flex flex-wrap gap-2 items-center w-full md:w-auto">
+                  {/* ... same as before ... */}
+                   <div className="flex flex-wrap gap-2 items-center w-full md:w-auto">
                      <span className="text-xs font-black text-gray-400 w-full md:w-auto">匯出區間</span>
                      <div className="flex gap-2 w-full md:w-auto">
-                        <input type="date" value={exportStart} onChange={e=>setExportStart(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" />
+                        <input type="date" value={exportStart} onChange={e=>setExportStart(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" style={{colorScheme:'light'}} />
                         <span className="text-gray-300 self-center">~</span>
-                        <input type="date" value={exportEnd} onChange={e=>setExportEnd(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" />
+                        <input type="date" value={exportEnd} onChange={e=>setExportEnd(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1" style={{colorScheme:'light'}} />
                      </div>
                      <button onClick={()=>handleExport('ot')} className="w-full md:w-auto bg-gray-100 text-gray-600 px-4 py-2 rounded-xl text-xs font-black hover:bg-gray-200 flex items-center justify-center gap-1"><Download size={14}/> 匯出</button>
                   </div>
                </div>
 
+               {/* Pending OTs */}
                {data.overtimes.filter(o => o.status === 'pending').length === 0 ? (
                  <div className="p-8 md:p-10 bg-white rounded-3xl text-gray-400 font-bold text-center border">目前無待審核項目</div>
                ) : (
                  <div className="grid gap-4 md:gap-6">
                     {data.overtimes.filter(o => o.status === 'pending').map(ot => (
                        <div key={ot.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl shadow-sm border flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                          {/* ... OT Item ... */}
                           <div className="flex items-start md:items-center gap-4 w-full">
-                             <div className="w-10 h-10 md:w-12 md:h-12 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-black text-base md:text-lg flex-shrink-0">{ot.userName[0]}</div>
+                             <div className="w-10 h-10 md:w-12 md:h-12 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-black text-base md:text-lg flex-shrink-0">{ot.userName?.[0] || '?'}</div>
                              <div className="flex-1">
                                 <div className="font-black text-base md:text-lg">
                                    <span className="font-mono text-gray-500 mr-2 text-sm md:text-base">{ot.userId}</span>
@@ -762,22 +873,30 @@ export const AdminDashboard: React.FC = () => {
                  </div>
                )}
 
+               {/* History */}
                <div>
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-2">
                      <h3 className="text-xl md:text-2xl font-black text-gray-400">歷史審核紀錄</h3>
                      <div className="flex items-center gap-2 w-full md:w-auto">
                         <span className="text-xs font-black text-gray-400 whitespace-nowrap">顯示日期</span>
-                        <input type="date" value={otHistoryFilterDate} onChange={e=>setOtHistoryFilterDate(e.target.value)} className="bg-black text-white p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" />
+                        <input type="date" value={otHistoryFilterDate} onChange={e=>setOtHistoryFilterDate(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" style={{colorScheme:'light'}} />
                         <button onClick={()=>setOtHistoryFilterDate('')} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
                      </div>
                   </div>
                   <div className="space-y-4">
                      {data.overtimes
                        .filter(o => o.status !== 'pending')
-                       .filter(o => !otHistoryFilterDate || o.start.startsWith(otHistoryFilterDate))
+                       .filter(o => {
+                          if (!otHistoryFilterDate) return true;
+                          const filterDate = otHistoryFilterDate;
+                          const startDate = o.start.substring(0, 10);
+                          const endDate = o.end.substring(0, 10);
+                          return filterDate >= startDate && filterDate <= endDate;
+                       })
                        .sort((a,b)=>b.id-a.id)
                        .map(ot => (
                         <div key={ot.id} className="bg-gray-50 p-6 rounded-[24px] md:rounded-3xl border flex flex-col gap-4 opacity-75 hover:opacity-100 transition-all group">
+                           {/* ... OT History Item ... */}
                            <div className="flex justify-between items-start">
                               <div className="flex items-start md:items-center gap-4">
                                  <span className={`px-2 py-1 md:px-3 rounded-xl text-[10px] md:text-xs font-black whitespace-nowrap ${ot.status === 'approved' ? 'bg-green-100 text-green-700' : ot.status === 'rejected' ? 'bg-red-100 text-red-700' : 'bg-gray-200 text-gray-600'}`}>
@@ -801,7 +920,7 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.overtimes.filter(o => o.status !== 'pending' && (!otHistoryFilterDate || o.start.startsWith(otHistoryFilterDate))).length === 0 && (
+                     {data.overtimes.filter(o => o.status !== 'pending' && (!otHistoryFilterDate || (otHistoryFilterDate >= o.start.substring(0, 10) && otHistoryFilterDate <= o.end.substring(0, 10)))).length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>
@@ -809,10 +928,10 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
           
-          {/* ... (Other views remain unchanged) */}
+          {/* ... News, Holiday, System sections unchanged ... */}
           {activeView === 'news' && (
-            // ... (Same as before)
             <div className="max-w-4xl space-y-8 md:space-y-12">
+               {/* ... (Existing news view content) ... */}
                <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                   <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8">{editAnnId ? '編輯公告' : '發布公告'}</h3>
                   <div className="space-y-4 md:space-y-6">
@@ -824,7 +943,7 @@ export const AdminDashboard: React.FC = () => {
                            <button onClick={()=>execFormat('underline')} className="p-2 md:p-2.5 hover:bg-white rounded-xl border shadow-sm transition-all"><Underline size={16} className="md:w-[18px] md:h-[18px]"/></button>
                            <div className="w-[1px] h-6 md:h-8 bg-gray-300 mx-1 md:mx-2 self-center"></div>
                            <select onChange={(e)=>execFormat('fontSize', e.target.value)} className="px-2 md:px-3 py-1 text-xs md:text-sm border rounded-xl bg-white font-black outline-none flex-1 md:flex-none">
-                              <option value="3">大小</option>
+                              <option value="3">字體大小</option>
                               {[1,2,3,4,5,6,7].map(v => <option key={v} value={v}>{['極小','小','中','大','特大','超大','極巨'][v-1]}</option>)}
                            </select>
                            <div className="flex items-center gap-2 border rounded-xl px-2 md:px-4 bg-white shadow-sm flex-1 md:flex-none justify-center">
@@ -856,8 +975,7 @@ export const AdminDashboard: React.FC = () => {
                                     {categoryMap[ann.category]}
                                  </span>
                                  <span className="text-gray-400 text-xs md:text-sm font-mono">
-                                    {/* Format date: YYYY-MM-DD only */}
-                                    {ann.date.split(' ')[0].split('T')[0]}
+                                    {ann.date ? ann.date.split(' ')[0].split('T')[0] : ''}
                                  </span>
                               </div>
                               <h4 className="text-lg md:text-xl font-black text-gray-800 mb-3">{ann.title}</h4>
@@ -875,25 +993,29 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'holiday' && (
-             // ... (Same as before)
              <div className="max-w-2xl space-y-8 md:space-y-12">
+                {/* ... (Existing holiday view content) ... */}
                 <div className="bg-white p-6 md:p-12 rounded-[32px] md:rounded-[48px] shadow-sm border">
                    <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-10 flex items-center gap-3"><Palmtree className="text-brand-500" /> 設定休假日</h3>
-                   <form className="space-y-6 md:space-y-8" onSubmit={(e) => {
+                   <form className="space-y-6 md:space-y-8" onSubmit={async (e) => {
                       e.preventDefault();
                       const dateInput = e.currentTarget.elements.namedItem('hdate') as HTMLInputElement;
                       const noteInput = e.currentTarget.elements.namedItem('hnote') as HTMLInputElement;
                       if (!noteInput.value.trim()) return showToast("請填寫假期備註", "error");
                       
-                      StorageService.addHoliday({ id: Date.now(), date: dateInput.value, note: noteInput.value });
-                      refreshData();
-                      showToast("假期已成功加入系統", 'success');
-                      dateInput.value = '';
-                      noteInput.value = '';
+                      try {
+                          await StorageService.addHoliday({ id: Date.now(), date: dateInput.value, note: noteInput.value });
+                          refreshData();
+                          showToast("假期已成功加入系統", 'success');
+                          dateInput.value = '';
+                          noteInput.value = '';
+                      } catch (e: any) {
+                          showToast("加入假期失敗: " + getErrorMessage(e), 'error');
+                      }
                    }}>
                       <div className="space-y-3">
                          <label className="text-sm font-black text-gray-400 ml-2">假期日期</label>
-                         <input name="hdate" type="date" className="w-full p-4 md:p-5 bg-black text-white rounded-3xl outline-none font-black tracking-widest text-lg border border-gray-100" required />
+                         <input name="hdate" type="date" className="w-full p-4 md:p-5 bg-white text-black rounded-3xl outline-none font-black tracking-widest text-lg border border-gray-100" style={{colorScheme:'light'}} required />
                       </div>
                       <div className="space-y-3">
                          <label className="text-sm font-black text-gray-400 ml-2">備註 <span className="text-red-500">*</span></label>
@@ -906,13 +1028,14 @@ export const AdminDashboard: React.FC = () => {
                 <div className="space-y-6">
                   <div className="flex justify-between items-center">
                      <h4 className="text-lg md:text-xl font-black text-gray-400">假期歷史紀錄</h4>
-                     <div className="flex items-center gap-2 bg-black px-3 md:px-4 py-2 rounded-2xl border border-gray-100">
-                        <CalendarIcon size={16} className="text-white"/>
+                     <div className="flex items-center gap-2 bg-white px-3 md:px-4 py-2 rounded-2xl border border-gray-200">
+                        <CalendarIcon size={16} className="text-gray-500"/>
                         <input 
                            type="month" 
                            value={holidayFilterMonth}
                            onChange={(e) => setHolidayFilterMonth(e.target.value)}
-                           className="font-black outline-none text-xs md:text-sm bg-transparent text-white placeholder-gray-500 w-24 md:w-auto"
+                           className="font-black outline-none text-xs md:text-sm bg-transparent text-black placeholder-gray-500 w-24 md:w-auto"
+                           style={{colorScheme:'light'}}
                         />
                      </div>
                   </div>
@@ -940,33 +1063,40 @@ export const AdminDashboard: React.FC = () => {
           )}
 
           {activeView === 'system' && (
-             // ... (Same as before)
              <div className="max-w-2xl bg-white p-6 md:p-12 rounded-[40px] md:rounded-[56px] shadow-2xl border animate-in zoom-in-95 duration-500">
                 <h3 className="text-2xl md:text-3xl font-black mb-8 md:mb-12 flex items-center gap-4 text-gray-800"><Settings className="text-brand-600" size={32}/> 核心參數設定</h3>
-                <form className="space-y-6 md:space-y-10" onSubmit={(e) => {
+                <form className="space-y-6 md:space-y-10" onSubmit={async (e) => {
                    e.preventDefault();
                    const formData = new FormData(e.currentTarget);
-                   StorageService.updateSettings({
-                      gasUrl: formData.get('gasUrl') as string,
-                      companyLat: parseFloat(formData.get('lat') as string),
-                      companyLng: parseFloat(formData.get('lng') as string),
-                      allowedRadius: parseInt(formData.get('radius') as string),
-                   });
-                   refreshData();
-                   showToast("設定已儲存", 'success');
+                   const latRaw = formData.get('lat');
+                   const lngRaw = formData.get('lng');
+                   const radRaw = formData.get('radius');
+
+                   const companyLat = latRaw ? (parseFloat(latRaw as string) || 0) : 0;
+                   const companyLng = lngRaw ? (parseFloat(lngRaw as string) || 0) : 0;
+                   const allowedRadius = radRaw ? (parseInt(radRaw as string) || 100) : 100;
+
+                   try {
+                       await StorageService.updateSettings({
+                          gasUrl: "disabled", 
+                          companyLat,
+                          companyLng,
+                          allowedRadius,
+                       });
+                       showToast("設定已儲存", 'success');
+                   } catch (e: any) {
+                       showToast("設定儲存失敗: " + getErrorMessage(e), 'error');
+                   }
                 }}>
-                   <div className="space-y-4">
-                      <label className="text-base md:text-lg font-black text-gray-800 ml-2">Google Sheets API 串接網址</label>
-                      <input name="gasUrl" defaultValue={data.settings.gasUrl} type="text" className="w-full p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[24px] md:rounded-[32px] font-mono text-xs md:text-sm font-bold focus:border-brand-500 outline-none transition-all" />
-                   </div>
+                   {/* Google Sheets API Input REMOVED */}
                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-8">
                       <div className="space-y-4">
                         <label className="text-base md:text-lg font-black text-gray-800 ml-2">公司座標 (緯度)</label>
-                        <input name="lat" defaultValue={data.settings.companyLat} type="text" className="w-full p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[24px] md:rounded-[32px] font-black focus:border-brand-500 outline-none transition-all" />
+                        <input name="lat" defaultValue={data.settings.companyLat} type="number" step="any" className="w-full p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[24px] md:rounded-[32px] font-black focus:border-brand-500 outline-none transition-all" />
                       </div>
                       <div className="space-y-4">
                         <label className="text-base md:text-lg font-black text-gray-800 ml-2">公司座標 (經度)</label>
-                        <input name="lng" defaultValue={data.settings.companyLng} type="text" className="w-full p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[24px] md:rounded-[32px] font-black focus:border-brand-500 outline-none transition-all" />
+                        <input name="lng" defaultValue={data.settings.companyLng} type="number" step="any" className="w-full p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[24px] md:rounded-[32px] font-black focus:border-brand-500 outline-none transition-all" />
                       </div>
                    </div>
                    <div className="space-y-4">
@@ -979,63 +1109,15 @@ export const AdminDashboard: React.FC = () => {
           )}
         </main>
       </div>
-
-      {/* Add User Modal */}
-      {isAddUserModalOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
-           <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-12 w-full max-w-md shadow-2xl font-bold">
-              <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8 flex items-center gap-2"><UserPlus className="text-brand-500"/> 新增員工帳號</h3>
-              <div className="space-y-4 md:space-y-6">
-                 <input type="text" placeholder="帳號 (不分大小寫)" value={addUserForm.id} onChange={e=>setAddUserForm({...addUserForm, id: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none" />
-                 <input type="password" placeholder="密碼" value={addUserForm.pass} onChange={e=>setAddUserForm({...addUserForm, pass: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none" />
-                 <input type="text" placeholder="姓名" value={addUserForm.name} onChange={e=>setAddUserForm({...addUserForm, name: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none" />
-                 <input type="text" placeholder="部門 (選填)" value={addUserForm.dept} onChange={e=>setAddUserForm({...addUserForm, dept: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none" />
-                 <div className="flex gap-4">
-                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>setIsAddUserModalOpen(false)}>取消</Button>
-                    <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleAddUser}>確認新增</Button>
-                 </div>
-              </div>
-           </div>
-        </div>
-      )}
-
-      {/* Edit User Modal (Combined Info + Password) */}
-      {isEditUserModalOpen && targetUser && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
-           <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-12 w-full max-w-md shadow-2xl font-bold">
-              <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8 flex items-center gap-2"><UserCog className="text-brand-500"/> 編輯員工資料</h3>
-              <div className="space-y-4 md:space-y-6">
-                 <div className="space-y-2">
-                    <label className="text-xs text-gray-400 ml-1">員工帳號 (不可修改)</label>
-                    <div className="w-full p-4 bg-gray-100 border border-gray-200 rounded-2xl font-mono text-gray-500">{targetUser.id}</div>
-                 </div>
-                 <div className="space-y-2">
-                    <label className="text-xs text-gray-400 ml-1">姓名</label>
-                    <input type="text" placeholder="姓名" value={editUserForm.name} onChange={e=>setEditUserForm({...editUserForm, name: e.target.value})} className="w-full p-4 bg-white border border-gray-200 rounded-2xl outline-none text-black" />
-                 </div>
-                 <div className="space-y-2">
-                    <label className="text-xs text-gray-400 ml-1">部門</label>
-                    <input type="text" placeholder="部門" value={editUserForm.dept} onChange={e=>setEditUserForm({...editUserForm, dept: e.target.value})} className="w-full p-4 bg-white border border-gray-200 rounded-2xl outline-none text-black" />
-                 </div>
-                 <div className="space-y-2 pt-4 border-t border-gray-100">
-                    <label className="text-xs text-brand-600 ml-1">修改密碼 (若不修改請留空)</label>
-                    <input type="password" placeholder="輸入新密碼" value={editUserForm.pass} onChange={e=>setEditUserForm({...editUserForm, pass: e.target.value})} className="w-full p-4 bg-white border border-gray-200 rounded-2xl outline-none text-black focus:ring-4 focus:ring-brand-100 transition-all" />
-                    <input type="password" placeholder="再次輸入新密碼" value={editUserForm.passConfirm} onChange={e=>setEditUserForm({...editUserForm, passConfirm: e.target.value})} className="w-full p-4 bg-white border border-gray-200 rounded-2xl outline-none text-black focus:ring-4 focus:ring-brand-100 transition-all mt-2" />
-                 </div>
-
-                 <div className="flex gap-4 mt-6">
-                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>{setIsEditUserModalOpen(false); setTargetUser(null);}}>取消</Button>
-                    <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleEditUser}>儲存變更</Button>
-                 </div>
-              </div>
-           </div>
-        </div>
-      )}
-
-      {/* New: Employee Settings Modal (Quotas & Onboard) */}
+      
+      {/* ... (Modal sections remain largely unchanged except approved leave list below) ... */}
+      
+      {/* Employee Settings Modal */}
       {isSettingsModalOpen && targetUser && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           {/* ... existing settings modal ... */}
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
+              {/* ... same content ... */}
               <div className="mb-4 md:mb-6 flex-shrink-0">
                  <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-gray-800"><Sliders className="text-brand-500"/> 員工設定</h3>
                  <div className="text-gray-500 mt-1 ml-1">{targetUser.name} ({targetUser.id})</div>
@@ -1051,7 +1133,8 @@ export const AdminDashboard: React.FC = () => {
                           setSettingsForm({...settingsForm, onboardDate: e.target.value});
                           calculateSeniority(e.target.value);
                       }}
-                      className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" 
+                      className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" 
+                      style={{colorScheme:'light'}}
                     />
                     {seniorityCalc && <div className="text-xs text-brand-600 font-black px-2 flex items-center gap-1"><Calculator size={12}/> {seniorityCalc}</div>}
                  </div>
@@ -1076,11 +1159,10 @@ export const AdminDashboard: React.FC = () => {
 
                  <div className="space-y-3 pt-2">
                     <div className="flex justify-between items-center px-1">
-                        <h4 className="text-xs md:text-sm font-black text-gray-500">已核准之請假紀錄</h4>
+                        <h4 className="text-xs md:text-sm font-black text-gray-500">已核准之請假紀錄 (最近5筆)</h4>
                         <button onClick={() => handleExportSingleUser(targetUser.id)} className="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-lg hover:bg-green-200 transition-all font-black flex items-center gap-1"><Download size={12}/> 匯出</button>
                     </div>
                     
-                    {/* Stats Preview */}
                     <div className="grid grid-cols-3 gap-2">
                         {['特休', '補休', '生日假'].map(type => {
                             const used = data.leaves
@@ -1098,9 +1180,8 @@ export const AdminDashboard: React.FC = () => {
                     <div className="bg-gray-50 border rounded-2xl p-2 h-40 md:h-60 overflow-y-auto custom-scroll text-xs space-y-1">
                         <div className="grid grid-cols-4 gap-2 px-2 py-1 border-b text-gray-400 font-black text-[10px] mb-1">
                            <div>假別</div>
-                           <div>日期</div>
-                           <div>時數</div>
-                           <div className="text-right">事由</div>
+                           <div className="col-span-2">時間</div>
+                           <div className="text-right">時數</div>
                         </div>
                         {data.leaves.filter(l => l.userId === targetUser.id && l.status === 'approved').length === 0 ? (
                             <div className="text-center text-gray-400 py-10 italic">無相關請假紀錄</div>
@@ -1108,14 +1189,18 @@ export const AdminDashboard: React.FC = () => {
                             data.leaves
                             .filter(l => l.userId === targetUser.id && l.status === 'approved')
                             .sort((a,b) => b.id - a.id)
+                            .slice(0, 5) // Limit to top 5
                             .map(l => (
                                 <div key={l.id} className="grid grid-cols-4 gap-2 items-center p-2 bg-white rounded-lg border border-gray-100 hover:shadow-sm">
                                     <div>
                                         <span className={`px-1.5 py-0.5 rounded text-[10px] ${l.type==='特休'?'bg-blue-100 text-blue-700':l.type==='補休'?'bg-purple-100 text-purple-700':l.type==='生日假'?'bg-pink-100 text-pink-700':'bg-gray-100 text-gray-600'}`}>{l.type}</span>
                                     </div>
-                                    <div className="font-mono text-gray-500 text-[10px] whitespace-nowrap overflow-hidden">{TimeService.getTaiwanDate(l.start)}</div>
-                                    <div className="font-black text-gray-800">{l.hours}hr</div>
-                                    <div className="text-right text-gray-400 truncate">{l.reason}</div>
+                                    <div className="col-span-2 font-mono text-gray-500 text-[9px] flex flex-col leading-tight">
+                                        <span>{TimeService.formatDateTime(l.start)}</span>
+                                        <span className="text-gray-300 mx-1">~</span>
+                                        <span>{TimeService.formatDateTime(l.end)}</span>
+                                    </div>
+                                    <div className="font-black text-gray-800 text-right">{l.hours}hr</div>
                                 </div>
                             ))
                         )}
@@ -1131,6 +1216,74 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
+      {/* Edit User Modal (Updated) */}
+      {isEditUserModalOpen && targetUser && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-12 w-full max-w-md shadow-2xl font-bold">
+              <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8 flex items-center gap-2"><UserCog className="text-brand-500"/> 編輯員工資料</h3>
+              <div className="space-y-4">
+                 <div className="space-y-1">
+                    <label className="text-xs text-gray-400 ml-2">姓名</label>
+                    <input type="text" value={editUserForm.name} onChange={e=>setEditUserForm({...editUserForm, name: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" />
+                 </div>
+                 <div className="space-y-1">
+                    <label className="text-xs text-gray-400 ml-2">部門</label>
+                    <input type="text" value={editUserForm.dept} onChange={e=>setEditUserForm({...editUserForm, dept: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" />
+                 </div>
+
+                 {/* Password Reset Section */}
+                 <div className="bg-yellow-50 p-4 rounded-2xl border border-yellow-100 mt-2">
+                    <div className="flex items-start gap-2 text-yellow-700 text-xs font-black mb-3">
+                       <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                       <span>安全提示：管理員無法直接修改員工密碼，請使用下方按鈕發送重設信件。</span>
+                    </div>
+                    <Button type="button" onClick={handleSendResetEmail} className="w-full bg-white border-2 border-yellow-200 text-yellow-700 hover:bg-yellow-100 rounded-xl py-3 text-sm flex items-center justify-center gap-2">
+                       <Mail size={16}/> 發送密碼重設信件
+                    </Button>
+                 </div>
+
+                 <div className="flex gap-4 pt-4">
+                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>setIsEditUserModalOpen(false)}>取消</Button>
+                    <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleEditUser}>儲存變更</Button>
+                 </div>
+              </div>
+           </div>
+        </div>
+      )}
+
+      {/* Add User Modal (Unchanged) */}
+      {isAddUserModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+           <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-12 w-full max-w-md shadow-2xl font-bold">
+              <h3 className="text-xl md:text-2xl font-black mb-6 md:mb-8 flex items-center gap-2"><UserPlus className="text-brand-500"/> 新增員工帳號</h3>
+              <div className="space-y-4">
+                 <div className="space-y-1">
+                    <label className="text-xs text-gray-400 ml-2">帳號 (ID)</label>
+                    <input type="text" value={addUserForm.id} onChange={e=>setAddUserForm({...addUserForm, id: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" placeholder="例如: john" />
+                 </div>
+                 <div className="space-y-1">
+                    <label className="text-xs text-gray-400 ml-2">預設密碼</label>
+                    <input type="text" value={addUserForm.pass} onChange={e=>setAddUserForm({...addUserForm, pass: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" placeholder="至少6位數" />
+                 </div>
+                 <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-1">
+                        <label className="text-xs text-gray-400 ml-2">姓名</label>
+                        <input type="text" value={addUserForm.name} onChange={e=>setAddUserForm({...addUserForm, name: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" />
+                    </div>
+                    <div className="space-y-1">
+                        <label className="text-xs text-gray-400 ml-2">部門</label>
+                        <input type="text" value={addUserForm.dept} onChange={e=>setAddUserForm({...addUserForm, dept: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" />
+                    </div>
+                 </div>
+                 <div className="flex gap-4 pt-4">
+                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>setIsAddUserModalOpen(false)}>取消</Button>
+                    <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleAddUser} disabled={isSubmitting} isLoading={isSubmitting}>建立帳號</Button>
+                 </div>
+              </div>
+           </div>
+        </div>
+      )}
+
       {/* Edit Overtime Modal */}
       {editOtModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
@@ -1139,11 +1292,11 @@ export const AdminDashboard: React.FC = () => {
               <div className="space-y-4">
                  <div className="space-y-1">
                     <label className="text-xs text-gray-400 ml-2">開始時間</label>
-                    <input type="datetime-local" value={editOtForm.start} onChange={e=>setEditOtForm({...editOtForm, start: e.target.value})} className="w-full p-4 bg-black text-white border border-gray-100 rounded-2xl outline-none font-black" />
+                    <input type="datetime-local" value={editOtForm.start} onChange={e=>setEditOtForm({...editOtForm, start: e.target.value})} className="w-full p-4 bg-white text-black border border-gray-100 rounded-2xl outline-none font-black" style={{colorScheme:'light'}} />
                  </div>
                  <div className="space-y-1">
                     <label className="text-xs text-gray-400 ml-2">結束時間</label>
-                    <input type="datetime-local" value={editOtForm.end} onChange={e=>setEditOtForm({...editOtForm, end: e.target.value})} className="w-full p-4 bg-black text-white border border-gray-100 rounded-2xl outline-none font-black" />
+                    <input type="datetime-local" value={editOtForm.end} onChange={e=>setEditOtForm({...editOtForm, end: e.target.value})} className="w-full p-4 bg-white text-black border border-gray-100 rounded-2xl outline-none font-black" style={{colorScheme:'light'}} />
                  </div>
                  <div className="space-y-1">
                     <label className="text-xs text-red-500 ml-2">修改原因 (必填，員工可見)</label>
@@ -1182,11 +1335,11 @@ export const AdminDashboard: React.FC = () => {
               <div className="space-y-4">
                   <div className="space-y-1">
                     <label className="text-xs text-gray-400 ml-1">起始日期</label>
-                    <input type="date" value={attExportStart} onChange={e=>setAttExportStart(e.target.value)} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" />
+                    <input type="date" value={attExportStart} onChange={e=>setAttExportStart(e.target.value)} className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" style={{colorScheme:'light'}} />
                   </div>
                   <div className="space-y-1">
                     <label className="text-xs text-gray-400 ml-1">結束日期</label>
-                    <input type="date" value={attExportEnd} onChange={e=>setAttExportEnd(e.target.value)} className="w-full p-4 bg-black text-white border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" />
+                    <input type="date" value={attExportEnd} onChange={e=>setAttExportEnd(e.target.value)} className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-brand-500 transition-all" style={{colorScheme:'light'}} />
                   </div>
                   <div className="flex gap-4 pt-4">
                     <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>setIsExportAttendanceModalOpen(false)}>取消</Button>

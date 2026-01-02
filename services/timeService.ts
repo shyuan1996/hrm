@@ -10,9 +10,10 @@ export const TimeService = {
   /**
    * 取得網路標準時間與本地時間的差值（毫秒）
    * 並且建立單調計時器錨點 (Monotonic Anchor)，防止使用者修改系統時間作弊。
+   * 若所有 API 請求都失敗，回傳 null (代表時間驗證失敗，禁止操作)。
    */
   getNetworkTimeOffset: async (): Promise<number | null> => {
-    const fetchWithTimeout = async (url: string, timeout = 5000) => {
+    const fetchWithTimeout = async (url: string, timeout = 3000) => {
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), timeout);
       try {
@@ -31,9 +32,6 @@ export const TimeService = {
         try {
             const data = JSON.parse(text);
             // Support multiple API formats
-            // timeapi.io: dateTime
-            // worldtimeapi.org: datetime
-            // general: utc_datetime, iso
             const dateTimeStr = data.dateTime || data.datetime || data.utc_datetime || data.iso;
             if (dateTimeStr) {
                 serverTime = new Date(dateTimeStr).getTime();
@@ -42,9 +40,9 @@ export const TimeService = {
             // Ignore JSON parse error, try text
         }
 
-        // If JSON parsing failed or didn't find time, try parsing text directly (e.g. Adafruit returns raw ISO string)
+        // If JSON parsing failed or didn't find time, try parsing text directly
         if (!serverTime) {
-            const trimmed = text.trim().replace(/^"|"$/g, ''); // Remove surrounding quotes if present
+            const trimmed = text.trim().replace(/^"|"$/g, '');
             const d = new Date(trimmed);
             if (!isNaN(d.getTime())) {
                 serverTime = d.getTime();
@@ -54,7 +52,6 @@ export const TimeService = {
         if (!serverTime) throw new Error('Invalid Data Format');
         
         // 核心邏輯：建立時間錨點
-        // 即使系統時間之後被修改，performance.now() 仍會穩定遞增
         _anchorServerTime = serverTime;
         _anchorPerfTime = performance.now();
 
@@ -66,7 +63,7 @@ export const TimeService = {
       }
     };
 
-    // Helper to simulate Promise.any behavior for older environments/TS configs
+    // Helper to simulate Promise.any behavior
     const promiseAny = <T>(promises: Promise<T>[]): Promise<T> => {
       return new Promise((resolve, reject) => {
         let rejectedCount = 0;
@@ -77,7 +74,7 @@ export const TimeService = {
           Promise.resolve(p).then(resolve).catch((e) => {
             rejectedCount++;
             if (rejectedCount === promises.length) {
-              reject(new Error('All promises rejected: ' + e?.message));
+              reject(new Error('All promises rejected'));
             }
           });
         });
@@ -85,7 +82,7 @@ export const TimeService = {
     };
 
     try {
-      // Race 模式：誰先回來就用誰，大幅縮短體感等待時間
+      // Race 模式：嘗試多個來源
       const offset = await promiseAny([
         fetchWithTimeout('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei'),
         fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
@@ -93,11 +90,8 @@ export const TimeService = {
       ]);
       return offset;
     } catch (e) {
-      console.error("無法取得網路時間", e);
-      // 如果完全無法連網，且之前沒有錨點，則回傳 null
-      if (_anchorServerTime !== null) {
-          return 0; // 只要有錨點，offset 多少不重要，因為我們改用 anchor 計算
-      }
+      // 網路時間獲取失敗，嚴格禁止使用本機時間
+      console.error("Time sync failed completely."); 
       return null;
     }
   },
@@ -155,27 +149,20 @@ export const TimeService = {
 
   /**
    * 格式化完整的日期時間字串 (YYYY-MM-DD HH:mm[:ss])
-   * @param dateStr 原始時間字串
-   * @param withSeconds 是否包含秒數 (預設 false)
    */
   formatDateTime: (dateStr: string, withSeconds = false): string => {
     if (!dateStr) return '--';
-    
-    // 嘗試解析
     try {
         const d = new Date(dateStr);
         if (isNaN(d.getTime())) {
-            // 如果解析失敗，且字串看起來像簡單格式，則直接返回
             return dateStr.replace('T', ' ').replace('Z', '');
         }
-
         const datePart = d.toLocaleDateString('zh-TW', {
             timeZone: 'Asia/Taipei',
             year: 'numeric',
             month: '2-digit',
             day: '2-digit'
         }).replace(/\//g, '-');
-
         const timePart = d.toLocaleTimeString('zh-TW', {
             timeZone: 'Asia/Taipei',
             hour12: false,
@@ -183,7 +170,6 @@ export const TimeService = {
             minute: '2-digit',
             second: withSeconds ? '2-digit' : undefined
         });
-
         return `${datePart} ${timePart}`;
     } catch {
         return dateStr;
@@ -192,13 +178,9 @@ export const TimeService = {
 
   /**
    * 僅取出時間部分 (HH:mm[:ss])
-   * @param rawTime 原始時間字串
-   * @param withSeconds 是否包含秒數 (預設 false)
    */
   formatTimeOnly: (rawTime: string, withSeconds = false): string => {
     if (!rawTime) return '--';
-    
-    // 如果包含 T，通常是 ISO 格式，先轉 Date 再取時間
     if (rawTime.includes('T') || rawTime.includes('-')) {
         try {
             const d = new Date(rawTime);
@@ -211,16 +193,12 @@ export const TimeService = {
                     second: withSeconds ? '2-digit' : undefined
                 });
             }
-        } catch { /* ignore */ }
+        } catch { }
     }
-    
-    // 處理純時間字串 HH:mm:ss
     let timePart = rawTime;
-    // 去除 .000Z 等可能的後綴
     if (timePart.includes('.')) {
         timePart = timePart.split('.')[0];
     }
-    
     const parts = timePart.split(':');
     if (parts.length >= 2) {
         if (withSeconds && parts.length === 3) {
@@ -228,12 +206,11 @@ export const TimeService = {
         }
         return `${parts[0]}:${parts[1]}`;
     }
-    
     return timePart;
   },
 
   /**
-   * 格式化民國日期字串
+   * 格式化民國日期字串 (移除民國二字)
    */
   toROCDateString: (date: Date): string => {
     const twDateStr = date.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: 'numeric', day: 'numeric' });
@@ -244,18 +221,17 @@ export const TimeService = {
     const m = parseInt(parts[1]);
     const d = parseInt(parts[2]);
     const w = ['日', '一', '二', '三', '四', '五', '六'][date.getDay()];
-    return `民國 ${y} 年 ${m} 月 ${d} 日 (星期${w})`;
+    // 更新：移除 "民國" 兩字
+    return `${y} 年 ${m} 月 ${d} 日 (星期${w})`;
   },
 
   /**
-   * 計算請假時數 (核心邏輯)
+   * 計算請假時數
    */
   calculateLeaveHours: (startStr: string, endStr: string, holidays: Holiday[]): number => {
     if (!startStr || !endStr) return 0;
-    
     const s = new Date(startStr.replace(' ', 'T'));
     const e = new Date(endStr.replace(' ', 'T'));
-    
     if (e <= s) return 0;
 
     let totalHours = 0;
