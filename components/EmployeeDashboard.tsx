@@ -300,11 +300,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
              console.warn("High accuracy geolocation failed", err);
              // If high accuracy fails, try standard but verify last known valid location
              if (distance !== null && settings.companyLat && settings.companyLng) {
-                 // Fallback to currently watched position if valid
-                 // But for security, if fresh pull fails, we should be cautious. 
-                 // Here we will proceed with watched value if high accuracy fetch fails to avoid blocking user completely in bad signal areas, 
-                 // but we log it. Ideally we should block if critical.
-                 completePunch(0, 0); // Using 0,0 to indicate failed fresh fetch, distance logic might fail verification
+                 completePunch(0, 0); 
              } else {
                  completePunch(0, 0);
              }
@@ -319,8 +315,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     
     // Server-side check simulation: Re-verify distance with fresh coords
     if (settings.companyLat) {
-        // If we got 0,0 from error handler, fallback or error out. 
-        // For now, if lat/lng are 0, we assume location failed.
         if (lat === 0 && lng === 0) {
              setNotification({ type: 'error', message: "無法獲取精確位置，請稍後再試" });
              setIsVerifying(false);
@@ -328,10 +322,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         }
 
         const freshDistance = getDistanceFromLatLonInM(lat, lng, settings.companyLat, settings.companyLng);
-        // Record the actual calculated distance
         setDistance(freshDistance); 
 
-        // Strictly check IN punch range again with fresh data
         if (currentPunchType === 'in' && freshDistance > settings.allowedRadius) {
              setNotification({ type: 'error', message: `即時定位距離過遠 (${freshDistance.toFixed(0)}m)，打卡失敗` });
              setIsVerifying(false);
@@ -346,6 +338,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     const newRecord: AttendanceRecord = {
       id: Date.now(),
       userId: user.id,
+      uid: user.uid, // Security: Critical for Firestore Rules
       userName: user.name,
       date: todayStr,
       time: currentTimeStr,
@@ -686,9 +679,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                            return;
                          }
                          StorageService.addLeave({
-                           id: Date.now(), userId: user.id, userName: user.name, type: leaveForm.type,
-                           start: `${leaveForm.startDate} ${leaveForm.startTime}`, end: `${leaveForm.endDate} ${leaveForm.endTime}`,
-                           hours: calculatedHours, reason: leaveForm.reason, status: 'pending', created_at: new Date().toLocaleString()
+                           id: Date.now(), 
+                           userId: user.id, 
+                           uid: user.uid, // Security
+                           userName: user.name, 
+                           type: leaveForm.type,
+                           start: `${leaveForm.startDate} ${leaveForm.startTime}`, 
+                           end: `${leaveForm.endDate} ${leaveForm.endTime}`,
+                           hours: calculatedHours, 
+                           reason: leaveForm.reason, 
+                           status: 'pending', 
+                           created_at: new Date().toLocaleString()
                          });
                          setLeaveForm({ type: LEAVE_TYPES[0], startDate: '', endDate: '', startTime: '08:30', endTime: '17:30', reason: '' });
                          setNotification({ type: 'success', message: "已成功送出申請！" });
@@ -807,9 +808,16 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                return;
                              }
                              StorageService.addOvertime({
-                               id: Date.now(), userId: user.id, userName: user.name,
-                               start: `${otForm.startDate} ${otForm.startTime}`, end: `${otForm.endDate} ${otForm.endTime}`, hours: calculatedOTHours, reason: otForm.reason,
-                               status: 'pending', created_at: new Date().toLocaleString()
+                               id: Date.now(), 
+                               userId: user.id, 
+                               uid: user.uid, // Security
+                               userName: user.name,
+                               start: `${otForm.startDate} ${otForm.startTime}`, 
+                               end: `${otForm.endDate} ${otForm.endTime}`, 
+                               hours: calculatedOTHours, 
+                               reason: otForm.reason,
+                               status: 'pending', 
+                               created_at: new Date().toLocaleString()
                              });
                              setOtForm({startDate: '', startTime: '18:00', endDate: '', endTime: '20:00', reason: ''});
                              setNotification({ type: 'success', message: "加班申請已提交！" });
@@ -883,7 +891,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
          </button>
       </div>
 
-      {/* Modals */}
+      {/* Modals - Unchanged logic, omitted for brevity as they don't affect record creation structure ... */}
       
       {/* 1. Punch Math Challenge Modal (Restored) */}
       {punchMathChallenge && (

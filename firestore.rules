@@ -4,56 +4,60 @@ service cloud.firestore {
   match /databases/{database}/documents {
     
     // 輔助函式：檢查是否為管理員
-    // 假設管理員的 User Document ID 固定為 'admin' 且 uid 相符
     function isAdmin() {
       return request.auth != null && 
              exists(/databases/$(database)/documents/users/admin) &&
              get(/databases/$(database)/documents/users/admin).data.uid == request.auth.uid;
     }
 
-    // 輔助函式：檢查是否為本人
-    function isOwner(userId) {
-      return request.auth != null && request.auth.uid == userId;
-    }
-
-    // 輔助函式：檢查資料中的 userId 是否與當前登入者相符 (防止幫別人打卡)
+    // 輔助函式：檢查資料中的 uid 是否與當前登入者相符 (嚴格身分驗證)
+    // 注意：這裡檢查的是 'uid' (Firebase ID) 而不是 'userId' (員工帳號字串)
     function isDataOwner() {
-      return request.resource.data.userId == request.auth.uid;
+      return request.resource.data.uid == request.auth.uid;
     }
 
     // --- Users Collection ---
     match /users/{userId} {
-      // 允許已登入用戶讀取使用者列表 (為了顯示姓名/部門)
       allow read: if request.auth != null;
       
-      // 建立/更新規則：
-      // 1. 管理員可以操作任何帳號
-      // 2. 用戶只能更新自己的 uid (用於首次登入綁定) 或密碼欄位
-      allow write: if isAdmin() || (request.auth != null && request.auth.uid == request.resource.data.uid);
+      // 建立規則: 綁定 UID
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.uid;
+
+      // 更新規則:
+      // 1. 管理員可全權修改
+      // 2. 用戶本人僅可更新 uid (綁定用) 或 pass (密碼標記)
+      allow update: if isAdmin() || (
+        request.auth != null && 
+        request.auth.uid == request.resource.data.uid && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid', 'pass'])
+      );
+
+      allow delete: if isAdmin();
     }
 
     // --- Records (打卡紀錄) ---
     match /records/{recordId} {
-      // 管理員可讀所有；員工只能讀自己的
-      allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      // 管理員可讀所有；員工只能讀自己的 (這裡可以用 userId 因為前端查詢是用 userId)
+      allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid); // 若要嚴格可改 resource.data.uid
       
-      // 員工只能建立屬於自己的紀錄 (userId 必須相符)
+      // 寫入驗證：必須包含正確的 uid 欄位
       allow create: if request.auth != null && isDataOwner();
       
-      // 打卡紀錄建立後，原則上不允許修改 (除了管理員)
       allow update, delete: if isAdmin();
     }
 
     // --- Leaves (請假申請) ---
     match /leaves/{leaveId} {
-      allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid); // 前端查詢相容性
       
-      // 員工申請請假
       allow create: if request.auth != null && isDataOwner();
       
-      // 員工只能 "取消" (update status) 自己的假單，不能審核 (approve/reject)
-      // 這裡簡化邏輯，若要嚴格限制欄位需更詳細的規則，目前允許本人或管理員修改
-      allow update: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      // 員工只能更新 status (例如取消) 且必須是本人
+      allow update: if isAdmin() || (
+        request.auth != null && 
+        resource.data.uid == request.auth.uid && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+      );
       
       allow delete: if isAdmin();
     }
@@ -61,16 +65,21 @@ service cloud.firestore {
     // --- Overtimes (加班申請) ---
     match /overtimes/{otId} {
       allow read: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      
       allow create: if request.auth != null && isDataOwner();
-      allow update: if isAdmin() || (request.auth != null && resource.data.userId == request.auth.uid);
+      
+      allow update: if isAdmin() || (
+        request.auth != null && 
+        resource.data.uid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+      );
+      
       allow delete: if isAdmin();
     }
 
     // --- Announcements (公告) ---
     match /announcements/{annId} {
-      // 公開讀取
       allow read: if true; 
-      // 僅管理員可寫入
       allow write: if isAdmin();
     }
 

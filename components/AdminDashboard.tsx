@@ -19,6 +19,9 @@ export const AdminDashboard: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
   
+  // Overview Date Filter
+  const [overviewDate, setOverviewDate] = useState(TimeService.getTaiwanDate(new Date()));
+
   // Modals & Forms
   const [isEditUserModalOpen, setIsEditUserModalOpen] = useState(false);
   const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
@@ -416,23 +419,38 @@ export const AdminDashboard: React.FC = () => {
     showToast("匯出成功", 'success');
   };
 
-  const getEmployeeStatus = (uid: string) => {
-    const today = TimeService.getTaiwanDate(new Date());
-
-    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getTaiwanDate(r.date) === today);
-    const userLeaves = data.leaves.filter(l => l.userId === uid && l.status === 'approved' && l.start.startsWith(today));
+  const getEmployeeStatus = (uid: string, targetDateStr: string) => {
+    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getTaiwanDate(r.date) === targetDateStr);
     
-    const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === today) || new Date().getDay() === 0 || new Date().getDay() === 6;
+    // Check for approved leaves on this specific date
+    const userLeaves = data.leaves.filter(l => 
+        l.userId === uid && 
+        l.status === 'approved' && 
+        l.start.substring(0, 10) <= targetDateStr && 
+        l.end.substring(0, 10) >= targetDateStr
+    );
+    
+    // Check if target date is a holiday or weekend
+    const checkDay = new Date(targetDateStr);
+    const dayOfWeek = checkDay.getDay();
+    const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === targetDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
 
     const firstIn = userRecords.filter(r => r.type === 'in').sort((a,b) => a.time.localeCompare(b.time))[0];
     const lastOut = userRecords.filter(r => r.type === 'out').sort((a,b) => b.time.localeCompare(a.time))[0];
 
     const statusTags: { label: string, color: string }[] = [];
 
+    // 1. Leave Status Priority
+    if (userLeaves.length > 0) {
+        // Use the type of the first leave found
+        statusTags.push({ label: userLeaves[0].type, color: 'text-indigo-600 bg-indigo-50 border-indigo-200' });
+    }
+
+    // 2. Attendance Status
     if (isHoliday) {
         if (firstIn) {
             statusTags.push({ label: '休假日加班', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-        } else {
+        } else if (userLeaves.length === 0) {
             statusTags.push({ label: '休假', color: 'text-green-600 bg-green-50 border-green-200' });
         }
     }
@@ -441,9 +459,15 @@ export const AdminDashboard: React.FC = () => {
         const inTimeStr = TimeService.formatTimeOnly(firstIn.time);
         
         if (!isHoliday) {
-            statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
+            if (!userLeaves.some(l => l.type !== '補休')) { // Don't show "Working" if on full day leave, unless it's partial? Simplified logic here.
+                 statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
+            }
             if (inTimeStr > '08:30') {
-                statusTags.push({ label: '遲到', color: 'text-red-600 bg-red-50 border-red-200' });
+                 // Check if leave covers the morning
+                 const morningLeave = userLeaves.some(l => l.start.includes(targetDateStr) && l.start.substring(11, 16) <= '08:30');
+                 if (!morningLeave) {
+                    statusTags.push({ label: '遲到', color: 'text-red-600 bg-red-50 border-red-200' });
+                 }
             }
         }
 
@@ -453,42 +477,58 @@ export const AdminDashboard: React.FC = () => {
             
             if (!isHoliday) {
                 if (outTimeStr < '17:30') {
-                    statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
+                    // Check if leave covers the afternoon
+                    const afternoonLeave = userLeaves.some(l => l.end.includes(targetDateStr) && l.end.substring(11, 16) >= '17:30');
+                    if (!afternoonLeave) {
+                        statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
+                    }
                 }
             }
         } else {
-            const nowH = new Date().getHours();
-            if (nowH >= 18 && !isHoliday) {
-                statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
+            // Only show "Overtime" if it's actually today and past 18:00
+            const todayStr = TimeService.getTaiwanDate(new Date());
+            if (targetDateStr === todayStr) {
+                const nowH = new Date().getHours();
+                if (nowH >= 18 && !isHoliday && userLeaves.length === 0) {
+                    statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
+                }
             }
         }
     } else {
-        if (!isHoliday) {
-             const nowStr = TimeService.getTaiwanTime(new Date());
-             const nowSimple = nowStr.substring(0, 5);
-             
-             if (nowSimple > '08:30') {
-                 if (userLeaves.length > 0) {
-                     statusTags.push({ label: '請假中', color: 'text-indigo-600 bg-indigo-50 border-indigo-200' });
+        if (!isHoliday && userLeaves.length === 0) {
+             const todayStr = TimeService.getTaiwanDate(new Date());
+             // Only show Absent/Missing if looking at today (and late) or past dates
+             if (targetDateStr < todayStr) {
+                 statusTags.push({ label: '缺勤/未打卡', color: 'text-red-600 bg-red-50 border-red-200' });
+             } else if (targetDateStr === todayStr) {
+                 const nowStr = TimeService.getTaiwanTime(new Date());
+                 const nowSimple = nowStr.substring(0, 5);
+                 if (nowSimple > '08:30') {
+                     statusTags.push({ label: '未到班', color: 'text-red-600 bg-red-50 border-red-200' });
                  } else {
-                     statusTags.push({ label: '未到班/曠職', color: 'text-red-600 bg-red-50 border-red-200' });
+                     statusTags.push({ label: '未打卡', color: 'text-gray-400 bg-gray-50 border-gray-200' });
                  }
-             } else {
-                 statusTags.push({ label: '未打卡', color: 'text-gray-400 bg-gray-50 border-gray-200' });
              }
         }
     }
 
+    // Deduplicate tags
+    const uniqueTags = statusTags.filter((tag, index, self) =>
+        index === self.findIndex((t) => (
+            t.label === tag.label
+        ))
+    );
+
     // Prepare Display Data
-    const inDisplay = firstIn ? `${TimeService.getTaiwanDate(firstIn.date)} ${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
-    const outDisplay = lastOut ? `${TimeService.getTaiwanDate(lastOut.date)} ${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
+    const inDisplay = firstIn ? `${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
+    const outDisplay = lastOut ? `${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
     
     // Coordinates & Distance
     const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist } : null;
     const outLoc = lastOut ? { lat: lastOut.lat, lng: lastOut.lng, dist: lastOut.dist } : null;
 
     return { 
-      tags: statusTags, 
+      tags: uniqueTags, 
       inTime: inDisplay, 
       outTime: outDisplay,
       inLoc,
@@ -629,7 +669,19 @@ export const AdminDashboard: React.FC = () => {
             <div className="space-y-6 md:space-y-8">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                  <h2 className="text-2xl md:text-3xl font-black text-gray-800">{showArchived ? '已封存員工' : '在職人員總覽'}</h2>
-                 <div className="flex flex-wrap gap-2 md:gap-4 w-full md:w-auto">
+                 <div className="flex flex-wrap gap-2 md:gap-4 w-full md:w-auto items-center">
+                     {/* Date Picker for Overview */}
+                     <div className="flex items-center gap-2 bg-white px-3 py-2 rounded-2xl border border-gray-200 shadow-sm">
+                        <CalendarIcon size={16} className="text-gray-500"/>
+                        <input 
+                           type="date" 
+                           value={overviewDate}
+                           onChange={(e) => setOverviewDate(e.target.value)}
+                           className="font-black outline-none text-xs md:text-sm bg-transparent text-black"
+                           style={{colorScheme:'light'}}
+                        />
+                     </div>
+
                      <button onClick={() => setIsExportAttendanceModalOpen(true)} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2.5 rounded-2xl font-black bg-indigo-600 text-white shadow-lg hover:bg-indigo-700 transition-all text-sm md:text-base">
                        <FileText size={18}/> <span className="hidden md:inline">匯出打卡紀錄</span><span className="md:hidden">匯出</span>
                      </button>
@@ -647,11 +699,12 @@ export const AdminDashboard: React.FC = () => {
                  <div className="overflow-x-auto">
                    <table className="w-full text-left min-w-[800px]">
                       <thead className="bg-gray-50 text-xs font-black uppercase text-gray-400">
-                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班打卡</th><th className="p-4 md:p-6">下班打卡</th><th className="p-4 md:p-6">狀態</th><th className="p-4 md:p-6 text-right">操作</th></tr>
+                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班打卡</th><th className="p-4 md:p-6">下班打卡</th><th className="p-4 md:p-6">狀態 ({overviewDate})</th><th className="p-4 md:p-6 text-right">操作</th></tr>
                       </thead>
                       <tbody className="divide-y text-black font-bold text-sm">
                          {data.users.filter(u => u.role !== 'admin' && (showArchived ? u.deleted : !u.deleted)).map(u => {
-                            const status = getEmployeeStatus(u.id);
+                            // Pass the selected date to get specific status
+                            const status = getEmployeeStatus(u.id, overviewDate);
                             // Helper to render Location info
                             const renderLocInfo = (info: {lat: number, lng: number, dist: number} | null) => {
                                 if(!info) return null;
@@ -716,7 +769,6 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )}
 
-          {/* ... Leaves, OT, News, Holiday sections omitted for brevity as they are unchanged ... */}
           {activeView === 'leaves' && (
              <div className="space-y-8 md:space-y-12">
                {/* ... Keep existing Leaves content ... */}
@@ -1240,6 +1292,10 @@ export const AdminDashboard: React.FC = () => {
                     <Button type="button" onClick={handleSendResetEmail} className="w-full bg-white border-2 border-yellow-200 text-yellow-700 hover:bg-yellow-100 rounded-xl py-3 text-sm flex items-center justify-center gap-2">
                        <Mail size={16}/> 發送密碼重設信件
                     </Button>
+                    <div className="mt-3 text-[10px] text-yellow-600/80 font-bold border-t border-yellow-200 pt-2 leading-relaxed">
+                        <span className="bg-yellow-200 text-yellow-800 px-1 rounded mr-1">TIPS</span>
+                        若員工使用虛擬信箱無法收信，請至列表將其「封存」並「永久刪除」後，重新「新增」同名帳號即可重設密碼。（打卡紀錄會保留，但需重設年資額度）
+                    </div>
                  </div>
 
                  <div className="flex gap-4 pt-4">

@@ -1,6 +1,7 @@
 
 export const STORAGE_KEY = 'attendance_system_v3';
 export const SESSION_KEY = 'attendance_session_v3';
+export const REMEMBER_USER_KEY = 'attendance_remember_user_v3';
 
 // 預設系統參數
 // gasUrl: 已填入您的 Google Sheet API 網址，讓系統上線即連線

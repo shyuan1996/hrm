@@ -132,6 +132,15 @@ export const StorageService = {
     }
   },
 
+  /**
+   * 停止所有 Realtime Sync 監聽
+   * 用於登出或清理資源時
+   */
+  stopRealtimeSync: () => {
+    _listeners.forEach(unsubscribe => unsubscribe());
+    _listeners = [];
+  },
+
   // Helper: Save memory cache to localStorage
   _saveToLocal: () => {
     try {
