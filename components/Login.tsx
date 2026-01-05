@@ -3,22 +3,21 @@ import React, { useState, useEffect, useRef } from 'react';
 import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
 import { auth, db } from '../services/firebase';
-import { signInWithEmailAndPassword, setPersistence, browserLocalPersistence, browserSessionPersistence } from 'firebase/auth';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { signInWithEmailAndPassword } from 'firebase/auth';
+import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { Button } from './ui/Button';
 import { Building2, AlertTriangle, Megaphone, CloudDownload, Eye, EyeOff } from 'lucide-react';
-import { REMEMBER_USER_KEY } from '../constants';
 
 interface LoginProps {
   onLogin: (user: User) => void;
 }
 
+const REMEMBER_KEY = 'sas_remember_user_v1';
+
 export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  // 預設不勾選記住我，若勾選則使用 browserLocalPersistence (關閉視窗仍保留登入狀態)
-  // 若不勾選則使用 browserSessionPersistence (關閉視窗即登出)
   const [rememberMe, setRememberMe] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -26,27 +25,37 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [announcements, setAnnouncements] = useState<Announcement[]>(() => StorageService.loadData().announcements);
   const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
   
+  // 使用 Ref 來記錄是否已經自動彈出過，防止使用者手動關閉後又因為資料更新而重複彈出
   const hasAutoShown = useRef(false);
 
   useEffect(() => {
-    // 1. Load Data
     const updateHandler = () => {
         setAnnouncements(StorageService.loadData().announcements);
     };
     window.addEventListener('storage-update', updateHandler);
     StorageService.initRealtimeSync();
 
-    // 2. Check for remembered username ONLY (Let browser handle password)
-    // 我們只幫使用者填入帳號，密碼由瀏覽器的 Autofill 安全處理
-    const savedUsername = localStorage.getItem(REMEMBER_USER_KEY);
-    if (savedUsername) {
-        setUsername(savedUsername);
-        setRememberMe(true);
+    // Load Remember Me Data
+    const storedCreds = localStorage.getItem(REMEMBER_KEY);
+    if (storedCreds) {
+        try {
+            // Simple Base64 decode
+            const { u, p } = JSON.parse(atob(storedCreds));
+            if (u && p) {
+                setUsername(u);
+                setPassword(p);
+                setRememberMe(true);
+            }
+        } catch (e) {
+            console.error("Failed to parse saved credentials", e);
+            localStorage.removeItem(REMEMBER_KEY);
+        }
     }
 
     return () => window.removeEventListener('storage-update', updateHandler);
   }, []);
 
+  // 新增：監聽公告資料，若有資料且尚未自動彈出，則開啟 Modal
   useEffect(() => {
     if (announcements.length > 0 && !hasAutoShown.current) {
         setShowAnnouncementModal(true);
@@ -64,13 +73,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         email = `${email}@shyuan-hrm.com`;
     }
 
+    // 嘗試從 Email 解析 ID，或直接使用 ID
     const originalId = username.includes('@') ? username.split('@')[0] : username;
 
     try {
-        // 資安修正：根據「記住我」設定 Firebase Persistence
-        // 這決定了「關閉瀏覽器後，下次進來是否還要登入」
-        await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
-
         // 1. Firebase Auth Login
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
         const firebaseUser = userCredential.user;
@@ -80,8 +86,11 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         const userDocRef = doc(db, 'users', originalId);
         
         // 2. 嘗試「認領」或更新 UID
+        // 這是為了配合 Security Rules: allow write: if request.resource.data.uid == request.auth.uid
+        // 無論是 Admin 還是員工，登入成功後確保資料庫內的 UID 與 Auth UID 一致
         if (originalId === 'admin') {
              try {
+                 // 嘗試寫入 Admin 權限標記，如果規則設定正確，這步會成功
                  await setDoc(userDocRef, {
                      id: 'admin',
                      uid: firebaseUser.uid,
@@ -91,14 +100,14 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                      pass: 'PROTECTED'
                  }, { merge: true });
              } catch (e) {
-                 console.warn("Admin auto-claim failed", e);
+                 console.warn("Admin auto-claim failed (possibly strict rules), proceeding to read...", e);
              }
         } else {
+             // 一般員工嘗試寫入自己的 UID
              try {
-                 // 一般員工嘗試寫入自己的 UID
                  await setDoc(userDocRef, { uid: firebaseUser.uid }, { merge: true });
              } catch (e) {
-                 console.warn("User auto-claim failed", e);
+                 console.warn("User auto-claim failed, proceeding...", e);
              }
         }
 
@@ -134,6 +143,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
              } as User;
              
              try {
+                // 這裡的寫入需要符合 request.resource.data.uid == request.auth.uid
                 await setDoc(userDocRef, userProfile);
              } catch (e: any) {
                  if (e.code === 'permission-denied') throw new Error("PERMISSION_DENIED_CREATE");
@@ -147,12 +157,12 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
             return;
         }
 
-        // Feature: Remember Username Only
-        // 我們只負責記住帳號，密碼的記憶交給瀏覽器 (Browser Native Password Manager)
+        // Handle Remember Me Logic (Save after successful login)
         if (rememberMe) {
-            localStorage.setItem(REMEMBER_USER_KEY, username);
+            const jsonStr = JSON.stringify({ u: username, p: password });
+            localStorage.setItem(REMEMBER_KEY, btoa(jsonStr));
         } else {
-            localStorage.removeItem(REMEMBER_USER_KEY);
+            localStorage.removeItem(REMEMBER_KEY);
         }
 
         onLogin(userProfile!);
@@ -162,6 +172,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         const errCode = err.code;
         const errMessage = err.message;
 
+        // 簡化錯誤提示邏輯：一般帳號密碼錯誤統一顯示，不提供解決方案
         if (errCode === 'auth/invalid-credential' || errCode === 'auth/wrong-password' || errCode === 'auth/user-not-found') {
             setError('帳號或密碼錯誤');
         } else if (errCode === 'auth/too-many-requests') {
@@ -198,28 +209,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-5 md:space-y-6">
-          <input 
-            type="text" 
-            name="username"
-            autoComplete="username" 
-            required 
-            value={username} 
-            onChange={e=>setUsername(e.target.value)} 
-            className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" 
-            placeholder="帳號" 
-          />
+          <input type="text" required value={username} onChange={e=>setUsername(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="帳號" />
           
           <div className="relative">
-             <input 
-               type={showPassword ? "text" : "password"} 
-               name="password"
-               autoComplete="current-password"
-               required 
-               value={password} 
-               onChange={e=>setPassword(e.target.value)} 
-               className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" 
-               placeholder="密碼" 
-             />
+             <input type={showPassword ? "text" : "password"} required value={password} onChange={e=>setPassword(e.target.value)} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none focus:ring-2 focus:ring-brand-500 font-black transition-all" placeholder="密碼" />
              <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-4 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600">
                 {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
              </button>
@@ -228,7 +221,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           <div className="flex justify-between items-center">
              <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
                 <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />
-                記住我 (保持登入)
+                記住我
              </label>
              {announcements.length > 0 && (
                 <button type="button" onClick={() => setShowAnnouncementModal(true)} className="text-xs font-black text-brand-600 hover:underline flex items-center gap-1">
@@ -259,7 +252,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                       <span className={`px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${ann.category === 'urgent' ? 'bg-red-100 text-red-600' : ann.category === 'system' ? 'bg-gray-100 text-gray-500' : 'bg-blue-100 text-blue-600'}`}>
                         {ann.category === 'urgent' ? '緊急' : ann.category === 'system' ? '系統' : '一般'}
                       </span>
-                      <span className="text-gray-400 font-black font-mono text-[10px]">
+                      <span className="text-[10px] text-gray-400 font-black font-mono">
                         {ann.date ? ann.date.split(' ')[0].split('T')[0] : ''}
                       </span>
                     </div>

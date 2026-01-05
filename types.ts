@@ -20,8 +20,7 @@ export interface User {
 
 export interface AttendanceRecord {
   id: number;
-  userId: string; // "john"
-  uid?: string;   // "firebase_auth_uid_123" (Security Check)
+  userId: string;
   userName: string;
   date: string; // YYYY-MM-DD
   time: string; // HH:mm:ss
@@ -31,12 +30,13 @@ export interface AttendanceRecord {
   lng: number;
   dist: number;
   photo?: string; // Base64 string of the selfie
+  uid?: string; // Added for robust security rules
 }
 
 export interface LeaveRequest {
   id: number;
   userId: string;
-  uid?: string; // Security Check
+  uid?: string; // Added for robust security rules
   userName: string;
   type: string;
   start: string; // YYYY-MM-DD HH:mm
@@ -51,7 +51,7 @@ export interface LeaveRequest {
 export interface OvertimeRequest {
   id: number;
   userId: string;
-  uid?: string; // Security Check
+  uid?: string; // Added for robust security rules
   userName: string;
   start: string;
   end: string;

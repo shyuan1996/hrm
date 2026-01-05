@@ -5,7 +5,7 @@ import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, Image as ImageIcon } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2 } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -338,7 +338,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     const newRecord: AttendanceRecord = {
       id: Date.now(),
       userId: user.id,
-      uid: user.uid, // Security: Critical for Firestore Rules
+      uid: user.uid, // PASS UID HERE
       userName: user.name,
       date: todayStr,
       time: currentTimeStr,
@@ -438,18 +438,29 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     setCancelLeaveChallenge({ id, q: `${n1} + ${n2} = ?`, a: ans, opts, type });
   };
 
-  const executeCancelRequest = (choice: number) => {
+  const executeCancelRequest = async (choice: number) => {
     if (!cancelLeaveChallenge) return;
     if (choice !== cancelLeaveChallenge.a) {
        setCancelLeaveChallenge(null);
        setNotification({ type: 'error', message: "驗證錯誤，取消操作已終止" });
        return;
     }
-    if (cancelLeaveChallenge.type === 'leave') StorageService.cancelLeave(cancelLeaveChallenge.id);
-    else StorageService.cancelOvertime(cancelLeaveChallenge.id);
-
-    setCancelLeaveChallenge(null);
-    setNotification({ type: 'success', message: "申請已成功取消" });
+    
+    try {
+        if (cancelLeaveChallenge.type === 'leave') {
+            // Updated: Pass user.id to deleteLeave to satisfy Firestore Rules query constraints
+            await StorageService.deleteLeave(cancelLeaveChallenge.id, user.id);
+        } else {
+            // Updated: Pass user.id to deleteOvertime to satisfy Firestore Rules query constraints
+            await StorageService.deleteOvertime(cancelLeaveChallenge.id, user.id);
+        }
+        setNotification({ type: 'success', message: "申請已成功刪除" });
+    } catch (e: any) {
+        console.error("Cancel failed", e);
+        setNotification({ type: 'error', message: "刪除失敗: " + (e.message || "權限不足或網路錯誤") });
+    } finally {
+        setCancelLeaveChallenge(null);
+    }
   };
 
   const getLeaveStatusStyle = (status: string) => {
@@ -681,7 +692,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                          StorageService.addLeave({
                            id: Date.now(), 
                            userId: user.id, 
-                           uid: user.uid, // Security
+                           uid: user.uid, // PASS UID HERE
                            userName: user.name, 
                            type: leaveForm.type,
                            start: `${leaveForm.startDate} ${leaveForm.startTime}`, 
@@ -808,16 +819,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                return;
                              }
                              StorageService.addOvertime({
-                               id: Date.now(), 
-                               userId: user.id, 
-                               uid: user.uid, // Security
+                               id: Date.now(), userId: user.id, uid: user.uid, // PASS UID HERE
                                userName: user.name,
-                               start: `${otForm.startDate} ${otForm.startTime}`, 
-                               end: `${otForm.endDate} ${otForm.endTime}`, 
-                               hours: calculatedOTHours, 
-                               reason: otForm.reason,
-                               status: 'pending', 
-                               created_at: new Date().toLocaleString()
+                               start: `${otForm.startDate} ${otForm.startTime}`, end: `${otForm.endDate} ${otForm.endTime}`, 
+                               hours: calculatedOTHours, reason: otForm.reason,
+                               status: 'pending', created_at: new Date().toLocaleString()
                              });
                              setOtForm({startDate: '', startTime: '18:00', endDate: '', endTime: '20:00', reason: ''});
                              setNotification({ type: 'success', message: "加班申請已提交！" });
@@ -837,33 +843,33 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                        <div className="flex flex-col gap-4">
                          <div className="flex justify-between items-start">
                            <div className="space-y-2 flex-1">
-                             <div className="text-lg md:text-xl font-black text-indigo-600 underline underline-offset-4 decoration-2">
-                                {recentOT.hours} 小時
-                             </div>
-                             <div className="text-xs md:text-sm text-gray-500 font-mono bg-gray-50 px-3 py-1 rounded-lg inline-block">
-                               {TimeService.formatDateTime(recentOT.start)} ~ {TimeService.formatDateTime(recentOT.end)}
-                             </div>
-                             <div className="text-xs md:text-sm text-gray-600 border-l-4 border-indigo-100 pl-4 py-1 italic">
-                               事由：{recentOT.reason}
-                             </div>
-                             {recentOT.status === 'rejected' && recentOT.rejectReason && (
-                               <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1">
-                                 審核不通過原因：{recentOT.rejectReason}
-                               </div>
-                             )}
-                             {recentOT.adminNote && (
-                               <div className="text-xs md:text-sm text-brand-600 font-bold border-l-4 border-brand-200 pl-4 py-1">
-                                 管理員修改備註：{recentOT.adminNote}
-                               </div>
-                             )}
-                             <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
-                                <Clock size={12}/> 申請於：{TimeService.formatDateTime(recentOT.created_at, true)}
-                             </div>
-                             {recentOT.status === 'pending' && (
-                               <button onClick={() => initiateCancelRequest(recentOT.id, 'ot')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
-                                  <XCircle size={14}/> 取消申請
-                               </button>
-                             )}
+                               <div className="text-lg md:text-xl font-black text-indigo-600 underline underline-offset-4 decoration-2">
+                                    {recentOT.hours} 小時
+                                 </div>
+                                 <div className="text-xs md:text-sm text-gray-500 font-mono bg-gray-50 px-3 py-1 rounded-lg inline-block">
+                                   {TimeService.formatDateTime(recentOT.start)} ~ {TimeService.formatDateTime(recentOT.end)}
+                                 </div>
+                                 <div className="text-xs md:text-sm text-gray-600 border-l-4 border-indigo-100 pl-4 py-1 italic">
+                                   事由：{recentOT.reason}
+                                 </div>
+                                 {recentOT.status === 'rejected' && recentOT.rejectReason && (
+                                   <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1">
+                                     審核不通過原因：{recentOT.rejectReason}
+                                   </div>
+                                 )}
+                                 {recentOT.adminNote && (
+                                   <div className="text-xs md:text-sm text-brand-600 font-bold border-l-4 border-brand-200 pl-4 py-1">
+                                     管理員修改備註：{recentOT.adminNote}
+                                   </div>
+                                 )}
+                                 <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1">
+                                    <Clock size={12}/> 申請於：{TimeService.formatDateTime(recentOT.created_at, true)}
+                                 </div>
+                                 {recentOT.status === 'pending' && (
+                                   <button onClick={() => initiateCancelRequest(recentOT.id, 'ot')} className="text-xs text-red-500 font-black flex items-center gap-1 hover:underline mt-2">
+                                      <XCircle size={14}/> 取消申請
+                                   </button>
+                                 )}
                            </div>
                            <span className={`px-3 py-1 md:px-5 md:py-2 rounded-full text-[10px] md:text-xs font-black shadow-sm ${getLeaveStatusStyle(recentOT.status)}`}>
                              {getLeaveStatusText(recentOT.status)}
@@ -891,7 +897,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
          </button>
       </div>
 
-      {/* Modals - Unchanged logic, omitted for brevity as they don't affect record creation structure ... */}
+      {/* Modals - Same as before */}
       
       {/* 1. Punch Math Challenge Modal (Restored) */}
       {punchMathChallenge && (
@@ -958,40 +964,41 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               </div>
               
               <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
-                 {records
-                    .filter(r => {
+                 {(() => {
+                    const filteredRecords = records.filter(r => {
                        if (punchFilterStart && r.date < punchFilterStart) return false;
                        if (punchFilterEnd && r.date > punchFilterEnd) return false;
                        return true;
-                    })
-                    .map(r => (
-                    <div key={r.id} className="p-4 bg-gray-50 border rounded-2xl flex items-center justify-between">
-                       <div>
-                          <div className="text-xs font-black text-gray-400">{TimeService.getTaiwanDate(r.date)}</div>
-                          <div className={`text-sm font-black ${r.type==='in'?'text-brand-600':'text-red-600'}`}>{r.type==='in'?'上班':'下班'}</div>
-                       </div>
-                       <div className="flex-1 text-center">
-                          <div className="text-xl font-mono font-black text-gray-800">{TimeService.formatTimeOnly(r.time, true)}</div>
-                       </div>
-                       <div className="flex flex-col items-end gap-1 min-w-[60px]">
-                          <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
-                            成功
-                          </div>
-                          {r.status.includes('異常') && <span className="text-[9px] text-red-500 font-bold">地點異常</span>}
-                       </div>
-                    </div>
-                 ))}
-                 {records.filter(r => {
-                       if (punchFilterStart && r.date < punchFilterStart) return false;
-                       if (punchFilterEnd && r.date > punchFilterEnd) return false;
-                       return true;
-                 }).length === 0 && <div className="text-center text-gray-400 py-10">無歷史紀錄</div>}
+                    });
+                    
+                    if (filteredRecords.length === 0) {
+                        return <div className="text-center text-gray-400 py-10">無歷史紀錄</div>;
+                    }
+
+                    return filteredRecords.map(r => (
+                        <div key={r.id} className="p-4 bg-gray-50 border rounded-2xl flex items-center justify-between">
+                           <div>
+                              <div className="text-xs font-black text-gray-400">{TimeService.getTaiwanDate(r.date)}</div>
+                              <div className={`text-sm font-black ${r.type==='in'?'text-brand-600':'text-red-600'}`}>{r.type==='in'?'上班':'下班'}</div>
+                           </div>
+                           <div className="flex-1 text-center">
+                              <div className="text-xl font-mono font-black text-gray-800">{TimeService.formatTimeOnly(r.time, true)}</div>
+                           </div>
+                           <div className="flex flex-col items-end gap-1 min-w-[60px]">
+                              <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>
+                                成功
+                              </div>
+                              {r.status.includes('異常') && <span className="text-[9px] text-red-500 font-bold">地點異常</span>}
+                           </div>
+                        </div>
+                    ));
+                 })()}
               </div>
            </div>
         </div>
       )}
 
-      {/* 4. Leave History Modal (Unchanged logic) */}
+      {/* 4. Leave History Modal */}
       {showLeaveHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
@@ -1024,42 +1031,48 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               </div>
 
               <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
-                 {allLeaves
-                    .filter(l => {
+                 {(() => {
+                    const filteredLeaves = allLeaves.filter(l => {
                         if (historyFilterType !== 'all' && l.type !== historyFilterType) return false;
                         if (historyFilterStart && l.start < historyFilterStart) return false;
                         if (historyFilterEnd && l.start > historyFilterEnd) return false;
                         return true;
-                    })
-                    .sort((a, b) => b.id - a.id)
-                    .map(l => (
-                    <div key={l.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
-                       <div className="flex justify-between items-start">
-                          <div>
-                             <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(l.status)}`}>{getLeaveStatusText(l.status)}</span>
-                             <div className="text-lg font-black text-brand-600 mt-1">{l.type} <span className="text-black text-sm">({l.hours}hr)</span></div>
-                          </div>
-                          {l.status === 'pending' && (
-                             <button onClick={() => initiateCancelRequest(l.id, 'leave')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
-                          )}
-                       </div>
-                       <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
-                          {TimeService.formatDateTime(l.start)} ~ <br/>{TimeService.formatDateTime(l.end)}
-                       </div>
-                       {l.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{l.reason}</div>}
-                       {l.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{l.rejectReason}</div>}
-                       <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
-                          申請時間：{TimeService.formatDateTime(l.created_at, true)}
-                       </div>
-                    </div>
-                 ))}
-                 {allLeaves.length === 0 && <div className="text-center text-gray-400 py-10">無請假紀錄</div>}
+                    });
+
+                    if (filteredLeaves.length === 0) {
+                        return <div className="text-center text-gray-400 py-10">無請假紀錄</div>;
+                    }
+
+                    return filteredLeaves
+                        .sort((a, b) => b.id - a.id)
+                        .map(l => (
+                        <div key={l.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
+                           <div className="flex justify-between items-start">
+                              <div>
+                                 <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(l.status)}`}>{getLeaveStatusText(l.status)}</span>
+                                 <div className="text-lg font-black text-brand-600 mt-1">{l.type} <span className="text-black text-sm">({l.hours}hr)</span></div>
+                              </div>
+                              {l.status === 'pending' && (
+                                 <button onClick={() => initiateCancelRequest(l.id, 'leave')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
+                              )}
+                           </div>
+                           <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
+                              {TimeService.formatDateTime(l.start)} ~ <br/>{TimeService.formatDateTime(l.end)}
+                           </div>
+                           {l.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{l.reason}</div>}
+                           {l.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{l.rejectReason}</div>}
+                           <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
+                              申請時間：{TimeService.formatDateTime(l.created_at, true)}
+                           </div>
+                        </div>
+                    ));
+                 })()}
               </div>
            </div>
         </div>
       )}
 
-      {/* 5. Overtime History Modal (Unchanged logic) */}
+      {/* 5. Overtime History Modal */}
       {showOTHistory && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
            <div className="bg-white rounded-[32px] md:rounded-[40px] p-6 md:p-10 w-full max-w-lg shadow-2xl font-bold flex flex-col max-h-[85vh]">
@@ -1080,36 +1093,42 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               </div>
 
               <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
-                 {allOvertime
-                    .filter(o => {
+                 {(() => {
+                    const filteredOT = allOvertime.filter(o => {
                         if (otFilterStart && o.start < otFilterStart) return false;
                         if (otFilterEnd && o.start > otFilterEnd) return false;
                         return true;
-                    })
-                    .sort((a, b) => b.id - a.id)
-                    .map(o => (
-                    <div key={o.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
-                       <div className="flex justify-between items-start">
-                          <div>
-                             <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(o.status)}`}>{getLeaveStatusText(o.status)}</span>
-                             <div className="text-lg font-black text-indigo-600 mt-1">加班 <span className="text-black text-sm">({o.hours}hr)</span></div>
-                          </div>
-                          {o.status === 'pending' && (
-                             <button onClick={() => initiateCancelRequest(o.id, 'ot')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
-                          )}
-                       </div>
-                       <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
-                          {TimeService.formatDateTime(o.start)} ~ <br/>{TimeService.formatDateTime(o.end)}
-                       </div>
-                       {o.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{o.reason}</div>}
-                       {o.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{o.rejectReason}</div>}
-                       {o.adminNote && <div className="text-xs text-brand-600 pl-2 border-l-2 border-brand-200">管理員備註：{o.adminNote}</div>}
-                       <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
-                          申請時間：{TimeService.formatDateTime(o.created_at, true)}
-                       </div>
-                    </div>
-                 ))}
-                 {allOvertime.length === 0 && <div className="text-center text-gray-400 py-10">無加班紀錄</div>}
+                    });
+
+                    if (filteredOT.length === 0) {
+                        return <div className="text-center text-gray-400 py-10">無加班紀錄</div>;
+                    }
+
+                    return filteredOT
+                        .sort((a, b) => b.id - a.id)
+                        .map(o => (
+                        <div key={o.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
+                           <div className="flex justify-between items-start">
+                              <div>
+                                 <span className={`px-2 py-0.5 rounded text-[10px] ${getLeaveStatusStyle(o.status)}`}>{getLeaveStatusText(o.status)}</span>
+                                 <div className="text-lg font-black text-indigo-600 mt-1">加班 <span className="text-black text-sm">({o.hours}hr)</span></div>
+                              </div>
+                              {o.status === 'pending' && (
+                                 <button onClick={() => initiateCancelRequest(o.id, 'ot')} className="p-2 text-gray-300 hover:text-red-500"><Trash2 size={16}/></button>
+                              )}
+                           </div>
+                           <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">
+                              {TimeService.formatDateTime(o.start)} ~ <br/>{TimeService.formatDateTime(o.end)}
+                           </div>
+                           {o.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{o.reason}</div>}
+                           {o.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{o.rejectReason}</div>}
+                           {o.adminNote && <div className="text-xs text-brand-600 pl-2 border-l-2 border-brand-200">管理員備註：{o.adminNote}</div>}
+                           <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
+                              申請時間：{TimeService.formatDateTime(o.created_at, true)}
+                           </div>
+                        </div>
+                    ));
+                 })()}
               </div>
            </div>
         </div>

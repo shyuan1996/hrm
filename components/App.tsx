@@ -6,7 +6,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { User, AppSettings } from './types';
 import { StorageService } from './services/storageService';
 import { TimeService } from './services/timeService';
-import { SESSION_KEY, DEFAULT_SETTINGS, APP_VERSION, VERSION_KEY, REMEMBER_USER_KEY, STORAGE_KEY } from './constants';
+import { SESSION_KEY, DEFAULT_SETTINGS } from './constants';
 import { Key, LogOut, CheckCircle, UserCircle, AlertTriangle } from 'lucide-react';
 import { Button } from './components/ui/Button';
 import { auth } from './services/firebase';
@@ -42,31 +42,6 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // 0. Version Check & Cache Invalidation
-    // 這段邏輯確保使用者每次開啟網頁時，如果我們發布了新版本，會自動清除舊緩存並重整
-    const localVersion = localStorage.getItem(VERSION_KEY);
-    if (localVersion !== APP_VERSION) {
-        console.log(`New version detected: ${APP_VERSION} (Old: ${localVersion}). Cleaning up stale cache...`);
-        
-        // 1. 備份「記住我」的帳號 (我們不想讓使用者更新後還得重新輸入帳號)
-        const savedUsername = localStorage.getItem(REMEMBER_USER_KEY);
-        
-        // 2. 清除所有 LocalStorage (包含舊的 STORAGE_KEY 資料快取)
-        localStorage.clear();
-        
-        // 3. 還原「記住我」
-        if (savedUsername) {
-            localStorage.setItem(REMEMBER_USER_KEY, savedUsername);
-        }
-        
-        // 4. 更新版本號
-        localStorage.setItem(VERSION_KEY, APP_VERSION);
-        
-        // 5. 強制重新整理頁面，確保載入最新的 JS/CSS
-        window.location.reload();
-        return;
-    }
-
     // 1. Initial Load from Cache (with defensive checks)
     const cachedData = safeLoadData();
     setAppSettings(cachedData.settings);
@@ -127,7 +102,6 @@ const App: React.FC = () => {
         }
       } else if (!firebaseUser) {
         // Firebase 已登出，強制清除本地狀態
-        // Ensure realtime sync is stopped if available
         try {
           if (typeof (StorageService as any).stopRealtimeSync === 'function') {
             (StorageService as any).stopRealtimeSync();
@@ -170,9 +144,7 @@ const App: React.FC = () => {
       return;
     }
 
-    // 安全檢查：鎖定當前使用者，避免非同步期間狀態改變
-    const user = auth.currentUser;
-    if (!user || !user.email) {
+    if (!auth.currentUser || !auth.currentUser.email) {
       showNotification('驗證狀態失效，請重新登入', 'error');
       return;
     }
@@ -181,9 +153,9 @@ const App: React.FC = () => {
 
     try {
       // 1. 優先判斷舊密碼是否正確 (透過 Firebase 重新驗證)
-      const credential = EmailAuthProvider.credential(user.email, pwdForm.old);
+      const credential = EmailAuthProvider.credential(auth.currentUser.email, pwdForm.old);
       try {
-        await reauthenticateWithCredential(user, credential);
+        await reauthenticateWithCredential(auth.currentUser, credential);
       } catch (e: any) {
         console.error('Re-auth failed', e);
         if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password') {
@@ -206,7 +178,7 @@ const App: React.FC = () => {
       }
 
       // 4. 執行密碼更新
-      await updatePassword(user, pwdForm.new1);
+      await updatePassword(auth.currentUser, pwdForm.new1);
 
       // 5. 更新 Firestore 狀態 (標記密碼已保護)
       if (currentUser) {
@@ -217,32 +189,34 @@ const App: React.FC = () => {
         }
       }
 
-      // 6. 成功提示 (注意：不需要清除記住的帳號)
-      setIsSelfPwdModalOpen(false);
-      setPwdForm({ old: '', new1: '', new2: '' });
-      showNotification('密碼修改成功！即將自動登出...', 'success');
+      // 6. 清除記住我
+      localStorage.removeItem('sas_remember_user_v1');
 
-      // 延遲執行登出，讓使用者能看到上方的成功提示
-      setTimeout(async () => {
-          try {
-            await signOut(auth);
-          } catch (e) {
-            console.error('signOut after password change failed', e);
-          } finally {
-            try {
-              if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-                (StorageService as any).stopRealtimeSync();
-              }
-            } catch (e) {
-              // ignore
-            }
-            localStorage.removeItem(SESSION_KEY);
-            setCurrentUser(null);
+      // 7. 成功提示並強制登出 (加入延遲)
+      showNotification('密碼修改成功！請使用新密碼重新登入', 'success');
+      
+      // Delay logout by 2 seconds to let user see the success message
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // 程式化登出並清理本地狀態
+      try {
+        await signOut(auth);
+      } catch (e) {
+        console.error('signOut after password change failed', e);
+      } finally {
+        try {
+          if (typeof (StorageService as any).stopRealtimeSync === 'function') {
+            (StorageService as any).stopRealtimeSync();
           }
-      }, 2000);
-
+        } catch (e) {
+          // ignore
+        }
+        localStorage.removeItem(SESSION_KEY);
+        setCurrentUser(null);
+        setIsSelfPwdModalOpen(false);
+        setPwdForm({ old: '', new1: '', new2: '' });
+      }
     } catch (error: any) {
-      setIsProcessing(false);
       if (error && typeof error === 'object' && 'code' in error) {
         const code = (error as any).code;
         if (code === 'WRONG_OLD_PASSWORD') {
@@ -262,6 +236,8 @@ const App: React.FC = () => {
       } else {
         showNotification('修改失敗: ' + (error?.message || '未知錯誤'), 'error');
       }
+    } finally {
+      setIsProcessing(false);
     }
   };
 

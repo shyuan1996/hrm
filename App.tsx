@@ -102,7 +102,6 @@ const App: React.FC = () => {
         }
       } else if (!firebaseUser) {
         // Firebase 已登出，強制清除本地狀態
-        // Ensure realtime sync is stopped if available
         try {
           if (typeof (StorageService as any).stopRealtimeSync === 'function') {
             (StorageService as any).stopRealtimeSync();
@@ -145,9 +144,7 @@ const App: React.FC = () => {
       return;
     }
 
-    // 安全檢查：鎖定當前使用者，避免非同步期間狀態改變
-    const user = auth.currentUser;
-    if (!user || !user.email) {
+    if (!auth.currentUser || !auth.currentUser.email) {
       showNotification('驗證狀態失效，請重新登入', 'error');
       return;
     }
@@ -156,9 +153,9 @@ const App: React.FC = () => {
 
     try {
       // 1. 優先判斷舊密碼是否正確 (透過 Firebase 重新驗證)
-      const credential = EmailAuthProvider.credential(user.email, pwdForm.old);
+      const credential = EmailAuthProvider.credential(auth.currentUser.email, pwdForm.old);
       try {
-        await reauthenticateWithCredential(user, credential);
+        await reauthenticateWithCredential(auth.currentUser, credential);
       } catch (e: any) {
         console.error('Re-auth failed', e);
         if (e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password') {
@@ -181,7 +178,7 @@ const App: React.FC = () => {
       }
 
       // 4. 執行密碼更新
-      await updatePassword(user, pwdForm.new1);
+      await updatePassword(auth.currentUser, pwdForm.new1);
 
       // 5. 更新 Firestore 狀態 (標記密碼已保護)
       if (currentUser) {
@@ -195,32 +192,33 @@ const App: React.FC = () => {
       // 6. 清除記住我
       localStorage.removeItem('sas_remember_user_v1');
 
-      // 7. 成功提示
+      // 7. 成功提示並強制登出
+      // 順序優化：先關閉視窗，再顯示成功訊息，最後才登出
       setIsSelfPwdModalOpen(false);
       setPwdForm({ old: '', new1: '', new2: '' });
-      showNotification('密碼修改成功！即將自動登出...', 'success');
+      
+      showNotification('密碼修改成功！請使用新密碼重新登入', 'success');
+      
+      // Delay logout by 2 seconds to let user see the success message
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
-      // 延遲執行登出，讓使用者能看到上方的成功提示
-      setTimeout(async () => {
-          try {
-            await signOut(auth);
-          } catch (e) {
-            console.error('signOut after password change failed', e);
-          } finally {
-            try {
-              if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-                (StorageService as any).stopRealtimeSync();
-              }
-            } catch (e) {
-              // ignore
-            }
-            localStorage.removeItem(SESSION_KEY);
-            setCurrentUser(null);
+      // 程式化登出並清理本地狀態
+      try {
+        await signOut(auth);
+      } catch (e) {
+        console.error('signOut after password change failed', e);
+      } finally {
+        try {
+          if (typeof (StorageService as any).stopRealtimeSync === 'function') {
+            (StorageService as any).stopRealtimeSync();
           }
-      }, 2000);
-
+        } catch (e) {
+          // ignore
+        }
+        localStorage.removeItem(SESSION_KEY);
+        setCurrentUser(null);
+      }
     } catch (error: any) {
-      setIsProcessing(false);
       if (error && typeof error === 'object' && 'code' in error) {
         const code = (error as any).code;
         if (code === 'WRONG_OLD_PASSWORD') {
@@ -240,6 +238,8 @@ const App: React.FC = () => {
       } else {
         showNotification('修改失敗: ' + (error?.message || '未知錯誤'), 'error');
       }
+    } finally {
+      setIsProcessing(false);
     }
   };
 
@@ -296,15 +296,11 @@ const App: React.FC = () => {
 
   return (
     <div className="font-sans text-gray-900 antialiased h-screen flex flex-col bg-gray-50 relative">
-      {/* Global Center Header Notification */}
+      {/* Global Center Header Notification - Styled exactly like EmployeeDashboard */}
       {notification && (
-        <div
-          className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}
-          role="status"
-          aria-live="polite"
-        >
-          {notification.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
-          <span className="flex-1">{notification.message}</span>
+        <div className={`fixed top-6 left-1/2 transform -translate-x-1/2 z-[9999] w-[92%] md:w-auto md:max-w-xl px-6 py-4 rounded-[28px] shadow-2xl flex items-center justify-center gap-3 font-black text-base md:text-lg border-4 transition-all duration-300 break-words text-center leading-snug ${notification.type === 'success' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'}`}>
+           {notification.type === 'success' ? <CheckCircle size={28} className="flex-shrink-0" /> : <AlertTriangle size={28} className="flex-shrink-0" />}
+           <span className="flex-1">{notification.message}</span>
         </div>
       )}
 

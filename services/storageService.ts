@@ -132,15 +132,6 @@ export const StorageService = {
     }
   },
 
-  /**
-   * 停止所有 Realtime Sync 監聽
-   * 用於登出或清理資源時
-   */
-  stopRealtimeSync: () => {
-    _listeners.forEach(unsubscribe => unsubscribe());
-    _listeners = [];
-  },
-
   // Helper: Save memory cache to localStorage
   _saveToLocal: () => {
     try {
@@ -226,25 +217,37 @@ export const StorageService = {
   updateLeaveStatus: async (id: number, status: LeaveRequest['status'], rejectReason?: string) => {
     const q = query(collection(db, 'leaves'), where('id', '==', id));
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null });
-    });
+    const promises = snapshot.docs.map(d => 
+        updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null })
+    );
+    await Promise.all(promises);
   },
 
-  cancelLeave: async (id: number) => {
-    const q = query(collection(db, 'leaves'), where('id', '==', id));
+  // Cancel/Delete operations now support userId for restrictive filtering
+  cancelLeave: async (id: number, userId?: string) => {
+    let constraints = [where('id', '==', id)];
+    if (userId) constraints.push(where('userId', '==', userId));
+
+    const q = query(collection(db, 'leaves'), ...constraints);
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await updateDoc(doc(db, 'leaves', d.id), { status: 'cancelled' });
-    });
+    const promises = snapshot.docs.map(d => 
+        updateDoc(doc(db, 'leaves', d.id), { status: 'cancelled' })
+    );
+    await Promise.all(promises);
   },
 
-  deleteLeave: async (id: number) => {
-    const q = query(collection(db, 'leaves'), where('id', '==', id));
+  deleteLeave: async (id: number, userId?: string) => {
+    let constraints = [where('id', '==', id)];
+    // Ensure we filter by userId so it matches the Query Rule implicitly
+    if (userId) constraints.push(where('userId', '==', userId));
+
+    const q = query(collection(db, 'leaves'), ...constraints);
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await deleteDoc(doc(db, 'leaves', d.id));
-    });
+    
+    // Direct Delete: No auto-claim (update) step to avoid permission conflict.
+    // Rely on the Rules allowing delete based on userId (email match) alone.
+    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'leaves', d.id)));
+    await Promise.all(promises);
   },
 
   addOvertime: async (ot: OvertimeRequest) => {
@@ -254,33 +257,42 @@ export const StorageService = {
   updateOvertime: async (id: number, updates: Partial<OvertimeRequest>) => {
     const q = query(collection(db, 'overtimes'), where('id', '==', id));
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await updateDoc(doc(db, 'overtimes', d.id), updates);
-    });
+    const promises = snapshot.docs.map(d => updateDoc(doc(db, 'overtimes', d.id), updates));
+    await Promise.all(promises);
   },
 
   updateOvertimeStatus: async (id: number, status: OvertimeRequest['status'], rejectReason?: string) => {
     const q = query(collection(db, 'overtimes'), where('id', '==', id));
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await updateDoc(doc(db, 'overtimes', d.id), { status, rejectReason: rejectReason || null });
-    });
+    const promises = snapshot.docs.map(d => 
+        updateDoc(doc(db, 'overtimes', d.id), { status, rejectReason: rejectReason || null })
+    );
+    await Promise.all(promises);
   },
 
-  cancelOvertime: async (id: number) => {
-    const q = query(collection(db, 'overtimes'), where('id', '==', id));
+  cancelOvertime: async (id: number, userId?: string) => {
+    let constraints = [where('id', '==', id)];
+    if (userId) constraints.push(where('userId', '==', userId));
+
+    const q = query(collection(db, 'overtimes'), ...constraints);
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await updateDoc(doc(db, 'overtimes', d.id), { status: 'cancelled' });
-    });
+    const promises = snapshot.docs.map(d => 
+        updateDoc(doc(db, 'overtimes', d.id), { status: 'cancelled' })
+    );
+    await Promise.all(promises);
   },
 
-  deleteOvertime: async (id: number) => {
-    const q = query(collection(db, 'overtimes'), where('id', '==', id));
+  deleteOvertime: async (id: number, userId?: string) => {
+    let constraints = [where('id', '==', id)];
+    // Ensure we filter by userId so it matches the Query Rule implicitly
+    if (userId) constraints.push(where('userId', '==', userId));
+
+    const q = query(collection(db, 'overtimes'), ...constraints);
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await deleteDoc(doc(db, 'overtimes', d.id));
-    });
+    
+    // Direct Delete: No auto-claim (update) step.
+    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'overtimes', d.id)));
+    await Promise.all(promises);
   },
 
   addAnnouncement: async (ann: Announcement) => {
@@ -288,9 +300,8 @@ export const StorageService = {
        const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
        const snapshot = await getDocs(q);
        if (!snapshot.empty) {
-           snapshot.forEach(async (d) => {
-               await updateDoc(doc(db, 'announcements', d.id), ann as any);
-           });
+           const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
+           await Promise.all(promises);
            return;
        }
     }
@@ -300,9 +311,8 @@ export const StorageService = {
   removeAnnouncement: async (id: number) => {
     const q = query(collection(db, 'announcements'), where('id', '==', id));
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await deleteDoc(doc(db, 'announcements', d.id));
-    });
+    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
+    await Promise.all(promises);
   },
 
   addHoliday: async (h: Holiday) => {
@@ -312,9 +322,8 @@ export const StorageService = {
   removeHoliday: async (id: number) => {
     const q = query(collection(db, 'holidays'), where('id', '==', id));
     const snapshot = await getDocs(q);
-    snapshot.forEach(async (d) => {
-        await deleteDoc(doc(db, 'holidays', d.id));
-    });
+    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
+    await Promise.all(promises);
   },
 
   updateSettings: async (settings: AppSettings) => {
