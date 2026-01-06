@@ -9,7 +9,7 @@ import { sendPasswordResetEmail } from 'firebase/auth';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -19,6 +19,9 @@ export const AdminDashboard: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
   
+  // Overview Date Filter
+  const [overviewDate, setOverviewDate] = useState(TimeService.getTaiwanDate(new Date()));
+
   // Modals & Forms
   const [isEditUserModalOpen, setIsEditUserModalOpen] = useState(false);
   const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
@@ -60,9 +63,12 @@ export const AdminDashboard: React.FC = () => {
   const [exportStart, setExportStart] = useState('');
   const [exportEnd, setExportEnd] = useState('');
 
-  // History Filter Dates
+  // History Filter Dates & Status
   const [leaveHistoryFilterDate, setLeaveHistoryFilterDate] = useState('');
+  const [leaveHistoryFilterStatus, setLeaveHistoryFilterStatus] = useState('all'); // 新增狀態篩選
+  
   const [otHistoryFilterDate, setOtHistoryFilterDate] = useState('');
+  const [otHistoryFilterStatus, setOtHistoryFilterStatus] = useState('all'); // 新增狀態篩選
 
   // Announcements
   const [editAnnId, setEditAnnId] = useState<number | null>(null);
@@ -416,31 +422,49 @@ export const AdminDashboard: React.FC = () => {
     showToast("匯出成功", 'success');
   };
 
-  const getEmployeeStatus = (uid: string) => {
-    const today = TimeService.getTaiwanDate(new Date());
-
-    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getTaiwanDate(r.date) === today);
-    const userLeaves = data.leaves.filter(l => l.userId === uid && l.status === 'approved' && l.start.startsWith(today));
+  // Modified to support historical date lookup
+  const getEmployeeStatus = (uid: string, targetDateStr: string) => {
+    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getTaiwanDate(r.date) === targetDateStr);
     
-    const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === today) || new Date().getDay() === 0 || new Date().getDay() === 6;
+    // Check for approved leaves covering this date
+    const userLeaves = data.leaves.filter(l => 
+        l.userId === uid && 
+        l.status === 'approved' &&
+        l.start.substring(0, 10) <= targetDateStr && 
+        l.end.substring(0, 10) >= targetDateStr
+    );
+
+    const targetDate = new Date(targetDateStr);
+    const dayOfWeek = targetDate.getDay();
+    const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === targetDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
 
     const firstIn = userRecords.filter(r => r.type === 'in').sort((a,b) => a.time.localeCompare(b.time))[0];
     const lastOut = userRecords.filter(r => r.type === 'out').sort((a,b) => b.time.localeCompare(a.time))[0];
 
     const statusTags: { label: string, color: string }[] = [];
 
+    // 1. Holiday / Weekend Logic
     if (isHoliday) {
         if (firstIn) {
             statusTags.push({ label: '休假日加班', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-        } else {
+        } else if (userLeaves.length === 0) { // Only show "Holiday" if not on a specific leave
             statusTags.push({ label: '休假', color: 'text-green-600 bg-green-50 border-green-200' });
         }
     }
 
+    // 2. Approved Leave Logic
+    userLeaves.forEach(leave => {
+        statusTags.push({ 
+            label: `${leave.type}中`, 
+            color: 'text-indigo-600 bg-indigo-50 border-indigo-200' 
+        });
+    });
+
+    // 3. Attendance Logic
     if (firstIn) {
         const inTimeStr = TimeService.formatTimeOnly(firstIn.time);
         
-        if (!isHoliday) {
+        if (!isHoliday && userLeaves.length === 0) {
             statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
             if (inTimeStr > '08:30') {
                 statusTags.push({ label: '遲到', color: 'text-red-600 bg-red-50 border-red-200' });
@@ -448,31 +472,33 @@ export const AdminDashboard: React.FC = () => {
         }
 
         if (lastOut) {
-            statusTags.push({ label: '已下班', color: 'text-gray-600 bg-gray-100 border-gray-300' });
-            const outTimeStr = TimeService.formatTimeOnly(lastOut.time);
-            
-            if (!isHoliday) {
-                if (outTimeStr < '17:30') {
+            if (!isHoliday && userLeaves.length === 0) {
+                 statusTags.push({ label: '已下班', color: 'text-gray-600 bg-gray-100 border-gray-300' });
+                 const outTimeStr = TimeService.formatTimeOnly(lastOut.time);
+                 if (outTimeStr < '17:30') {
                     statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
-                }
+                 }
             }
         } else {
+            // No out record yet
+            // If it's today and past 18:00
             const nowH = new Date().getHours();
-            if (nowH >= 18 && !isHoliday) {
+            const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
+            
+            if (isToday && nowH >= 18 && !isHoliday && userLeaves.length === 0) {
                 statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
             }
         }
     } else {
-        if (!isHoliday) {
+        // No IN record
+        if (!isHoliday && userLeaves.length === 0) {
              const nowStr = TimeService.getTaiwanTime(new Date());
              const nowSimple = nowStr.substring(0, 5);
-             
-             if (nowSimple > '08:30') {
-                 if (userLeaves.length > 0) {
-                     statusTags.push({ label: '請假中', color: 'text-indigo-600 bg-indigo-50 border-indigo-200' });
-                 } else {
-                     statusTags.push({ label: '未到班/曠職', color: 'text-red-600 bg-red-50 border-red-200' });
-                 }
+             const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
+             const isPast = targetDateStr < TimeService.getTaiwanDate(new Date());
+
+             if (isPast || (isToday && nowSimple > '08:30')) {
+                 statusTags.push({ label: '未到班/曠職', color: 'text-red-600 bg-red-50 border-red-200' });
              } else {
                  statusTags.push({ label: '未打卡', color: 'text-gray-400 bg-gray-50 border-gray-200' });
              }
@@ -480,8 +506,8 @@ export const AdminDashboard: React.FC = () => {
     }
 
     // Prepare Display Data
-    const inDisplay = firstIn ? `${TimeService.getTaiwanDate(firstIn.date)} ${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
-    const outDisplay = lastOut ? `${TimeService.getTaiwanDate(lastOut.date)} ${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
+    const inDisplay = firstIn ? `${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
+    const outDisplay = lastOut ? `${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
     
     // Coordinates & Distance
     const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist } : null;
@@ -628,7 +654,20 @@ export const AdminDashboard: React.FC = () => {
           {activeView === 'overview' && (
             <div className="space-y-6 md:space-y-8">
                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                 <h2 className="text-2xl md:text-3xl font-black text-gray-800">{showArchived ? '已封存員工' : '在職人員總覽'}</h2>
+                 <div className="flex items-center gap-4 flex-wrap">
+                    <h2 className="text-2xl md:text-3xl font-black text-gray-800">{showArchived ? '已封存員工' : '在職人員總覽'}</h2>
+                    {/* Date Picker for Overview */}
+                    <div className="flex items-center gap-2 bg-white px-3 py-2 rounded-xl border border-gray-200 shadow-sm">
+                       <CalendarIcon size={18} className="text-brand-600" />
+                       <input 
+                         type="date" 
+                         value={overviewDate} 
+                         onChange={e => setOverviewDate(e.target.value)} 
+                         className="font-black outline-none bg-transparent text-gray-700 text-sm md:text-base cursor-pointer" 
+                         style={{colorScheme:'light'}}
+                       />
+                    </div>
+                 </div>
                  <div className="flex flex-wrap gap-2 md:gap-4 w-full md:w-auto">
                      <button onClick={() => setIsExportAttendanceModalOpen(true)} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 md:px-6 py-2.5 rounded-2xl font-black bg-indigo-600 text-white shadow-lg hover:bg-indigo-700 transition-all text-sm md:text-base">
                        <FileText size={18}/> <span className="hidden md:inline">匯出打卡紀錄</span><span className="md:hidden">匯出</span>
@@ -651,7 +690,9 @@ export const AdminDashboard: React.FC = () => {
                       </thead>
                       <tbody className="divide-y text-black font-bold text-sm">
                          {data.users.filter(u => u.role !== 'admin' && (showArchived ? u.deleted : !u.deleted)).map(u => {
-                            const status = getEmployeeStatus(u.id);
+                            // Pass the selected overviewDate
+                            const status = getEmployeeStatus(u.id, overviewDate);
+                            
                             // Helper to render Location info
                             const renderLocInfo = (info: {lat: number, lng: number, dist: number} | null) => {
                                 if(!info) return null;
@@ -772,15 +813,32 @@ export const AdminDashboard: React.FC = () => {
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-2">
                      <h3 className="text-xl md:text-2xl font-black text-gray-400">歷史審核紀錄</h3>
                      <div className="flex items-center gap-2 w-full md:w-auto">
-                        <span className="text-xs font-black text-gray-400 whitespace-nowrap">顯示日期</span>
+                        <span className="text-xs font-black text-gray-400 whitespace-nowrap hidden md:inline"><Filter size={12} className="inline mr-1"/>狀態</span>
+                        {/* Status Filter */}
+                        <select 
+                           value={leaveHistoryFilterStatus} 
+                           onChange={(e) => setLeaveHistoryFilterStatus(e.target.value)}
+                           className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none"
+                        >
+                           <option value="all">全部狀態</option>
+                           <option value="approved">已核准</option>
+                           <option value="rejected">已拒絕</option>
+                           <option value="cancelled">已取消</option>
+                        </select>
+
+                        <span className="text-xs font-black text-gray-400 whitespace-nowrap hidden md:inline ml-2"><CalendarIcon size={12} className="inline mr-1"/>日期</span>
                         <input type="date" value={leaveHistoryFilterDate} onChange={e=>setLeaveHistoryFilterDate(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" style={{colorScheme:'light'}} />
-                        <button onClick={()=>setLeaveHistoryFilterDate('')} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
+                        <button onClick={()=>{setLeaveHistoryFilterDate(''); setLeaveHistoryFilterStatus('all');}} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
                      </div>
                   </div>
                   <div className="space-y-4">
                      {data.leaves
                        .filter(l => l.status !== 'pending')
                        .filter(l => {
+                          // Filter Status
+                          if (leaveHistoryFilterStatus !== 'all' && l.status !== leaveHistoryFilterStatus) return false;
+                          
+                          // Filter Date
                           if (!leaveHistoryFilterDate) return true;
                           const filterDate = leaveHistoryFilterDate;
                           const startDate = l.start.substring(0, 10);
@@ -814,7 +872,7 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.leaves.filter(l => l.status !== 'pending' && (!leaveHistoryFilterDate || (leaveHistoryFilterDate >= l.start.substring(0, 10) && leaveHistoryFilterDate <= l.end.substring(0, 10)))).length === 0 && (
+                     {data.leaves.filter(l => l.status !== 'pending' && (leaveHistoryFilterStatus === 'all' || l.status === leaveHistoryFilterStatus) && (!leaveHistoryFilterDate || (leaveHistoryFilterDate >= l.start.substring(0, 10) && leaveHistoryFilterDate <= l.end.substring(0, 10)))).length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>
@@ -878,15 +936,31 @@ export const AdminDashboard: React.FC = () => {
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-6 gap-2">
                      <h3 className="text-xl md:text-2xl font-black text-gray-400">歷史審核紀錄</h3>
                      <div className="flex items-center gap-2 w-full md:w-auto">
-                        <span className="text-xs font-black text-gray-400 whitespace-nowrap">顯示日期</span>
+                        <span className="text-xs font-black text-gray-400 whitespace-nowrap hidden md:inline"><Filter size={12} className="inline mr-1"/>狀態</span>
+                        {/* Status Filter */}
+                        <select 
+                           value={otHistoryFilterStatus} 
+                           onChange={(e) => setOtHistoryFilterStatus(e.target.value)}
+                           className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none"
+                        >
+                           <option value="all">全部狀態</option>
+                           <option value="approved">已核准</option>
+                           <option value="rejected">已拒絕</option>
+                           <option value="cancelled">已取消</option>
+                        </select>
+                        <span className="text-xs font-black text-gray-400 whitespace-nowrap hidden md:inline ml-2"><CalendarIcon size={12} className="inline mr-1"/>日期</span>
                         <input type="date" value={otHistoryFilterDate} onChange={e=>setOtHistoryFilterDate(e.target.value)} className="bg-white text-black p-2 rounded-lg text-xs font-black outline-none border border-gray-200 flex-1 md:flex-none" style={{colorScheme:'light'}} />
-                        <button onClick={()=>setOtHistoryFilterDate('')} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
+                        <button onClick={()=>{setOtHistoryFilterDate(''); setOtHistoryFilterStatus('all');}} className="p-2 bg-gray-100 rounded-lg hover:bg-gray-200"><RotateCcw size={14} className="text-gray-500"/></button>
                      </div>
                   </div>
                   <div className="space-y-4">
                      {data.overtimes
                        .filter(o => o.status !== 'pending')
                        .filter(o => {
+                          // Filter Status
+                          if (otHistoryFilterStatus !== 'all' && o.status !== otHistoryFilterStatus) return false;
+
+                          // Filter Date
                           if (!otHistoryFilterDate) return true;
                           const filterDate = otHistoryFilterDate;
                           const startDate = o.start.substring(0, 10);
@@ -920,7 +994,7 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.overtimes.filter(o => o.status !== 'pending' && (!otHistoryFilterDate || (otHistoryFilterDate >= o.start.substring(0, 10) && otHistoryFilterDate <= o.end.substring(0, 10)))).length === 0 && (
+                     {data.overtimes.filter(o => o.status !== 'pending' && (otHistoryFilterStatus === 'all' || o.status === otHistoryFilterStatus) && (!otHistoryFilterDate || (otHistoryFilterDate >= o.start.substring(0, 10) && otHistoryFilterDate <= o.end.substring(0, 10)))).length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>

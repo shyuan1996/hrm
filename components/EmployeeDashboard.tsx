@@ -448,16 +448,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     
     try {
         if (cancelLeaveChallenge.type === 'leave') {
-            // Updated: Pass user.id to deleteLeave to satisfy Firestore Rules query constraints
-            await StorageService.deleteLeave(cancelLeaveChallenge.id, user.id);
+            // 使用 cancelLeave (更新狀態) 而不是 deleteLeave (物理刪除)
+            // 這樣管理員端可以看到「已取消」的狀態
+            await StorageService.cancelLeave(cancelLeaveChallenge.id, user.id);
         } else {
-            // Updated: Pass user.id to deleteOvertime to satisfy Firestore Rules query constraints
-            await StorageService.deleteOvertime(cancelLeaveChallenge.id, user.id);
+            // 同上
+            await StorageService.cancelOvertime(cancelLeaveChallenge.id, user.id);
         }
-        setNotification({ type: 'success', message: "申請已成功刪除" });
+        setNotification({ type: 'success', message: "申請已成功取消" });
     } catch (e: any) {
         console.error("Cancel failed", e);
-        setNotification({ type: 'error', message: "刪除失敗: " + (e.message || "權限不足或網路錯誤") });
+        setNotification({ type: 'error', message: "取消失敗: " + (e.message || "權限不足或網路錯誤") });
     } finally {
         setCancelLeaveChallenge(null);
     }

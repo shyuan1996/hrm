@@ -3,104 +3,128 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // --- 輔助函式 (Helper Functions) ---
+    // --- Helper Functions ---
 
-    // 1. 檢查是否為管理員
-    // 讀取 users/admin 文件，比對 uid 是否與當前登入者相同
     function isAdmin() {
       return request.auth != null && 
              exists(/databases/$(database)/documents/users/admin) &&
              get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid;
     }
 
-    // 2. 檢查 Email 是否匹配 (忽略大小寫)
-    // 這是為了相容舊系統：如果文件存的是 'John'，但登入的是 'john@domain.com'
+    // Helper: Normalize email to lowercase for comparison
     function isEmailMatch(id) {
        return request.auth.token.email.lower() == (id + '@shyuan-hrm.com').lower();
     }
 
-    // 3. 檢查資源擁有者 (是本人嗎?)
-    // 如果文件的 uid 等於登入者的 uid，或者文件的 userId 對應登入者的 email，則視為本人
+    // Helper: Check if the user owns the document (Read/Update/Delete context)
     function isResourceOwner() {
-      let docUid = resource.data.get('uid', '');
+      let docUid = resource.data.get('uid', null);
       let docUserId = resource.data.get('userId', '');
       
       return request.auth != null && (
-        (docUid == request.auth.uid) || 
+        (docUid != null && docUid == request.auth.uid) || 
         (docUserId != '' && isEmailMatch(docUserId))
       );
     }
 
-    // --- 集合規則 (Collection Rules) ---
+    // Helper: Check if the user is creating data for themselves (Create context)
+    function isCreatingOwnResource() {
+       return request.auth != null && (
+         request.resource.data.get('uid', '') == request.auth.uid ||
+         isEmailMatch(request.resource.data.get('userId', ''))
+       );
+    }
 
-    // Users: 員工資料
+    // --- Collection Rules ---
+
+    // Users Collection
     match /users/{userId} {
       allow read: if request.auth != null;
-      // 允許管理員寫入，或是本人(uid匹配)寫入 (例如首次登入綁定 uid)
-      allow write: if isAdmin() || (request.auth != null && (
-        isEmailMatch(userId) || 
-        request.resource.data.get('uid', '') == request.auth.uid ||
-        resource.data.get('uid', '') == request.auth.uid
-      ));
+      
+      // Write Rules (Update/Create)
+      allow write: if 
+        // 1. 管理員擁有完全權限
+        isAdmin() || 
+        (
+          request.auth != null &&
+          
+          // 2. 安全核心：絕對禁止非管理員寫入/覆蓋 'admin' 文件
+          userId != 'admin' &&
+          
+          // 3. 權限檢查：必須是該文件的擁有者
+          (isEmailMatch(userId) || resource == null || resource.data.get('uid', '') == request.auth.uid) &&
+          
+          // 4. 防止權限提升 (Privilege Escalation)
+          // 嘗試寫入的 role 必須是 'employee'，或者保持原值不變 (不能把自己改成 admin)
+          (request.resource.data.get('role', 'employee') == 'employee' || request.resource.data.get('role', '') == resource.data.get('role', '')) &&
+          
+          // 5. 防止額度竄改 (Quota Tampering)
+          // 更新時：禁止修改額度欄位 (quota_*)
+          // 創建時：允許 (Login.tsx 會初始化，但為了 UX 暫不強制為 0，改由後續管理員審核)
+          (
+            resource == null || 
+            (
+              request.resource.data.get('quota_annual', 0) == resource.data.get('quota_annual', 0) &&
+              request.resource.data.get('quota_birthday', 0) == resource.data.get('quota_birthday', 0) &&
+              request.resource.data.get('quota_comp', 0) == resource.data.get('quota_comp', 0)
+            )
+          )
+        );
     }
 
-    // Records: 打卡紀錄
+    // Records (Attendance)
     match /records/{recordId} {
       allow read: if isAdmin() || isResourceOwner();
-      allow create: if request.auth != null; 
-      allow update, delete: if isAdmin(); // 打卡紀錄涉及薪資計算，通常不開放員工自行刪除
+      // 安全性增強：建立時必須證明是本人 (uid match)
+      allow create: if isCreatingOwnResource();
+      allow update, delete: if isAdmin();
     }
 
-    // Leaves: 請假申請
+    // Leaves (Requests)
     match /leaves/{leaveId} {
       allow read: if isAdmin() || isResourceOwner();
-      allow create: if request.auth != null;
+      // 安全性增強：建立時必須證明是本人
+      allow create: if isCreatingOwnResource();
       
-      // 允許更新：管理員可審核，員工可更新內容(如本人)
-      allow update: if isAdmin() || isResourceOwner(); 
-      
-      // 【修正後的刪除規則】
-      // 1. 管理員可以刪除
-      // 2. 本人(isResourceOwner) 可以刪除，前提是單據狀態為 'pending' 或 'cancelled'
-      // 注意：刪除時要檢查的是 `resource.data` (資料庫裡的現有資料)，而不是 request.resource
-      allow delete: if isAdmin() || (
+      // 更新規則：本人只能將狀態改為 cancelled
+      allow update: if isAdmin() || (
         isResourceOwner() && 
-        (
-          resource.data.status == 'pending' || 
-          resource.data.status == 'cancelled'
-        )
+        request.resource.data.status == 'cancelled' &&
+        // 防止在取消時順便修改時數或事由
+        request.resource.data.hours == resource.data.hours &&
+        request.resource.data.type == resource.data.type
       );
+      
+      allow delete: if isAdmin();
     }
 
-    // Overtimes: 加班申請
+    // Overtimes (Requests)
     match /overtimes/{otId} {
       allow read: if isAdmin() || isResourceOwner();
-      allow create: if request.auth != null;
-      allow update: if isAdmin() || isResourceOwner();
+      // 安全性增強：建立時必須證明是本人
+      allow create: if isCreatingOwnResource();
       
-      // 【修正後的刪除規則】(同上)
-      allow delete: if isAdmin() || (
+      // 更新規則：本人只能將狀態改為 cancelled
+      allow update: if isAdmin() || (
         isResourceOwner() && 
-        (
-          resource.data.status == 'pending' || 
-          resource.data.status == 'cancelled'
-        )
+        request.resource.data.status == 'cancelled' &&
+        request.resource.data.hours == resource.data.hours
       );
+      
+      allow delete: if isAdmin();
     }
 
-    // Announcements: 公告
+    // Public/System Data
     match /announcements/{annId} {
       allow read: if true;
       allow write: if isAdmin();
     }
 
-    // Holidays: 假期
     match /holidays/{id} {
       allow read: if true;
       allow write: if isAdmin();
     }
 
-    // System Settings: 系統設定
     match /system/{document=**} {
       allow read: if true;
       allow write: if isAdmin();
