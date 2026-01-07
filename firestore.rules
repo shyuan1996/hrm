@@ -37,6 +37,14 @@ service cloud.firestore {
 
     // --- Collection Rules ---
 
+    // Security Logs (New)
+    match /security_logs/{logId} {
+      // 允許所有已認證使用者寫入日誌 (為了記錄異常嘗試)
+      allow create: if request.auth != null;
+      // 僅管理員可讀取與管理日誌
+      allow read, update, delete: if isAdmin();
+    }
+
     // Users Collection
     match /users/{userId} {
       allow read: if request.auth != null;
@@ -58,15 +66,19 @@ service cloud.firestore {
           // 嘗試寫入的 role 必須是 'employee'，或者保持原值不變 (不能把自己改成 admin)
           (request.resource.data.get('role', 'employee') == 'employee' || request.resource.data.get('role', '') == resource.data.get('role', '')) &&
           
-          // 5. 防止額度竄改 (Quota Tampering)
-          // 更新時：禁止修改額度欄位 (quota_*)
-          // 創建時：允許 (Login.tsx 會初始化，但為了 UX 暫不強制為 0，改由後續管理員審核)
+          // 5. 資料完整性保護 (Data Integrity)
+          // 更新時：禁止修改額度、到職日、部門
+          // 創建時：允許 (Login.tsx 自動建立檔案時會寫入初始值)
           (
             resource == null || 
             (
+              // 禁止修改假別額度
               request.resource.data.get('quota_annual', 0) == resource.data.get('quota_annual', 0) &&
               request.resource.data.get('quota_birthday', 0) == resource.data.get('quota_birthday', 0) &&
-              request.resource.data.get('quota_comp', 0) == resource.data.get('quota_comp', 0)
+              request.resource.data.get('quota_comp', 0) == resource.data.get('quota_comp', 0) &&
+              // 禁止修改人事核心資料 (防止員工竄改年資或部門)
+              request.resource.data.get('onboard_date', '') == resource.data.get('onboard_date', '') &&
+              request.resource.data.get('dept', '') == resource.data.get('dept', '')
             )
           )
         );
@@ -75,18 +87,22 @@ service cloud.firestore {
     // Records (Attendance)
     match /records/{recordId} {
       allow read: if isAdmin() || isResourceOwner();
-      // 安全性增強：建立時必須證明是本人 (uid match)
+      // 建立打卡紀錄：必須是本人
       allow create: if isCreatingOwnResource();
+      // 修改/刪除：僅限管理員
       allow update, delete: if isAdmin();
     }
 
     // Leaves (Requests)
     match /leaves/{leaveId} {
       allow read: if isAdmin() || isResourceOwner();
-      // 安全性增強：建立時必須證明是本人
-      allow create: if isCreatingOwnResource();
       
-      // 更新規則：本人只能將狀態改為 cancelled
+      // 建立假單：
+      // 1. 必須是本人
+      // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
+      allow create: if isCreatingOwnResource() && request.resource.data.status == 'pending';
+      
+      // 更新規則：本人只能將狀態改為 cancelled (取消申請)
       allow update: if isAdmin() || (
         isResourceOwner() && 
         request.resource.data.status == 'cancelled' &&
@@ -95,14 +111,18 @@ service cloud.firestore {
         request.resource.data.type == resource.data.type
       );
       
+      // 刪除規則：僅限管理員
       allow delete: if isAdmin();
     }
 
     // Overtimes (Requests)
     match /overtimes/{otId} {
       allow read: if isAdmin() || isResourceOwner();
-      // 安全性增強：建立時必須證明是本人
-      allow create: if isCreatingOwnResource();
+      
+      // 建立加班單：
+      // 1. 必須是本人
+      // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
+      allow create: if isCreatingOwnResource() && request.resource.data.status == 'pending';
       
       // 更新規則：本人只能將狀態改為 cancelled
       allow update: if isAdmin() || (
@@ -111,6 +131,7 @@ service cloud.firestore {
         request.resource.data.hours == resource.data.hours
       );
       
+      // 刪除規則：僅限管理員
       allow delete: if isAdmin();
     }
 

@@ -163,34 +163,86 @@ export const StorageService = {
     return _memoryCache;
   },
 
+  // --- Security Logger ---
+  logSecurityEvent: async (action: string, details: string) => {
+    const user = auth.currentUser;
+    if (user) {
+        try {
+            await addDoc(collection(db, 'security_logs'), {
+                uid: user.uid,
+                email: user.email,
+                action,
+                details,
+                timestamp: Timestamp.now(),
+                userAgent: navigator.userAgent
+            });
+        } catch (e) {
+            console.error("Failed to write security log", e);
+        }
+    }
+  },
+
   // --- Write Operations (Direct to Firestore) ---
 
   addUser: async (user: User) => {
     // 1. 呼叫 Firebase Auth 建立真實的登入帳號
+    // 注意：createAuthUser 已經在內部處理了小寫化
     const authUser = await createAuthUser(user.id, user.pass);
 
     // 2. 建立成功後，將使用者資料寫入 Firestore
-    await setDoc(doc(db, 'users', user.id), {
+    // 這裡同樣確保寫入 Firestore 的 ID 是小寫
+    const userIdLower = user.id.toLowerCase();
+    await setDoc(doc(db, 'users', userIdLower), {
         ...user,
+        id: userIdLower,
         uid: authUser.uid, // Save UID here
         pass: 'PROTECTED' 
     });
   },
 
   updateUser: async (userId: string, updates: Partial<User>) => {
-    await updateDoc(doc(db, 'users', userId), updates);
+    try {
+        await updateDoc(doc(db, 'users', userId), updates);
+    } catch (e: any) {
+        // 如果非管理員嘗試更新他人資料或鎖定欄位
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_UPDATE_USER', `Attempted to update user ${userId} with keys: ${Object.keys(updates).join(', ')}`);
+        }
+        throw e;
+    }
   },
 
   archiveUser: async (userId: string) => {
-    await updateDoc(doc(db, 'users', userId), { deleted: true });
+    try {
+        await updateDoc(doc(db, 'users', userId), { deleted: true });
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_ARCHIVE_USER', `Attempted to archive user ${userId}`);
+        }
+        throw e;
+    }
   },
 
   restoreUser: async (userId: string) => {
-    await updateDoc(doc(db, 'users', userId), { deleted: false });
+    try {
+        await updateDoc(doc(db, 'users', userId), { deleted: false });
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_RESTORE_USER', `Attempted to restore user ${userId}`);
+        }
+        throw e;
+    }
   },
 
   permanentDeleteUser: async (userId: string) => {
-    await deleteDoc(doc(db, 'users', userId));
+    try {
+        await deleteDoc(doc(db, 'users', userId));
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_USER', `Attempted to permanently delete user ${userId}`);
+        }
+        throw e;
+    }
   },
 
   addRecord: async (record: AttendanceRecord) => {
@@ -215,12 +267,19 @@ export const StorageService = {
   },
 
   updateLeaveStatus: async (id: number, status: LeaveRequest['status'], rejectReason?: string) => {
-    const q = query(collection(db, 'leaves'), where('id', '==', id));
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => 
-        updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null })
-    );
-    await Promise.all(promises);
+    try {
+        const q = query(collection(db, 'leaves'), where('id', '==', id));
+        const snapshot = await getDocs(q);
+        const promises = snapshot.docs.map(d => 
+            updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null })
+        );
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_LEAVE_STATUS', `Attempted to set leave ${id} to ${status}`);
+        }
+        throw e;
+    }
   },
 
   // Cancel/Delete operations now support userId for restrictive filtering
@@ -237,17 +296,21 @@ export const StorageService = {
   },
 
   deleteLeave: async (id: number, userId?: string) => {
-    let constraints = [where('id', '==', id)];
-    // Ensure we filter by userId so it matches the Query Rule implicitly
-    if (userId) constraints.push(where('userId', '==', userId));
+    try {
+        let constraints = [where('id', '==', id)];
+        if (userId) constraints.push(where('userId', '==', userId));
 
-    const q = query(collection(db, 'leaves'), ...constraints);
-    const snapshot = await getDocs(q);
-    
-    // Direct Delete: No auto-claim (update) step to avoid permission conflict.
-    // Rely on the Rules allowing delete based on userId (email match) alone.
-    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'leaves', d.id)));
-    await Promise.all(promises);
+        const q = query(collection(db, 'leaves'), ...constraints);
+        const snapshot = await getDocs(q);
+        
+        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'leaves', d.id)));
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_LEAVE', `Attempted to delete leave ${id}`);
+        }
+        throw e;
+    }
   },
 
   addOvertime: async (ot: OvertimeRequest) => {
@@ -262,12 +325,19 @@ export const StorageService = {
   },
 
   updateOvertimeStatus: async (id: number, status: OvertimeRequest['status'], rejectReason?: string) => {
-    const q = query(collection(db, 'overtimes'), where('id', '==', id));
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => 
-        updateDoc(doc(db, 'overtimes', d.id), { status, rejectReason: rejectReason || null })
-    );
-    await Promise.all(promises);
+    try {
+        const q = query(collection(db, 'overtimes'), where('id', '==', id));
+        const snapshot = await getDocs(q);
+        const promises = snapshot.docs.map(d => 
+            updateDoc(doc(db, 'overtimes', d.id), { status, rejectReason: rejectReason || null })
+        );
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_OT_STATUS', `Attempted to set overtime ${id} to ${status}`);
+        }
+        throw e;
+    }
   },
 
   cancelOvertime: async (id: number, userId?: string) => {
@@ -283,56 +353,96 @@ export const StorageService = {
   },
 
   deleteOvertime: async (id: number, userId?: string) => {
-    let constraints = [where('id', '==', id)];
-    // Ensure we filter by userId so it matches the Query Rule implicitly
-    if (userId) constraints.push(where('userId', '==', userId));
+    try {
+        let constraints = [where('id', '==', id)];
+        if (userId) constraints.push(where('userId', '==', userId));
 
-    const q = query(collection(db, 'overtimes'), ...constraints);
-    const snapshot = await getDocs(q);
-    
-    // Direct Delete: No auto-claim (update) step.
-    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'overtimes', d.id)));
-    await Promise.all(promises);
+        const q = query(collection(db, 'overtimes'), ...constraints);
+        const snapshot = await getDocs(q);
+        
+        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'overtimes', d.id)));
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_OT', `Attempted to delete overtime ${id}`);
+        }
+        throw e;
+    }
   },
 
   addAnnouncement: async (ann: Announcement) => {
-    if (ann.id) {
-       const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
-       const snapshot = await getDocs(q);
-       if (!snapshot.empty) {
-           const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
-           await Promise.all(promises);
-           return;
-       }
+    try {
+        if (ann.id) {
+           const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
+           const snapshot = await getDocs(q);
+           if (!snapshot.empty) {
+               const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
+               await Promise.all(promises);
+               return;
+           }
+        }
+        await addDoc(collection(db, 'announcements'), ann);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_WRITE', `Attempted to write announcement`);
+        }
+        throw e;
     }
-    await addDoc(collection(db, 'announcements'), ann);
   },
 
   removeAnnouncement: async (id: number) => {
-    const q = query(collection(db, 'announcements'), where('id', '==', id));
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
-    await Promise.all(promises);
+    try {
+        const q = query(collection(db, 'announcements'), where('id', '==', id));
+        const snapshot = await getDocs(q);
+        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_DELETE', `Attempted to delete announcement ${id}`);
+        }
+        throw e;
+    }
   },
 
   addHoliday: async (h: Holiday) => {
-    await addDoc(collection(db, 'holidays'), h);
+    try {
+        await addDoc(collection(db, 'holidays'), h);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_HOLIDAY_ADD', `Attempted to add holiday`);
+        }
+        throw e;
+    }
   },
 
   removeHoliday: async (id: number) => {
-    const q = query(collection(db, 'holidays'), where('id', '==', id));
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
-    await Promise.all(promises);
+    try {
+        const q = query(collection(db, 'holidays'), where('id', '==', id));
+        const snapshot = await getDocs(q);
+        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
+        await Promise.all(promises);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_HOLIDAY_DELETE', `Attempted to delete holiday ${id}`);
+        }
+        throw e;
+    }
   },
 
   updateSettings: async (settings: AppSettings) => {
-    const safeSettings = {
-        gasUrl: settings.gasUrl || "disabled",
-        companyLat: Number(settings.companyLat) || 0,
-        companyLng: Number(settings.companyLng) || 0,
-        allowedRadius: Number(settings.allowedRadius) || 100
-    };
-    await setDoc(doc(db, 'system', 'settings'), safeSettings);
+    try {
+        const safeSettings = {
+            gasUrl: settings.gasUrl || "disabled",
+            companyLat: Number(settings.companyLat) || 0,
+            companyLng: Number(settings.companyLng) || 0,
+            allowedRadius: Number(settings.allowedRadius) || 100
+        };
+        await setDoc(doc(db, 'system', 'settings'), safeSettings);
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_SETTINGS_UPDATE', `Attempted to update system settings`);
+        }
+        throw e;
+    }
   }
 };

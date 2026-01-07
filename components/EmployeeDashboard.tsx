@@ -5,7 +5,7 @@ import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2 } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -43,6 +43,8 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
 };
 
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset, isTimeSynced }) => {
+  // Use a dynamic offset that can be updated frequently by the dashboard itself
+  const [dynamicOffset, setDynamicOffset] = useState(timeOffset);
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
@@ -53,6 +55,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [holidays, setHolidays] = useState<Holiday[]>([]);
   
   const [isVerifying, setIsVerifying] = useState(false);
+  const [punchStep, setPunchStep] = useState<'idle' | 'syncing' | 'locating' | 'verifying'>('idle'); // Granular status
   
   // Mobile View State
   const [mobileView, setMobileView] = useState<'punch' | 'apply'>('punch');
@@ -132,6 +135,29 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return opts;
   }, []);
 
+  // Update dynamic offset if parent provides a new one (initial load)
+  useEffect(() => {
+    setDynamicOffset(timeOffset);
+  }, [timeOffset]);
+
+  // 1. [Requirement: 10s Interval Sync]
+  // Polling network time every 10 seconds to ensure the clock is always calibrated
+  useEffect(() => {
+    const syncTimer = setInterval(async () => {
+      // Background sync - silent unless major error (optional to log)
+      try {
+        const newOffset = await TimeService.getNetworkTimeOffset();
+        if (newOffset !== null) {
+          setDynamicOffset(newOffset);
+        }
+      } catch (e) {
+        // Silently fail in background, keep using last known offset
+      }
+    }, 10000);
+
+    return () => clearInterval(syncTimer);
+  }, []);
+
   // Optimized Geolocation with Fallback Strategy
   useEffect(() => {
     if (!navigator.geolocation) {
@@ -185,27 +211,24 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     };
   }, [settings]);
 
-  // Data Sync and Time
+  // Data Sync and Time Ticker
   useEffect(() => {
-    const timer = setInterval(() => setNow(TimeService.getCorrectedNow(timeOffset)), 1000);
+    // Updates UI clock every second using the LATEST dynamicOffset
+    const timer = setInterval(() => setNow(TimeService.getCorrectedNow(dynamicOffset)), 1000);
     
     const updateLocalData = () => {
         const newData = StorageService.loadData();
-        // CRITICAL FIX: Spread object to force React to detect change even if reference is same
         setLocalData({ ...newData }); 
     };
 
-    // Initial load
     updateLocalData();
-
-    // Listen for updates
     window.addEventListener('storage-update', updateLocalData);
 
     return () => {
         clearInterval(timer);
         window.removeEventListener('storage-update', updateLocalData);
     };
-  }, [timeOffset, user.id]);
+  }, [dynamicOffset, user.id]);
 
   // Derive state from localData whenever it changes
   useEffect(() => {
@@ -220,6 +243,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       timer = setTimeout(() => {
         setPunchMathChallenge(null);
         setIsVerifying(false);
+        setPunchStep('idle');
         setNotification({ type: 'error', message: '回答超時，打卡動作已取消' });
       }, 10000); // 10 seconds
     }
@@ -235,40 +259,85 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const isLocationReady = distance !== null;
   const inRange = isLocationReady && distance! <= settings.allowedRadius;
 
-  const initiatePunch = () => {
-    if (!isTimeSynced) {
-        setNotification({ type: 'error', message: "無法連接網路時間伺服器，禁止打卡，請檢查網路連線。" });
+  // 2. [Requirement: Force Sync on Punch]
+  const initiatePunch = async () => {
+    // Basic checks before even starting sync
+    if (!isTimeSynced && dynamicOffset === 0) {
+        setNotification({ type: 'error', message: "系統尚未初始化，請稍候..." });
         return;
     }
-    if (Math.abs(timeOffset) > 60000) {
-       setNotification({ type: 'error', message: "時間錯誤：系統偵測到您的裝置時間與標準時間誤差過大 (>1分鐘)，請校準裝置時間後再進行打卡。" });
-       return;
-    }
-    if (!isLocationReady) {
-      setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
-      return;
-    }
-    if (currentPunchType === 'in') {
-        if (settings.companyLat && !inRange) {
-           setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
+
+    // Set UI to "Syncing"
+    setIsVerifying(true);
+    setPunchStep('syncing');
+
+    try {
+        // Force a fresh network time check
+        const freshOffset = await TimeService.getNetworkTimeOffset();
+        
+        if (freshOffset === null) {
+            setNotification({ type: 'error', message: "無法連接網路時間伺服器，禁止打卡，請檢查網路連線。" });
+            setIsVerifying(false);
+            setPunchStep('idle');
+            return;
+        }
+
+        // Update local offset with the fresh one
+        setDynamicOffset(freshOffset);
+
+        // Sanity Check: if local clock is wildly different (> 1 min)
+        if (Math.abs(freshOffset) > 60000) {
+           setNotification({ type: 'error', message: "時間錯誤：系統偵測到您的裝置時間與標準時間誤差過大 (>1分鐘)，請校準裝置時間後再進行打卡。" });
+           setIsVerifying(false);
+           setPunchStep('idle');
            return;
         }
-    }
 
-    setIsVerifying(true);
-    setTimeout(() => {
-        const n1 = Math.floor(Math.random() * 9) + 1;
-        const n2 = Math.floor(Math.random() * 9) + 1;
-        const ans = n1 + n2;
-        const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
-        setPunchMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
-    }, 500); 
+        // Now proceed to Location check
+        setPunchStep('locating');
+        
+        // Short delay to let UI update to "Locating..."
+        await new Promise(r => setTimeout(r, 500));
+
+        if (!isLocationReady) {
+          setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
+          setIsVerifying(false);
+          setPunchStep('idle');
+          return;
+        }
+
+        if (currentPunchType === 'in') {
+            if (settings.companyLat && !inRange) {
+               setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
+               setIsVerifying(false);
+               setPunchStep('idle');
+               return;
+            }
+        }
+
+        // Proceed to Math Challenge
+        setPunchStep('verifying');
+        setTimeout(() => {
+            const n1 = Math.floor(Math.random() * 9) + 1;
+            const n2 = Math.floor(Math.random() * 9) + 1;
+            const ans = n1 + n2;
+            const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
+            setPunchMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
+        }, 300);
+
+    } catch (e) {
+        console.error("Punch Init Error", e);
+        setNotification({ type: 'error', message: "打卡初始化失敗" });
+        setIsVerifying(false);
+        setPunchStep('idle');
+    }
   };
 
   const executePunch = (choice: number) => {
     if (choice !== punchMathChallenge?.a) {
       setPunchMathChallenge(null);
       setIsVerifying(false);
+      setPunchStep('idle');
       setNotification({ type: 'error', message: "驗證錯誤，打卡動作取消" });
       return;
     }
@@ -280,6 +349,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         if (!isCheckDone) {
             isCheckDone = true;
             setIsVerifying(false);
+            setPunchStep('idle');
             setNotification({ type: 'error', message: "核對超時 (超過20秒)，驗證失敗請重新驗證" });
         }
     }, 20000);
@@ -318,6 +388,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         if (lat === 0 && lng === 0) {
              setNotification({ type: 'error', message: "無法獲取精確位置，請稍後再試" });
              setIsVerifying(false);
+             setPunchStep('idle');
              return;
         }
 
@@ -327,6 +398,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         if (currentPunchType === 'in' && freshDistance > settings.allowedRadius) {
              setNotification({ type: 'error', message: `即時定位距離過遠 (${freshDistance.toFixed(0)}m)，打卡失敗` });
              setIsVerifying(false);
+             setPunchStep('idle');
              return;
         }
 
@@ -363,6 +435,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     }
     
     setIsVerifying(false);
+    setPunchStep('idle');
   };
 
   const allLeaves = localData.leaves.filter(l => l.userId === user.id).sort((a,b) => b.id - a.id);
@@ -501,10 +574,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         {/* Punch Section (Left) */}
         <div className={`w-full md:w-1/2 flex-col h-full flex-shrink-0 ${mobileView === 'punch' ? 'flex' : 'hidden md:flex'}`}>
             <div className="flex-1 bg-white rounded-[32px] md:rounded-[40px] shadow-sm border p-6 md:p-12 flex flex-col items-center justify-start space-y-6 md:space-y-8 overflow-y-auto custom-scroll relative h-full">
-              <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100">
+              <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100 relative">
                  <div className="text-brand-600 font-black text-lg md:text-2xl mb-1 md:mb-2">{TimeService.toROCDateString(now)}</div>
                  <div className="text-5xl md:text-7xl font-mono font-black tracking-tighter text-gray-800">
                    {currentTimeStr}
+                 </div>
+                 {/* Auto Sync Indicator */}
+                 <div className="absolute top-0 right-0 flex items-center gap-1 text-[10px] text-gray-400 opacity-50">
+                    <RefreshCw size={10} className="animate-spin" /> 自動校時中
                  </div>
               </div>
 
@@ -512,20 +589,25 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 <Button 
                   variant="tech-circle" 
                   onClick={initiatePunch}
-                  disabled={!isTimeSynced || !isLocationReady || isVerifying}
-                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!isTimeSynced || !isLocationReady || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
+                  disabled={!isTimeSynced || isVerifying}
+                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!isTimeSynced || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
                 >
                   {!isTimeSynced ? (
                      <div className="flex flex-col items-center">
                        <Loader2 size={40} className="animate-spin text-white mb-2" />
                        <span className="text-xl md:text-2xl font-black text-white">連線中...</span>
                      </div>
-                  ) : !isLocationReady ? (
+                  ) : punchStep === 'syncing' ? (
                      <div className="flex flex-col items-center">
-                       <Loader2 size={40} className="animate-spin text-white mb-2" />
+                       <RefreshCw size={40} className="animate-spin text-white mb-2" />
+                       <span className="text-xl md:text-2xl font-black text-white">校時中...</span>
+                     </div>
+                  ) : punchStep === 'locating' ? (
+                     <div className="flex flex-col items-center">
+                       <MapPin size={40} className="animate-bounce text-white mb-2" />
                        <span className="text-xl md:text-2xl font-black text-white">定位中...</span>
                      </div>
-                  ) : isVerifying ? (
+                  ) : punchStep === 'verifying' ? (
                      <div className="flex flex-col items-center">
                        <Loader2 size={40} className="animate-spin text-white mb-2" />
                        <span className="text-xl md:text-2xl font-black text-white">資料核對中...</span>
@@ -916,7 +998,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                   <button key={idx} onClick={() => executePunch(opt)} className="p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black text-brand-600 hover:bg-brand-600 hover:text-white transition-all shadow-md">{opt}</button>
                 ))}
               </div>
-              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>{setPunchMathChallenge(null); setIsVerifying(false);}}>取消本次打卡</button>
+              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>{setPunchMathChallenge(null); setIsVerifying(false); setPunchStep('idle');}}>取消本次打卡</button>
            </div>
         </div>
       )}

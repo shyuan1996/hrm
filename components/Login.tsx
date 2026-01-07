@@ -68,13 +68,17 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setIsLoading(true);
     setError('');
 
-    let email = username.trim();
+    // [資安與體驗修正] 強制轉小寫，實現帳號不分大小寫登入
+    const normalizedInput = username.trim().toLowerCase();
+    
+    // 解析 ID (去掉 @domain 部分)
+    const originalId = normalizedInput.includes('@') ? normalizedInput.split('@')[0] : normalizedInput;
+
+    // 組合 Email (使用小寫 ID)
+    let email = originalId;
     if (!email.includes('@')) {
         email = `${email}@shyuan-hrm.com`;
     }
-
-    // 嘗試從 Email 解析 ID，或直接使用 ID
-    const originalId = username.includes('@') ? username.split('@')[0] : username;
 
     try {
         // 1. Firebase Auth Login
@@ -159,7 +163,8 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
         // Handle Remember Me Logic (Save after successful login)
         if (rememberMe) {
-            const jsonStr = JSON.stringify({ u: username, p: password });
+            // 注意：這裡儲存原始輸入或小寫皆可，建議儲存標準化後的
+            const jsonStr = JSON.stringify({ u: normalizedInput, p: password });
             localStorage.setItem(REMEMBER_KEY, btoa(jsonStr));
         } else {
             localStorage.removeItem(REMEMBER_KEY);

@@ -38,7 +38,8 @@ const secondaryAuth = getAuth(secondaryApp);
  */
 export const createAuthUser = async (username: string, password: string) => {
     // 自動補全 Email 格式，實現「純帳號」登入體驗
-    let email = username.trim();
+    // 強制轉小寫，確保帳號一致性
+    let email = username.trim().toLowerCase();
     if (!email.includes('@')) {
         email = `${email}@shyuan-hrm.com`;
     }
