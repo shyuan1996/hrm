@@ -1,11 +1,10 @@
-
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, AttendanceRecord, AppSettings, Holiday } from '../types';
 import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw, Paperclip, FileText, X } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -56,6 +55,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   
   const [isVerifying, setIsVerifying] = useState(false);
   const [punchStep, setPunchStep] = useState<'idle' | 'syncing' | 'locating' | 'verifying'>('idle'); // Granular status
+  const [isSubmittingLeave, setIsSubmittingLeave] = useState(false); // New loading state for leave submit
   
   // Mobile View State
   const [mobileView, setMobileView] = useState<'punch' | 'apply'>('punch');
@@ -92,6 +92,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     endTime: '17:30',
     reason: ''
   });
+  
+  // File Upload State
+  const [leaveFiles, setLeaveFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Overtime Form
   const [otForm, setOtForm] = useState({
@@ -258,6 +262,36 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   
   const isLocationReady = distance !== null;
   const inRange = isLocationReady && distance! <= settings.allowedRadius;
+
+  // File Upload Logic
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      const filesArray: File[] = Array.from(e.target.files);
+      const totalFiles = leaveFiles.length + filesArray.length;
+      
+      if (totalFiles > 3) {
+        setNotification({ type: 'error', message: "最多只能上傳 3 個文件" });
+        return;
+      }
+
+      for (const file of filesArray) {
+        if (file.size > 5 * 1024 * 1024) {
+          setNotification({ type: 'error', message: `文件 ${file.name} 超過 5MB 上限` });
+          return;
+        }
+      }
+
+      setLeaveFiles(prev => [...prev, ...filesArray]);
+    }
+    // Reset input value to allow selecting the same file again if deleted
+    if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+    }
+  };
+
+  const removeFile = (index: number) => {
+    setLeaveFiles(prev => prev.filter((_, i) => i !== index));
+  };
 
   // 2. [Requirement: Force Sync on Punch]
   const initiatePunch = async () => {
@@ -521,11 +555,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     
     try {
         if (cancelLeaveChallenge.type === 'leave') {
-            // 使用 cancelLeave (更新狀態) 而不是 deleteLeave (物理刪除)
-            // 這樣管理員端可以看到「已取消」的狀態
             await StorageService.cancelLeave(cancelLeaveChallenge.id, user.id);
         } else {
-            // 同上
             await StorageService.cancelOvertime(cancelLeaveChallenge.id, user.id);
         }
         setNotification({ type: 'success', message: "申請已成功取消" });
@@ -535,6 +566,51 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     } finally {
         setCancelLeaveChallenge(null);
     }
+  };
+
+  const handleSubmitLeave = async () => {
+     if (!leaveForm.startDate || !leaveForm.endDate) {
+       setNotification({ type: 'error', message: "請填寫完整請假日期" });
+       return;
+     }
+     if (!leaveForm.reason.trim()) {
+       setNotification({ type: 'error', message: "請填寫請假事由" });
+       return;
+     }
+
+     setIsSubmittingLeave(true);
+     
+     try {
+        // Upload files first
+        let attachments: any[] = [];
+        if (leaveFiles.length > 0) {
+            attachments = await StorageService.uploadLeaveAttachments(leaveFiles, user.id);
+        }
+
+        await StorageService.addLeave({
+          id: Date.now(), 
+          userId: user.id, 
+          uid: user.uid, // PASS UID HERE
+          userName: user.name, 
+          type: leaveForm.type,
+          start: `${leaveForm.startDate} ${leaveForm.startTime}`, 
+          end: `${leaveForm.endDate} ${leaveForm.endTime}`,
+          hours: calculatedHours, 
+          reason: leaveForm.reason, 
+          status: 'pending', 
+          created_at: new Date().toLocaleString(),
+          attachments: attachments
+        });
+
+        setLeaveForm({ type: LEAVE_TYPES[0], startDate: '', endDate: '', startTime: '08:30', endTime: '17:30', reason: '' });
+        setLeaveFiles([]);
+        setNotification({ type: 'success', message: "已成功送出申請！" });
+     } catch (e: any) {
+        console.error("Leave Submit Error:", e);
+        setNotification({ type: 'error', message: "申請失敗: " + (e.message || "上傳文件或寫入資料時發生錯誤") });
+     } finally {
+        setIsSubmittingLeave(false);
+     }
   };
 
   const getLeaveStatusStyle = (status: string) => {
@@ -571,7 +647,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden p-4 md:p-8 gap-4 md:gap-8 items-stretch relative mb-16 md:mb-0">
         
-        {/* Punch Section (Left) */}
+        {/* Punch Section (Left) - Unchanged */}
         <div className={`w-full md:w-1/2 flex-col h-full flex-shrink-0 ${mobileView === 'punch' ? 'flex' : 'hidden md:flex'}`}>
             <div className="flex-1 bg-white rounded-[32px] md:rounded-[40px] shadow-sm border p-6 md:p-12 flex flex-col items-center justify-start space-y-6 md:space-y-8 overflow-y-auto custom-scroll relative h-full">
               <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100 relative">
@@ -733,6 +809,50 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                          <textarea className="w-full p-4 bg-white border border-gray-100 rounded-2xl min-h-[80px] font-black outline-none transition-all" value={leaveForm.reason} onChange={e => setLeaveForm({...leaveForm, reason: e.target.value})} placeholder="請說明請假事由..." />
                        </div>
 
+                       {/* File Upload Section */}
+                       <div className="space-y-2">
+                          <label className="text-xs font-black text-gray-400">證明文件 (選填，最多3份，每份限5MB)</label>
+                          <div className="flex flex-col gap-3">
+                             {/* File Input */}
+                             <div className="relative">
+                                <input 
+                                   ref={fileInputRef}
+                                   type="file" 
+                                   multiple 
+                                   onChange={handleFileSelect} 
+                                   className="hidden" 
+                                   id="leave-file-upload"
+                                   accept="image/*,.pdf"
+                                />
+                                <label 
+                                  htmlFor="leave-file-upload" 
+                                  className={`flex items-center justify-center gap-2 w-full p-3 border-2 border-dashed rounded-2xl cursor-pointer transition-all ${leaveFiles.length >= 3 ? 'bg-gray-100 border-gray-300 text-gray-400 cursor-not-allowed' : 'bg-white border-brand-200 text-brand-600 hover:bg-brand-50'}`}
+                                >
+                                   <Paperclip size={18} />
+                                   <span className="font-black text-sm">點擊上傳文件</span>
+                                </label>
+                             </div>
+
+                             {/* Selected Files List */}
+                             {leaveFiles.length > 0 && (
+                               <div className="space-y-2">
+                                  {leaveFiles.map((file, idx) => (
+                                    <div key={idx} className="flex items-center justify-between p-3 bg-white border border-gray-200 rounded-xl">
+                                       <div className="flex items-center gap-2 overflow-hidden">
+                                          <FileText size={16} className="text-gray-400 flex-shrink-0" />
+                                          <span className="text-xs font-bold text-gray-700 truncate max-w-[150px] md:max-w-[200px]">{file.name}</span>
+                                          <span className="text-[10px] text-gray-400 flex-shrink-0">({(file.size / 1024 / 1024).toFixed(1)} MB)</span>
+                                       </div>
+                                       <button type="button" onClick={() => removeFile(idx)} className="text-gray-400 hover:text-red-500 transition-colors p-1">
+                                          <X size={16} />
+                                       </button>
+                                    </div>
+                                  ))}
+                               </div>
+                             )}
+                          </div>
+                       </div>
+
                        {!isLeaveDateValid ? (
                          <div className="p-4 md:p-6 bg-red-50 rounded-[24px] md:rounded-[32px] border-2 border-red-100 space-y-3 flex items-center justify-center gap-3 text-red-600 font-black animate-pulse text-sm md:text-base">
                             <AlertTriangle />
@@ -762,33 +882,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
                        <Button 
                          className={`w-full py-4 md:py-5 rounded-[24px] md:rounded-[32px] text-lg md:text-xl font-black shadow-2xl ${(!isLeaveDateValid || !quotaCheck.valid) ? 'bg-gray-300 text-gray-500 cursor-not-allowed shadow-none' : ''}`}
-                         disabled={!isLeaveDateValid || !quotaCheck.valid}
-                         onClick={() => {
-                         if (!leaveForm.startDate || !leaveForm.endDate) {
-                           setNotification({ type: 'error', message: "請填寫完整請假日期" });
-                           return;
-                         }
-                         if (!leaveForm.reason.trim()) {
-                           setNotification({ type: 'error', message: "請填寫請假事由" });
-                           return;
-                         }
-                         StorageService.addLeave({
-                           id: Date.now(), 
-                           userId: user.id, 
-                           uid: user.uid, // PASS UID HERE
-                           userName: user.name, 
-                           type: leaveForm.type,
-                           start: `${leaveForm.startDate} ${leaveForm.startTime}`, 
-                           end: `${leaveForm.endDate} ${leaveForm.endTime}`,
-                           hours: calculatedHours, 
-                           reason: leaveForm.reason, 
-                           status: 'pending', 
-                           created_at: new Date().toLocaleString()
-                         });
-                         setLeaveForm({ type: LEAVE_TYPES[0], startDate: '', endDate: '', startTime: '08:30', endTime: '17:30', reason: '' });
-                         setNotification({ type: 'success', message: "已成功送出申請！" });
-                       }}>
-                         {isLeaveDateValid ? (quotaCheck.valid ? '送出申請' : '額度不足') : '日期選擇錯誤'}
+                         disabled={!isLeaveDateValid || !quotaCheck.valid || isSubmittingLeave}
+                         isLoading={isSubmittingLeave}
+                         onClick={handleSubmitLeave}>
+                         {isLeaveDateValid ? (quotaCheck.valid ? (isSubmittingLeave ? '正在上傳...' : '送出申請') : '額度不足') : '日期選擇錯誤'}
                        </Button>
                      </div>
                    </div>
@@ -812,8 +909,24 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                              <div className="text-xs md:text-sm text-gray-600 border-l-4 border-gray-100 pl-4 py-1 italic">
                                事由：{recentLeave.reason || '無備註'}
                              </div>
+                             
+                             {/* Attachments Preview */}
+                             {recentLeave.attachments && recentLeave.attachments.length > 0 && (
+                                <div className="mt-2 pl-2">
+                                   <div className="text-[10px] font-black text-gray-400 mb-1 flex items-center gap-1"><Paperclip size={10}/> 附件檔案</div>
+                                   <div className="flex flex-wrap gap-2">
+                                     {recentLeave.attachments.map((att, idx) => (
+                                        <a key={idx} href={att.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 bg-gray-50 border border-gray-200 px-2 py-1 rounded-lg text-xs font-bold text-brand-600 hover:bg-brand-50 transition-colors">
+                                           <FileText size={12}/>
+                                           <span className="max-w-[120px] truncate">{att.name}</span>
+                                        </a>
+                                     ))}
+                                   </div>
+                                </div>
+                             )}
+
                              {recentLeave.status === 'rejected' && recentLeave.rejectReason && (
-                               <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1">
+                               <div className="text-xs md:text-sm text-red-500 font-bold border-l-4 border-red-200 pl-4 py-1 mt-2">
                                  審核不通過原因：{recentLeave.rejectReason}
                                </div>
                              )}
@@ -836,6 +949,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  </div>
                ) : (
                  <div className="space-y-6 md:space-y-8">
+                    {/* ... (Overtime Form Section remains unchanged) ... */}
                     <div className="bg-gray-50/50 p-6 md:p-8 rounded-[28px] md:rounded-[36px] border border-gray-100">
                        <h3 className="font-black text-xl md:text-2xl mb-4 md:mb-6 flex items-center gap-3 text-indigo-800">填寫加班單</h3>
                        <div className="space-y-4 md:space-y-6">
@@ -1143,6 +1257,18 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                               {TimeService.formatDateTime(l.start)} ~ <br/>{TimeService.formatDateTime(l.end)}
                            </div>
                            {l.reason && <div className="text-xs text-gray-600 pl-2 border-l-2 border-gray-200">備註：{l.reason}</div>}
+                           
+                           {/* History Attachment Link */}
+                           {l.attachments && l.attachments.length > 0 && (
+                              <div className="flex flex-wrap gap-2 mt-1">
+                                 {l.attachments.map((att, idx) => (
+                                    <a key={idx} href={att.url} target="_blank" rel="noopener noreferrer" className="text-[10px] text-brand-600 bg-brand-50 px-2 py-1 rounded border border-brand-100 flex items-center gap-1 hover:underline">
+                                       <Paperclip size={10}/> {att.name}
+                                    </a>
+                                 ))}
+                              </div>
+                           )}
+
                            {l.rejectReason && <div className="text-xs text-red-500 pl-2 border-l-2 border-red-200">拒絕原因：{l.rejectReason}</div>}
                            <div className="text-[10px] text-gray-400 text-right pt-2 border-t border-gray-50 mt-2">
                               申請時間：{TimeService.formatDateTime(l.created_at, true)}

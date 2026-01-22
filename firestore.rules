@@ -47,7 +47,8 @@ service cloud.firestore {
 
     // Users Collection
     match /users/{userId} {
-      allow read: if request.auth != null;
+      // Security fix: Employees can only read their own data. Admin can read all.
+      allow read: if isAdmin() || (request.auth != null && (userId == 'admin' ? false : isResourceOwner()));
       
       // Write Rules (Update/Create)
       allow write: if 

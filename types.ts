@@ -33,6 +33,12 @@ export interface AttendanceRecord {
   uid?: string; // Added for robust security rules
 }
 
+export interface LeaveAttachment {
+  name: string;
+  url: string;
+  path: string; // Storage path for deletion reference
+}
+
 export interface LeaveRequest {
   id: number;
   userId: string;
@@ -46,6 +52,7 @@ export interface LeaveRequest {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   rejectReason?: string;
   created_at: string;
+  attachments?: LeaveAttachment[]; // New field for file uploads
 }
 
 export interface OvertimeRequest {

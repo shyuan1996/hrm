@@ -1,12 +1,13 @@
 
-import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, UserRole } from '../types';
+import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, UserRole, LeaveAttachment } from '../types';
 import { STORAGE_KEY, DEFAULT_SETTINGS } from '../constants';
 import { TimeService } from './timeService';
-import { db, auth, createAuthUser } from './firebase'; // Import createAuthUser
+import { db, auth, createAuthUser, storage } from './firebase'; // Import storage
 import { 
   collection, doc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, 
   onSnapshot, query, orderBy, where, Timestamp, limit 
 } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 
 export interface AppData {
   users: User[];
@@ -52,7 +53,7 @@ export const StorageService = {
         _memoryCache.announcements = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as any));
         StorageService._saveToLocal();
     }, (error) => {
-        console.warn("Announcements sync paused (permission/network):", error.code);
+        console.warn("Announcements sync paused:", error.code);
     }));
 
     // Holidays Sync
@@ -61,18 +62,30 @@ export const StorageService = {
         _memoryCache.holidays = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as any));
         StorageService._saveToLocal();
     }, (error) => {
-        console.warn("Holidays sync paused (permission/network):", error.code);
+        console.warn("Holidays sync paused:", error.code);
     }));
 
     // --- Protected Data (Users, Settings, Personal Records) ---
     // Only subscribe if we are logged in (userId is provided)
     if (userId) {
-        // Users Sync
-        const usersQ = query(collection(db, 'users'));
-        _listeners.push(onSnapshot(usersQ, (snapshot) => {
-            _memoryCache.users = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as User));
-            StorageService._saveToLocal();
-        }, (error) => console.error("Users sync error:", error.message)));
+        // Users Sync: Security Enhancement
+        // Admin gets all users; Employee gets only self.
+        if (role === 'admin') {
+            const usersQ = query(collection(db, 'users'));
+            _listeners.push(onSnapshot(usersQ, (snapshot) => {
+                _memoryCache.users = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as User));
+                StorageService._saveToLocal();
+            }, (error) => console.error("Users sync error (Admin):", error.message)));
+        } else {
+            _listeners.push(onSnapshot(doc(db, 'users', userId), (docSnap) => {
+                if (docSnap.exists()) {
+                    const u = { ...docSnap.data(), id: docSnap.id } as User;
+                    // Replace/Set users array to contain only self
+                    _memoryCache.users = [u];
+                    StorageService._saveToLocal();
+                }
+            }, (error) => console.error("User sync error (Self):", error.message)));
+        }
 
         // Settings Sync
         _listeners.push(onSnapshot(doc(db, 'system', 'settings'), (docSnap) => {
@@ -137,7 +150,7 @@ export const StorageService = {
     try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(_memoryCache));
     } catch (e) {
-        console.warn("Failed to save cache to local storage (possibly circular ref or quota exceeded):", e);
+        console.warn("Failed to save cache to local storage:", e);
     }
     // Trigger a custom event so React components can re-render if they listen to it
     window.dispatchEvent(new Event('storage-update'));
@@ -179,6 +192,74 @@ export const StorageService = {
         } catch (e) {
             console.error("Failed to write security log", e);
         }
+    }
+  },
+
+  // --- File Storage Operations ---
+
+  uploadLeaveAttachments: async (files: File[], userId: string): Promise<LeaveAttachment[]> => {
+    if (!storage) throw new Error("File Storage Service is currently unavailable.");
+    if (!files || files.length === 0) return [];
+
+    const uploaded: LeaveAttachment[] = [];
+
+    for (const file of files) {
+        // Path: leave_attachments/{userId}/{timestamp}_{filename}
+        const timestamp = Date.now();
+        const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_'); // Sanitize filename
+        const storagePath = `leave_attachments/${userId}/${timestamp}_${safeName}`;
+        const storageRef = ref(storage, storagePath);
+
+        try {
+            const snapshot = await uploadBytes(storageRef, file);
+            const url = await getDownloadURL(snapshot.ref);
+            uploaded.push({
+                name: file.name,
+                url: url,
+                path: storagePath
+            });
+        } catch (e: any) {
+            console.error("Upload failed for " + file.name, e);
+            throw new Error(`檔案 ${file.name} 上傳失敗，請稍後再試。`);
+        }
+    }
+    return uploaded;
+  },
+
+  deleteLeaveAttachment: async (leaveId: number, attachment: LeaveAttachment) => {
+    if (!storage) throw new Error("Storage unavailable");
+
+    // 1. Delete physical file from Storage
+    if (attachment.path) {
+        try {
+            const fileRef = ref(storage, attachment.path);
+            await deleteObject(fileRef);
+        } catch (e: any) {
+            // Ignore if file not found (already deleted), but warn on other errors
+            if (e.code !== 'storage/object-not-found') {
+                 console.warn("Storage file deletion failed:", e);
+            }
+        }
+    }
+
+    // 2. Update Firestore Document
+    try {
+        const q = query(collection(db, 'leaves'), where('id', '==', leaveId));
+        const snapshot = await getDocs(q);
+        if (!snapshot.empty) {
+            const docRef = snapshot.docs[0].ref;
+            const currentData = snapshot.docs[0].data();
+            const currentAttachments = currentData.attachments || [];
+            // Remove the specific attachment by path
+            const updatedAttachments = currentAttachments.filter((a: any) => a.path !== attachment.path);
+            
+            await updateDoc(docRef, { attachments: updatedAttachments });
+        }
+    } catch (e: any) {
+        if (e.code === 'permission-denied') {
+            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_ATTACHMENT', `Attempted to delete attachment for leave ${leaveId}`);
+        }
+        throw e;
     }
   },
 
@@ -303,8 +384,33 @@ export const StorageService = {
         const q = query(collection(db, 'leaves'), ...constraints);
         const snapshot = await getDocs(q);
         
-        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'leaves', d.id)));
-        await Promise.all(promises);
+        // Use map to create an array of promises for deleting both files and documents
+        const deleteOperations = snapshot.docs.map(async (docSnap) => {
+            const data = docSnap.data();
+            
+            // 1. Cascading Delete: Remove attachments from Storage first
+            if (data.attachments && Array.isArray(data.attachments)) {
+                const attachmentDeletions = data.attachments.map((att: LeaveAttachment) => {
+                    if (att.path && storage) {
+                        const fileRef = ref(storage, att.path);
+                        return deleteObject(fileRef).catch(err => {
+                             // Suppress 'not found' errors to allow partial cleanup
+                             if (err.code !== 'storage/object-not-found') {
+                                 console.warn(`Failed to delete attached file ${att.path}`, err);
+                             }
+                        });
+                    }
+                    return Promise.resolve();
+                });
+                await Promise.all(attachmentDeletions);
+            }
+
+            // 2. Delete the Firestore document
+            return deleteDoc(doc(db, 'leaves', docSnap.id));
+        });
+
+        await Promise.all(deleteOperations);
+
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_LEAVE', `Attempted to delete leave ${id}`);

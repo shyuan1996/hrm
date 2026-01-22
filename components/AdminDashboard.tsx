@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { User, OvertimeRequest, Announcement, UserRole } from '../types';
+import { User, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { Button } from './ui/Button';
@@ -9,7 +9,7 @@ import { sendPasswordResetEmail } from 'firebase/auth';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter, Paperclip, X
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -135,6 +135,17 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
+  const deleteAttachment = async (leaveId: number, attachment: LeaveAttachment) => {
+      if(!window.confirm(`確認刪除附件 "${attachment.name}"？此操作無法復原。`)) return;
+      try {
+          await StorageService.deleteLeaveAttachment(leaveId, attachment);
+          refreshData();
+          showToast("附件已刪除", 'success');
+      } catch (e: any) {
+          showToast("附件刪除失敗: " + getErrorMessage(e), 'error');
+      }
+  };
+
   // Trigger Delete Challenge
   const confirmDelete = (id: string | number, type: 'user' | 'leave' | 'ot' | 'announcement' | 'holiday') => {
     const n1 = Math.floor(Math.random() * 9) + 1;
@@ -246,27 +257,149 @@ export const AdminDashboard: React.FC = () => {
   const handleExportAllAttendance = () => {
     if (!attExportStart || !attExportEnd) return showToast("請選擇匯出日期區間", "error");
 
-    const filteredRecords = data.records.filter(r => r.date >= attExportStart && r.date <= attExportEnd);
-    if (filteredRecords.length === 0) return showToast("該區間無打卡紀錄", "error");
+    // 1. Generate all dates in range
+    const dateArray: string[] = [];
+    let currentDate = new Date(attExportStart);
+    const endDate = new Date(attExportEnd);
+    
+    // Safety check for huge ranges
+    const diffTime = Math.abs(endDate.getTime() - currentDate.getTime());
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
+    if (diffDays > 366) {
+        if (!window.confirm("匯出區間超過一年，可能會花費較長時間，是否繼續？")) return;
+    }
 
-    const enhancedRecords = filteredRecords.map(r => {
-        const user = data.users.find(u => u.id === r.userId);
-        return {
-            ...r,
-            dept: user ? user.dept : '未知'
-        };
-    });
+    while (currentDate <= endDate) {
+        dateArray.push(TimeService.getTaiwanDate(currentDate));
+        currentDate.setDate(currentDate.getDate() + 1);
+    }
 
-    let csv = "\uFEFF打卡日期,員工帳號,員工姓名,部門,打卡時間,類型,距離(M),狀態\n";
-    enhancedRecords.forEach(r => {
-        const safeDate = TimeService.getTaiwanDate(r.date);
-        csv += `${safeDate},${r.userId},${r.userName},${r.dept},${TimeService.formatTimeOnly(r.time, true)},${r.type==='in'?'上班':'下班'},${r.dist.toFixed(0)},${r.status}\n`;
+    // 2. CSV Header (Updated with detailed status)
+    let csv = "\uFEFF日期,員工帳號,員工姓名,部門,上班時間,下班時間,上班座標,下班座標,狀態\n";
+
+    // 3. Iterate Users and Dates
+    data.users.forEach(user => {
+        if (user.role === 'admin') return;
+
+        dateArray.forEach(dateStr => {
+            // Find Records for this User & Date
+            const dayRecords = data.records.filter(r => 
+                r.userId === user.id && TimeService.getTaiwanDate(r.date) === dateStr
+            );
+
+            // Find Approved Leaves for this User & Date
+            const userLeaves = data.leaves.filter(l => 
+                l.userId === user.id && 
+                l.status === 'approved' && 
+                l.start.substring(0, 10) <= dateStr && 
+                l.end.substring(0, 10) >= dateStr
+            );
+
+            // Determine Holiday / Weekend
+            const targetDate = new Date(dateStr);
+            const dayOfWeek = targetDate.getDay();
+            const holidayInfo = data.holidays.find(h => TimeService.getTaiwanDate(h.date) === dateStr);
+            const isHoliday = !!holidayInfo;
+            const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+
+            let inTime = '--';
+            let outTime = '--';
+            let inLoc = '--';
+            let outLoc = '--';
+            let statusParts: string[] = [];
+
+            // --- A. Process Records (If any) ---
+            if (dayRecords.length > 0) {
+                // Sort by time
+                dayRecords.sort((a,b) => a.time.localeCompare(b.time));
+                
+                const inRecord = dayRecords.find(r => r.type === 'in');
+                const outRecord = dayRecords.filter(r => r.type === 'out').pop(); // Latest out
+
+                if (inRecord) {
+                    const timeOnly = TimeService.formatTimeOnly(inRecord.time, true);
+                    inTime = timeOnly;
+                    inLoc = `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`;
+                    
+                    // Logic: Early Clock In (Before 08:00:00)
+                    if (timeOnly <= "08:00:00") statusParts.push("提早打卡");
+
+                    // Logic: Late (after 08:30:00)
+                    if (timeOnly > "08:30:00") statusParts.push("遲到");
+                    
+                    // Logic: Location Abnormal
+                    if (inRecord.status.includes('異常') || inRecord.dist > data.settings.allowedRadius) {
+                        statusParts.push("上班地點異常");
+                    }
+                }
+
+                if (outRecord) {
+                    const timeOnly = TimeService.formatTimeOnly(outRecord.time, true);
+                    outTime = timeOnly;
+                    outLoc = `(${outRecord.lat.toFixed(5)}, ${outRecord.lng.toFixed(5)})`;
+
+                    // Logic: Early Leave (before 17:30:00)
+                    if (timeOnly < "17:30:00") statusParts.push("早退");
+
+                    // Logic: Late Out (after 18:00:00)
+                    if (timeOnly >= "18:00:00") statusParts.push("晚退");
+
+                    // Logic: Location Abnormal
+                    if (outRecord.status.includes('異常') || outRecord.dist > data.settings.allowedRadius) {
+                        statusParts.push("下班地點異常");
+                    }
+                }
+
+                // Check Missing Punches
+                if (inRecord && !outRecord) statusParts.push("缺下班卡");
+                if (!inRecord && outRecord) statusParts.push("缺上班卡");
+            }
+
+            // --- B. Process Leaves ---
+            if (userLeaves.length > 0) {
+                userLeaves.forEach(l => {
+                    statusParts.push(`請假(${l.type} ${l.hours}hr)`);
+                });
+            }
+
+            // --- C. Process Holiday / Weekend / Absent ---
+            if (dayRecords.length === 0 && userLeaves.length === 0) {
+                if (isHoliday) {
+                    statusParts.push(`國定假日(${holidayInfo?.note})`);
+                } else if (isWeekend) {
+                    statusParts.push("例假日");
+                } else {
+                    // Check Onboard Date
+                    if (user.onboard_date && dateStr < user.onboard_date) {
+                        statusParts.push("尚未到職");
+                    } else {
+                        statusParts.push("曠職/未打卡");
+                    }
+                }
+            } else {
+                // If there are records but it's a holiday/weekend
+                if (isHoliday) statusParts.push("假日出勤");
+                if (isWeekend && !isHoliday) statusParts.push("週末加班");
+            }
+
+            // --- D. Final Status Formatting ---
+            // If statusParts is empty but records exist (Normal day, on time, no leave), label as "正常"
+            if (statusParts.length === 0 && dayRecords.length > 0) {
+                statusParts.push("正常");
+            }
+
+            const finalStatus = statusParts.join(" / ");
+
+            // Append Row
+            // Wrap coordinates in quotes to handle comma
+            csv += `${dateStr},${user.id},${user.name},${user.dept},${inTime},${outTime},"${inLoc}","${outLoc}",${finalStatus}\n`;
+        });
     });
 
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `全體打卡紀錄_${attExportStart}_${attExportEnd}.csv`;
+    link.download = `完整考勤紀錄_${attExportStart}_${attExportEnd}.csv`;
     link.click();
     setIsExportAttendanceModalOpen(false);
     showToast("匯出成功", 'success');
@@ -796,6 +929,31 @@ export const AdminDashboard: React.FC = () => {
                                 </div>
                                 <div className="ml-0 md:ml-2 inline-block text-brand-600 font-black text-lg md:text-xl underline decoration-4 decoration-brand-200 underline-offset-4">({leave.hours}hr)</div>
                                 <div className="text-xs md:text-sm text-gray-600 mt-2 pl-2 border-l-4 border-brand-200">{leave.reason}</div>
+                                
+                                {/* Admin View Attachments (Pending) */}
+                                {leave.attachments && leave.attachments.length > 0 && (
+                                   <div className="mt-3 bg-gray-50 p-2 rounded-xl border border-gray-100">
+                                      <div className="text-[10px] font-black text-gray-400 mb-1 flex items-center gap-1"><Paperclip size={10}/> 附件檔案</div>
+                                      <div className="flex flex-wrap gap-2">
+                                        {leave.attachments.map((att, idx) => (
+                                           <div key={idx} className="flex items-center gap-2 bg-white border border-gray-200 px-2 py-1 rounded-lg">
+                                              <a href={att.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs font-bold text-brand-600 hover:underline">
+                                                 <FileText size={12}/>
+                                                 <span className="max-w-[150px] truncate">{att.name}</span>
+                                              </a>
+                                              <button 
+                                                onClick={(e) => { e.stopPropagation(); deleteAttachment(leave.id, att); }} 
+                                                className="text-gray-400 hover:text-red-500 transition-colors p-0.5 rounded-full hover:bg-red-50"
+                                                title="刪除此附件"
+                                              >
+                                                 <X size={12} />
+                                              </button>
+                                           </div>
+                                        ))}
+                                      </div>
+                                   </div>
+                                )}
+
                                 <div className="text-[10px] md:text-xs text-gray-400 mt-2 flex items-center gap-1"><Info size={12}/> 申請時間: {TimeService.formatDateTime(leave.created_at, true)}</div>
                              </div>
                           </div>
@@ -850,11 +1008,11 @@ export const AdminDashboard: React.FC = () => {
                         <div key={leave.id} className="bg-gray-50 p-6 rounded-[24px] md:rounded-3xl border flex flex-col gap-4 opacity-75 hover:opacity-100 transition-all group">
                            {/* ... Leave History Item ... */}
                            <div className="flex justify-between items-start">
-                              <div className="flex items-start md:items-center gap-4">
+                              <div className="flex items-start md:items-center gap-4 flex-1">
                                  <span className={`px-2 py-1 md:px-3 rounded-xl text-[10px] md:text-xs font-black whitespace-nowrap ${leave.status === 'approved' ? 'bg-green-100 text-green-700' : leave.status === 'rejected' ? 'bg-red-100 text-red-700' : 'bg-gray-200 text-gray-600'}`}>
                                     {leave.status === 'approved' ? '已核准' : leave.status === 'rejected' ? '已拒絕' : '已取消'}
                                  </span>
-                                 <div>
+                                 <div className="flex-1">
                                     <div className="font-bold text-base md:text-lg">
                                        <span className="font-mono text-gray-400 mr-2 text-xs md:text-sm">{leave.userId}</span>
                                        {leave.userName} - <span className="text-brand-600 font-black">{leave.type}</span>
@@ -864,6 +1022,27 @@ export const AdminDashboard: React.FC = () => {
                                        {TimeService.formatDateTime(leave.start)} ~ {TimeService.formatDateTime(leave.end)}
                                     </div>
                                     <div className="text-xs md:text-sm text-gray-600 mt-1">事由：{leave.reason}</div>
+                                    
+                                    {/* Admin View Attachments (History) */}
+                                    {leave.attachments && leave.attachments.length > 0 && (
+                                       <div className="mt-2 flex flex-wrap gap-2">
+                                          {leave.attachments.map((att, idx) => (
+                                             <div key={idx} className="flex items-center gap-1 bg-white border border-gray-200 px-2 py-0.5 rounded text-[10px] font-bold">
+                                                <a href={att.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-gray-600 hover:text-brand-600 hover:underline">
+                                                   <Paperclip size={10}/> {att.name}
+                                                </a>
+                                                <button 
+                                                  onClick={(e) => { e.stopPropagation(); deleteAttachment(leave.id, att); }} 
+                                                  className="text-gray-300 hover:text-red-500 transition-colors p-0.5"
+                                                  title="刪除附件"
+                                                >
+                                                   <X size={10} />
+                                                </button>
+                                             </div>
+                                          ))}
+                                       </div>
+                                    )}
+
                                     {leave.rejectReason && <div className="text-xs text-red-500 mt-1 font-bold">拒絕原因：{leave.rejectReason}</div>}
                                     <div className="text-[10px] md:text-xs text-gray-400 mt-1">申請時間: {TimeService.formatDateTime(leave.created_at, true)}</div>
                                  </div>

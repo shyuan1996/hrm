@@ -2,6 +2,7 @@
 import { initializeApp, getApp, getApps } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signOut } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
   apiKey: "AIzaSyChRSqy8ubnhGQgGAA0bfe-gFOLWTJxmMk",
@@ -17,6 +18,7 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const storage = getStorage(app); // Standard initialization
 
 // 2. 次要 App (專門用來讓管理員建立新員工帳號)
 // 這是因為 Firebase Client SDK 只要一呼叫 createUserWithEmailAndPassword 就會自動把當前使用者登出並登入新帳號
@@ -34,7 +36,7 @@ const secondaryAuth = getAuth(secondaryApp);
 
 /**
  * 專門給管理員使用的「建立員工帳號」功能
- * 支援「純帳號」模式 (自動補上 @domain)
+ * 支援「純帳號」模式 (自動補全 @domain)
  */
 export const createAuthUser = async (username: string, password: string) => {
     // 自動補全 Email 格式，實現「純帳號」登入體驗

@@ -82,7 +82,7 @@ export const TimeService = {
     };
 
     try {
-      // Race 模式：嘗試多個來源
+      // Race 模式：嘗試多個外部來源
       const offset = await promiseAny([
         fetchWithTimeout('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei'),
         fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
@@ -90,8 +90,8 @@ export const TimeService = {
       ]);
       return offset;
     } catch (e) {
-      // 網路時間獲取失敗，嚴格禁止使用本機時間
-      console.error("Time sync failed completely."); 
+      // 網路時間獲取完全失敗，嚴格禁止使用本機時間或任何後備方案
+      console.error("Time sync failed completely. API unavailable."); 
       return null;
     }
   },
@@ -107,6 +107,7 @@ export const TimeService = {
         return new Date(_anchorServerTime + elapsed);
     }
     // 降級方案：如果尚未對時成功，只能依賴本地時間 + 偏移量
+    // (注意：打卡功能會強制要求 getNetworkTimeOffset() 成功，此處僅供 UI 顯示)
     return new Date(Date.now() + offset);
   },
 
