@@ -479,13 +479,20 @@ export const StorageService = {
   addAnnouncement: async (ann: Announcement) => {
     try {
         if (ann.id) {
-           const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
-           const snapshot = await getDocs(q);
-           if (!snapshot.empty) {
-               const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
-               await Promise.all(promises);
-               return;
-           }
+            if (typeof ann.id === 'string') {
+                const docRef = doc(db, 'announcements', ann.id);
+                // Check if doc actually exists just in case
+                await updateDoc(docRef, ann as any);
+                return;
+            } else {
+                const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
+                const snapshot = await getDocs(q);
+                if (!snapshot.empty) {
+                    const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
+                    await Promise.all(promises);
+                    return;
+                }
+            }
         }
         await addDoc(collection(db, 'announcements'), ann);
     } catch (e: any) {
@@ -496,12 +503,33 @@ export const StorageService = {
     }
   },
 
-  removeAnnouncement: async (id: number) => {
+  removeAnnouncement: async (id: number | string) => {
     try {
-        const q = query(collection(db, 'announcements'), where('id', '==', id));
+        let deleted = false;
+        if (typeof id === 'string') {
+            try {
+                await deleteDoc(doc(db, 'announcements', id));
+                deleted = true;
+            } catch (e) {
+                // Ignore and fallback
+            }
+        }
+        const numericId = Number(id);
+        const q = query(collection(db, 'announcements'), where('id', '==', isNaN(numericId) ? id : numericId));
         const snapshot = await getDocs(q);
-        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
-        await Promise.all(promises);
+        if (!snapshot.empty) {
+            const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
+            await Promise.all(promises);
+            deleted = true;
+        }
+        if (typeof id === 'string') {
+            const qs = query(collection(db, 'announcements'), where('id', '==', id));
+            const snapshots = await getDocs(qs);
+            if (!snapshots.empty) {
+                const promises = snapshots.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
+                await Promise.all(promises);
+            }
+        }
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_DELETE', `Attempted to delete announcement ${id}`);
@@ -521,12 +549,38 @@ export const StorageService = {
     }
   },
 
-  removeHoliday: async (id: number) => {
+  removeHoliday: async (id: number | string) => {
     try {
-        const q = query(collection(db, 'holidays'), where('id', '==', id));
+        let deleted = false;
+        // First try to delete by document ID if it's a string
+        if (typeof id === 'string') {
+            try {
+                await deleteDoc(doc(db, 'holidays', id));
+                deleted = true;
+            } catch (e) {
+                // Ignore and fallback
+            }
+        }
+        
+        // Always try to query by id field as well, in case id refers to the Date.now() timestamp
+        const numericId = Number(id);
+        const q = query(collection(db, 'holidays'), where('id', '==', isNaN(numericId) ? id : numericId));
         const snapshot = await getDocs(q);
-        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
-        await Promise.all(promises);
+        if (!snapshot.empty) {
+            const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
+            await Promise.all(promises);
+            deleted = true;
+        }
+        
+        // Also query by string id if needed
+        if (typeof id === 'string') {
+            const qs = query(collection(db, 'holidays'), where('id', '==', id));
+            const snapshots = await getDocs(qs);
+            if (!snapshots.empty) {
+                const promises = snapshots.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
+                await Promise.all(promises);
+            }
+        }
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_HOLIDAY_DELETE', `Attempted to delete holiday ${id}`);

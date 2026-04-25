@@ -3,6 +3,7 @@ import { User, AttendanceRecord, AppSettings, Holiday } from '../types';
 import { StorageService } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
+import { calculateOTWithDeduction } from '../utils/otCalculator';
 import { Button } from './ui/Button';
 import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw, Paperclip, FileText, X } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
@@ -106,6 +107,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     reason: ''
   });
 
+  const [permissionState, setPermissionState] = useState<PermissionState | 'unknown'>('unknown');
   const watchIdRef = useRef<number | null>(null);
 
   // Auto-hide notification
@@ -206,7 +208,30 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       );
     };
 
-    startWatching(true);
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'geolocation' }).then((res) => {
+        setPermissionState(res.state);
+        res.onchange = () => {
+           setPermissionState(res.state);
+           if (res.state === 'granted') {
+               startWatching(true);
+           }
+        };
+
+        if (res.state === 'granted') {
+           startWatching(true);
+        } else if (res.state === 'prompt') {
+           setGpsError("點此啟用定位");
+        } else {
+           setGpsError("定位權限已被拒絕");
+        }
+      }).catch((e) => {
+         // Fallback
+         startWatching(true);
+      });
+    } else {
+      startWatching(true);
+    }
 
     return () => {
       if (watchIdRef.current !== null) {
@@ -296,6 +321,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   // 2. [Requirement: Force Sync on Punch]
   const initiatePunch = async () => {
     // Basic checks before even starting sync
+    if (permissionState === 'prompt' || gpsError === '點此啟用定位') {
+        setNotification({ type: 'error', message: "請先點擊下方『點此啟用定位』" });
+        return;
+    }
+
     if (!isTimeSynced && dynamicOffset === 0) {
         setNotification({ type: 'error', message: "系統尚未初始化，請稍候..." });
         return;
@@ -530,12 +560,22 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const calculatedOTHours = useMemo(() => {
     if (!otForm.startDate || !otForm.endDate) return 0;
+    
+    // Create Date objects to represent the current OT applying
     const s = new Date(`${otForm.startDate}T${otForm.startTime}`);
     const e = new Date(`${otForm.endDate}T${otForm.endTime}`);
-    const diffMs = e.getTime() - s.getTime();
-    if (diffMs <= 0) return 0;
-    return parseFloat((diffMs / (1000 * 60 * 60)).toFixed(1));
-  }, [otForm]);
+    
+    if (e.getTime() <= s.getTime()) return 0;
+
+    // Filter today's existing OT requests for this user, ignoring rejected/cancelled
+    const sameDayOTs = localData.overtimes.filter(o => 
+        o.userId === user.id && 
+        o.status !== 'rejected' && o.status !== 'cancelled' &&
+        o.start.startsWith(otForm.startDate) 
+    ).map(o => ({ start: o.start, end: o.end, hours: o.hours }));
+
+    return calculateOTWithDeduction(s, e, sameDayOTs);
+  }, [otForm, localData.overtimes, user.id]);
 
   const initiateCancelRequest = (id: number, type: 'leave' | 'ot') => {
     const n1 = Math.floor(Math.random() * 9) + 1;
@@ -706,7 +746,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     'bg-gray-100 text-gray-400'
                 }`}>
                    <MapPin size={20} className={`md:w-6 md:h-6 ${(!isTimeSynced || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
-                   {gpsError ? (
+                   {permissionState === 'prompt' || gpsError === '點此啟用定位' ? (
+                     <button onClick={() => {
+                         navigator.geolocation.getCurrentPosition(() => {}, () => {
+                             setGpsError("定位權限已被拒絕");
+                             setPermissionState('denied');
+                         });
+                     }} className="underline cursor-pointer">點此啟用定位</button>
+                   ) : gpsError ? (
                      <span>{gpsError}</span>
                    ) : !isTimeSynced ? (
                      <span className="animate-pulse">正在校正系統時間...</span>

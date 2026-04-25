@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { User, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
+import { calculateOTWithDeduction } from '../utils/otCalculator';
 import { Button } from './ui/Button';
 import { auth } from '../services/firebase';
 import { sendPasswordResetEmail } from 'firebase/auth';
@@ -308,84 +309,116 @@ export const AdminDashboard: React.FC = () => {
             let outLoc = '--';
             let statusParts: string[] = [];
 
-            // --- A. Process Records (If any) ---
+            // Parse Records First to get inTime/outTime
+            let inRecord: any = null;
+            let outRecord: any = null;
             if (dayRecords.length > 0) {
-                // Sort by time
                 dayRecords.sort((a,b) => a.time.localeCompare(b.time));
+                inRecord = dayRecords.find(r => r.type === 'in');
+                outRecord = dayRecords.filter(r => r.type === 'out').pop(); // Latest out
                 
-                const inRecord = dayRecords.find(r => r.type === 'in');
-                const outRecord = dayRecords.filter(r => r.type === 'out').pop(); // Latest out
-
                 if (inRecord) {
-                    const timeOnly = TimeService.formatTimeOnly(inRecord.time, true);
-                    inTime = timeOnly;
+                    inTime = TimeService.formatTimeOnly(inRecord.time, true);
                     inLoc = `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`;
-                    
-                    // Logic: Early Clock In (Before 08:00:00)
-                    if (timeOnly <= "08:00:00") statusParts.push("提早打卡");
-
-                    // Logic: Late (after 08:30:00)
-                    if (timeOnly > "08:30:00") statusParts.push("遲到");
-                    
-                    // Logic: Location Abnormal
-                    if (inRecord.status.includes('異常') || inRecord.dist > data.settings.allowedRadius) {
-                        statusParts.push("上班地點異常");
-                    }
                 }
-
                 if (outRecord) {
-                    const timeOnly = TimeService.formatTimeOnly(outRecord.time, true);
-                    outTime = timeOnly;
+                    outTime = TimeService.formatTimeOnly(outRecord.time, true);
                     outLoc = `(${outRecord.lat.toFixed(5)}, ${outRecord.lng.toFixed(5)})`;
-
-                    // Logic: Early Leave (before 17:30:00)
-                    if (timeOnly < "17:30:00") statusParts.push("早退");
-
-                    // Logic: Late Out (after 18:00:00)
-                    if (timeOnly >= "18:00:00") statusParts.push("晚退");
-
-                    // Logic: Location Abnormal
-                    if (outRecord.status.includes('異常') || outRecord.dist > data.settings.allowedRadius) {
-                        statusParts.push("下班地點異常");
-                    }
                 }
-
-                // Check Missing Punches
-                if (inRecord && !outRecord) statusParts.push("缺下班卡");
-                if (!inRecord && outRecord) statusParts.push("缺上班卡");
             }
 
-            // --- B. Process Leaves ---
-            if (userLeaves.length > 0) {
-                userLeaves.forEach(l => {
-                    statusParts.push(`請假(${l.type} ${l.hours}hr)`);
-                });
-            }
-
-            // --- C. Process Holiday / Weekend / Absent ---
-            if (dayRecords.length === 0 && userLeaves.length === 0) {
-                if (isHoliday) {
-                    statusParts.push(`國定假日(${holidayInfo?.note})`);
-                } else if (isWeekend) {
-                    statusParts.push("例假日");
-                } else {
-                    // Check Onboard Date
-                    if (user.onboard_date && dateStr < user.onboard_date) {
-                        statusParts.push("尚未到職");
-                    } else {
-                        statusParts.push("曠職/未打卡");
-                    }
-                }
+            if (isHoliday) {
+                if (dayRecords.length > 0) statusParts.push("假日出勤");
+                else statusParts.push(`國定假日(${holidayInfo?.note})`);
+            } else if (isWeekend) {
+                if (dayRecords.length > 0) statusParts.push("週末加班");
+                else statusParts.push("例假日");
             } else {
-                // If there are records but it's a holiday/weekend
-                if (isHoliday) statusParts.push("假日出勤");
-                if (isWeekend && !isHoliday) statusParts.push("週末加班");
-            }
+                // Normal Day Logic
+                if (user.onboard_date && dateStr < user.onboard_date) {
+                    statusParts.push("尚未到職");
+                } else {
+                    let expectedIn = "08:30:00";
+                    let expectedOut = "17:30:00";
+                    const lunchStart = "12:00:00";
+                    const lunchEnd = "13:30:00";
 
-            // --- D. Final Status Formatting ---
-            // If statusParts is empty but records exist (Normal day, on time, no leave), label as "正常"
-            if (statusParts.length === 0 && dayRecords.length > 0) {
-                statusParts.push("正常");
+                    let dayLeaves = userLeaves.map(l => ({
+                        type: l.type,
+                        hours: l.hours,
+                        start: TimeService.formatTimeOnly(l.start, true),
+                        end: TimeService.formatTimeOnly(l.end, true),
+                    })).sort((a,b) => a.start.localeCompare(b.start));
+
+                    // Adjust expectedIn based on morning leaves
+                    for (const l of dayLeaves) {
+                        if (l.start <= expectedIn && l.end > expectedIn) {
+                            expectedIn = l.end;
+                        }
+                    }
+                    if (expectedIn >= lunchStart && expectedIn < lunchEnd) expectedIn = lunchEnd;
+
+                    // Adjust expectedOut based on afternoon leaves
+                    for (const l of [...dayLeaves].sort((a,b) => b.end.localeCompare(a.end))) {
+                        if (l.end >= expectedOut && l.start < expectedOut) {
+                            expectedOut = l.start;
+                        }
+                    }
+                    if (expectedOut > lunchStart && expectedOut <= lunchEnd) expectedOut = lunchStart;
+
+                    const events: {start: string, text: string}[] = [];
+                    
+                    // 1. Add leaves to events timeline
+                    dayLeaves.forEach(l => {
+                        events.push({
+                            start: l.start,
+                            text: `請假(${l.type} ${l.hours}hr)`
+                        });
+                    });
+
+                    const hasToWork = expectedIn < expectedOut;
+
+                    // 2. Add work tracking to events timeline
+                    if (dayRecords.length > 0) {
+                        let workParts: string[] = [];
+                        if (inRecord) {
+                            if (inTime <= "08:00:00") workParts.push("提早打卡");
+                            if (inTime > expectedIn) workParts.push("遲到");
+                            if (inRecord.status.includes('異常') || inRecord.dist > data.settings.allowedRadius) {
+                                workParts.push("上班地點異常");
+                            }
+                        }
+                        if (outRecord) {
+                            if (outTime < expectedOut) workParts.push("早退");
+                            if (outTime >= "18:00:00") workParts.push("晚退");
+                            if (outRecord.status.includes('異常') || outRecord.dist > data.settings.allowedRadius) {
+                                workParts.push("下班地點異常");
+                            }
+                        }
+
+                        if (inRecord && !outRecord) workParts.push("缺下班卡");
+                        if (!inRecord && outRecord) workParts.push("缺上班卡");
+
+                        if (workParts.length === 0) workParts.push("正常");
+
+                        events.push({
+                            start: inTime !== '--' ? inTime : expectedIn,
+                            text: workParts.join(", ")
+                        });
+                    } else {
+                        // NO RECORDS
+                        if (hasToWork) {
+                            events.push({
+                                start: expectedIn,
+                                text: "曠職/未打卡"
+                            });
+                        }
+                    }
+
+                    // Sort events by time
+                    events.sort((a,b) => a.start.localeCompare(b.start));
+                    events.forEach(e => statusParts.push(e.text));
+                }
             }
 
             const finalStatus = statusParts.join(" / ");
@@ -580,18 +613,18 @@ export const AdminDashboard: React.FC = () => {
     if (isHoliday) {
         if (firstIn) {
             statusTags.push({ label: '休假日加班', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-        } else if (userLeaves.length === 0) { // Only show "Holiday" if not on a specific leave
+        } else {
             statusTags.push({ label: '休假', color: 'text-green-600 bg-green-50 border-green-200' });
         }
-    }
-
-    // 2. Approved Leave Logic
-    userLeaves.forEach(leave => {
-        statusTags.push({ 
-            label: `${leave.type}中`, 
-            color: 'text-indigo-600 bg-indigo-50 border-indigo-200' 
+    } else {
+        // 2. Approved Leave Logic (only on non-holidays)
+        userLeaves.forEach(leave => {
+            statusTags.push({ 
+                label: `${leave.type}中`, 
+                color: 'text-indigo-600 bg-indigo-50 border-indigo-200' 
+            });
         });
-    });
+    }
 
     // 3. Attendance Logic
     if (firstIn) {
@@ -661,7 +694,15 @@ export const AdminDashboard: React.FC = () => {
     
     const s = new Date(editOtForm.start);
     const e = new Date(editOtForm.end);
-    const h = parseFloat(((e.getTime() - s.getTime()) / 3600000).toFixed(1));
+
+    const sameDayOTs = data.overtimes.filter(o => 
+        o.userId === editOtModal.userId && 
+        o.id !== editOtModal.id && // Exclude the one being edited
+        o.status !== 'rejected' && o.status !== 'cancelled' &&
+        o.start.startsWith(editOtForm.start.substring(0, 10).replace('T', ' ')) 
+    ).map(o => ({ start: o.start, end: o.end, hours: o.hours }));
+
+    const h = calculateOTWithDeduction(s, e, sameDayOTs);
 
     try {
         await StorageService.updateOvertime(editOtModal.id, {
@@ -1169,7 +1210,12 @@ export const AdminDashboard: React.FC = () => {
                                     <div className="text-[10px] md:text-xs text-gray-400 mt-1">申請時間: {TimeService.formatDateTime(ot.created_at, true)}</div>
                                  </div>
                               </div>
-                              <button onClick={() => confirmDelete(ot.id, 'ot')} className="text-gray-300 hover:text-red-500 transition-colors p-2"><Trash2 size={18} className="md:w-5 md:h-5"/></button>
+                              <div className="flex flex-col md:flex-row gap-2">
+                                 {ot.status === 'approved' && (
+                                    <button onClick={() => { setEditOtModal(ot); setEditOtForm({ start: ot.start.replace(' ', 'T'), end: ot.end.replace(' ', 'T'), reason: '', hours: ot.hours }); }} className="text-gray-300 hover:text-brand-500 transition-colors p-2" title="修改"><Edit3 size={18} className="md:w-5 md:h-5"/></button>
+                                 )}
+                                 <button onClick={() => confirmDelete(ot.id, 'ot')} className="text-gray-300 hover:text-red-500 transition-colors p-2"><Trash2 size={18} className="md:w-5 md:h-5"/></button>
+                              </div>
                            </div>
                         </div>
                      ))}
@@ -1358,6 +1404,52 @@ export const AdminDashboard: React.FC = () => {
                    </div>
                    <Button type="submit" className="w-full py-5 md:py-6 rounded-[32px] text-lg md:text-xl font-black shadow-2xl bg-brand-600 hover:bg-brand-700">儲存所有設定</Button>
                 </form>
+                
+                <div className="mt-12 pt-12 border-t border-gray-100">
+                   <h4 className="text-xl font-black text-red-600 mb-4 flex items-center gap-2"><AlertTriangle size={24}/> 進階系統操作</h4>
+                   <p className="text-sm text-gray-500 mb-6 font-bold">若您近日修改過加班計算規則，可執行此操作來重新計算所有已核准加班的正確時數。</p>
+                   <Button 
+                      className="w-full bg-red-50 text-red-600 hover:bg-red-100 border-none font-black rounded-[32px] py-4"
+                      onClick={async () => {
+                          if (!confirm("確定要重新計算所有「已核准」的加班時數嗎？這將會耗費大量系統資源。")) return;
+                          try {
+                              const approvedOts = data.overtimes.filter(o => o.status === 'approved');
+                              
+                              const groups = new Map<string, typeof approvedOts>();
+                              for (const ot of approvedOts) {
+                                  const date = ot.start.substring(0, 10);
+                                  const key = `${ot.userId}_${date}`;
+                                  if (!groups.has(key)) groups.set(key, []);
+                                  groups.get(key)!.push(ot);
+                              }
+                          
+                              let fixedCount = 0;
+                              for (const [key, userOts] of groups) {
+                                  userOts.sort((a,b) => new Date(a.start.replace(' ', 'T')).getTime() - new Date(b.start.replace(' ', 'T')).getTime());
+                                  const existing: any[] = [];
+                                  
+                                  for (const ot of userOts) {
+                                      const s = new Date(ot.start.replace(' ', 'T'));
+                                      const e = new Date(ot.end.replace(' ', 'T'));
+                                      const newHours = calculateOTWithDeduction(s, e, [...existing]);
+                                      
+                                      if (newHours !== ot.hours) {
+                                          await StorageService.updateOvertime(ot.id, { hours: newHours });
+                                          fixedCount++;
+                                      }
+                                      existing.push({ start: ot.start, end: ot.end, hours: newHours });
+                                  }
+                              }
+                              showToast(`計算完畢！共修正 ${fixedCount} 筆加班資料`, 'success');
+                              refreshData();
+                          } catch (e: any) {
+                              showToast("修復失敗: " + getErrorMessage(e), 'error');
+                          }
+                      }}
+                   >
+                     重新運算所有已核准加班時數
+                   </Button>
+                </div>
              </div>
           )}
         </main>
