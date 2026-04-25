@@ -218,10 +218,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
            }
         };
 
-        if (res.state === 'granted') {
+        if (res.state === 'granted' || res.state === 'prompt') {
            startWatching(true);
-        } else if (res.state === 'prompt') {
-           setGpsError("點此啟用定位");
         } else {
            setGpsError("定位權限已被拒絕");
         }
@@ -321,11 +319,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   // 2. [Requirement: Force Sync on Punch]
   const initiatePunch = async () => {
     // Basic checks before even starting sync
-    if (permissionState === 'prompt' || gpsError === '點此啟用定位') {
-        setNotification({ type: 'error', message: "請先點擊下方『點此啟用定位』" });
-        return;
-    }
-
     if (!isTimeSynced && dynamicOffset === 0) {
         setNotification({ type: 'error', message: "系統尚未初始化，請稍候..." });
         return;
@@ -746,14 +739,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     'bg-gray-100 text-gray-400'
                 }`}>
                    <MapPin size={20} className={`md:w-6 md:h-6 ${(!isTimeSynced || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
-                   {permissionState === 'prompt' || gpsError === '點此啟用定位' ? (
-                     <button onClick={() => {
-                         navigator.geolocation.getCurrentPosition(() => {}, () => {
-                             setGpsError("定位權限已被拒絕");
-                             setPermissionState('denied');
-                         });
-                     }} className="underline cursor-pointer">點此啟用定位</button>
-                   ) : gpsError ? (
+                   {gpsError ? (
                      <span>{gpsError}</span>
                    ) : !isTimeSynced ? (
                      <span className="animate-pulse">正在校正系統時間...</span>

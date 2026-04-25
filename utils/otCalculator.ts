@@ -76,7 +76,11 @@ export const calculateOTWithDeduction = (
             
             let clusterNet = clusterGross;
             if (clusterGross > 4) { // "連續超過四小時"
-                const deduction = Math.max(0, 1 - clusterRest);
+                let requiredRest = 1; // Default to 1 hour
+                if (clusterGross < 5) {
+                    requiredRest = clusterGross - 4; // Auto deduct excess over 4 as rest
+                }
+                const deduction = Math.max(0, requiredRest - clusterRest);
                 clusterNet -= deduction;
             }
             totalNet += clusterNet;
