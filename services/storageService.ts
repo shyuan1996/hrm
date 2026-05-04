@@ -351,6 +351,25 @@ export const StorageService = {
     try {
         const q = query(collection(db, 'leaves'), where('id', '==', id));
         const snapshot = await getDocs(q);
+        
+        if (status === 'approved' && snapshot.docs.length > 0) {
+            const leaveDoc = snapshot.docs[0];
+            const leaveData = leaveDoc.data() as LeaveRequest;
+            if (leaveData.status !== 'approved' && ['特休', '補休', '生日假'].includes(leaveData.type)) {
+                const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
+                const userSnapshot = await getDocs(userQ);
+                if (userSnapshot.docs.length > 0) {
+                    const userDoc = userSnapshot.docs[0];
+                    const userData = userDoc.data() as User;
+                    let updateData: any = {};
+                    if (leaveData.type === '特休') updateData.quota_annual = Math.max(0, (userData.quota_annual || 0) - leaveData.hours);
+                    else if (leaveData.type === '補休') updateData.quota_comp = Math.max(0, (userData.quota_comp || 0) - leaveData.hours);
+                    else if (leaveData.type === '生日假') updateData.quota_birthday = Math.max(0, (userData.quota_birthday || 0) - leaveData.hours);
+                    if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
+                }
+            }
+        }
+
         const promises = snapshot.docs.map(d => 
             updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null })
         );
@@ -370,6 +389,24 @@ export const StorageService = {
 
     const q = query(collection(db, 'leaves'), ...constraints);
     const snapshot = await getDocs(q);
+    
+    if (snapshot.docs.length > 0) {
+        const leaveData = snapshot.docs[0].data() as LeaveRequest;
+        if (leaveData.status === 'approved' && ['特休', '補休', '生日假'].includes(leaveData.type)) {
+             const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
+             const userSnapshot = await getDocs(userQ);
+             if (userSnapshot.docs.length > 0) {
+                 const userDoc = userSnapshot.docs[0];
+                 const userData = userDoc.data() as User;
+                 let updateData: any = {};
+                 if (leaveData.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + leaveData.hours;
+                 else if (leaveData.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + leaveData.hours;
+                 else if (leaveData.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + leaveData.hours;
+                 if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
+             }
+        }
+    }
+
     const promises = snapshot.docs.map(d => 
         updateDoc(doc(db, 'leaves', d.id), { status: 'cancelled' })
     );
@@ -384,11 +421,23 @@ export const StorageService = {
         const q = query(collection(db, 'leaves'), ...constraints);
         const snapshot = await getDocs(q);
         
-        // Use map to create an array of promises for deleting both files and documents
         const deleteOperations = snapshot.docs.map(async (docSnap) => {
-            const data = docSnap.data();
+            const data = docSnap.data() as LeaveRequest;
             
-            // 1. Cascading Delete: Remove attachments from Storage first
+            if (data.status === 'approved' && ['特休', '補休', '生日假'].includes(data.type)) {
+                 const userQ = query(collection(db, 'users'), where('id', '==', data.userId));
+                 const userSnapshot = await getDocs(userQ);
+                 if (userSnapshot.docs.length > 0) {
+                     const userDoc = userSnapshot.docs[0];
+                     const userData = userDoc.data() as User;
+                     let updateData: any = {};
+                     if (data.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + data.hours;
+                     else if (data.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + data.hours;
+                     else if (data.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + data.hours;
+                     if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
+                 }
+            }
+
             if (data.attachments && Array.isArray(data.attachments)) {
                 const attachmentDeletions = data.attachments.map((att: LeaveAttachment) => {
                     if (att.path && storage) {

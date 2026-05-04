@@ -258,7 +258,7 @@ export const AdminDashboard: React.FC = () => {
   const handleExportAllAttendance = () => {
     if (!attExportStart || !attExportEnd) return showToast("請選擇匯出日期區間", "error");
 
-    // 1. Generate all dates in range
+    // 1. Generate all dates in range for Attendance
     const dateArray: string[] = [];
     let currentDate = new Date(attExportStart);
     const endDate = new Date(attExportEnd);
@@ -275,8 +275,10 @@ export const AdminDashboard: React.FC = () => {
         currentDate.setDate(currentDate.getDate() + 1);
     }
 
-    // 2. CSV Header (Updated with detailed status)
-    let csv = "\uFEFF日期,員工帳號,員工姓名,部門,上班時間,下班時間,上班座標,下班座標,狀態\n";
+    // --- Prepare Attendance Sheet Data ---
+    const attendanceData: any[][] = [
+        ["日期", "員工帳號", "員工姓名", "部門", "上班時間", "下班時間", "上班時間內下班", "上班時間內上班", "上班座標", "下班座標", "狀態"]
+    ];
 
     // 3. Iterate Users and Dates
     data.users.forEach(user => {
@@ -305,6 +307,8 @@ export const AdminDashboard: React.FC = () => {
 
             let inTime = '--';
             let outTime = '--';
+            let midInTime = '--';
+            let midOutTime = '--';
             let inLoc = '--';
             let outLoc = '--';
             let statusParts: string[] = [];
@@ -314,9 +318,23 @@ export const AdminDashboard: React.FC = () => {
             let outRecord: any = null;
             if (dayRecords.length > 0) {
                 dayRecords.sort((a,b) => a.time.localeCompare(b.time));
-                inRecord = dayRecords.find(r => r.type === 'in');
-                outRecord = dayRecords.filter(r => r.type === 'out').pop(); // Latest out
                 
+                const firstInIdx = dayRecords.findIndex(r => r.type === 'in');
+                const validRecords = firstInIdx !== -1 ? dayRecords.slice(firstInIdx) : [];
+
+                const inRecords = validRecords.filter(r => r.type === 'in');
+                const outRecords = validRecords.filter(r => r.type === 'out');
+
+                inRecord = inRecords[0] || null;
+                outRecord = outRecords.length > 0 ? outRecords[outRecords.length - 1] : null; // Latest out
+                
+                if (inRecords.length > 1) {
+                    midInTime = inRecords.slice(1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+                }
+                if (outRecords.length > 1) {
+                    midOutTime = outRecords.slice(0, outRecords.length - 1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+                }
+
                 if (inRecord) {
                     inTime = TimeService.formatTimeOnly(inRecord.time, true);
                     inLoc = `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`;
@@ -377,13 +395,16 @@ export const AdminDashboard: React.FC = () => {
                     });
 
                     const hasToWork = expectedIn < expectedOut;
+                    
+                    // Lateness threshold is 08:32 => anything > 08:32:00 is late
+                    const expectedInThreshold = expectedIn === "08:30:00" ? "08:32:00" : expectedIn;
 
                     // 2. Add work tracking to events timeline
                     if (dayRecords.length > 0) {
                         let workParts: string[] = [];
                         if (inRecord) {
                             if (inTime <= "08:00:00") workParts.push("提早打卡");
-                            if (inTime > expectedIn) workParts.push("遲到");
+                            if (inTime > expectedInThreshold) workParts.push("遲到");
                             if (inRecord.status.includes('異常') || inRecord.dist > data.settings.allowedRadius) {
                                 workParts.push("上班地點異常");
                             }
@@ -423,19 +444,76 @@ export const AdminDashboard: React.FC = () => {
 
             const finalStatus = statusParts.join(" / ");
 
-            // Append Row
-            // Wrap coordinates in quotes to handle comma
-            csv += `${dateStr},${user.id},${user.name},${user.dept},${inTime},${outTime},"${inLoc}","${outLoc}",${finalStatus}\n`;
+            // Append Row For Attendance
+            attendanceData.push([
+                dateStr, user.id, user.name, user.dept, inTime, outTime, midOutTime, midInTime, inLoc, outLoc, finalStatus
+            ]);
         });
     });
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `完整考勤紀錄_${attExportStart}_${attExportEnd}.csv`;
-    link.click();
-    setIsExportAttendanceModalOpen(false);
-    showToast("匯出成功", 'success');
+    const getStatusText = (s: string) => {
+        if (s === 'pending') return '審核中';
+        if (s === 'approved') return '已核准';
+        if (s === 'rejected') return '已退回';
+        if (s === 'cancelled') return '已取消';
+        return s;
+    };
+
+    // --- Prepare Leave Sheet Data ---
+    const leaveData: any[][] = [
+        ["員工帳號", "員工姓名", "假別", "開始時間", "結束時間", "時數", "狀態", "申請原因"]
+    ];
+    data.leaves.filter(i => {
+        if (!i.start || !i.end) return false;
+        const itemStartDay = i.start.replace('T', ' ').split(' ')[0];
+        const itemEndDay = i.end.replace('T', ' ').split(' ')[0];
+        return itemStartDay <= attExportEnd && itemEndDay >= attExportStart;
+    }).forEach(i => {
+        const startStr = TimeService.formatDateTime(i.start, true);
+        const endStr = TimeService.formatDateTime(i.end, true);
+        leaveData.push([
+            i.userId, i.userName, i.type, startStr, endStr, i.hours, getStatusText(i.status), i.reason || ''
+        ]);
+    });
+
+    // --- Prepare Overtime Sheet Data ---
+    const otData: any[][] = [
+        ["員工帳號", "員工姓名", "類型", "開始時間", "結束時間", "時數", "狀態", "申請原因"]
+    ];
+    data.overtimes.filter(i => {
+        if (!i.start || !i.end) return false;
+        const itemStartDay = i.start.replace('T', ' ').split(' ')[0];
+        const itemEndDay = i.end.replace('T', ' ').split(' ')[0];
+        return itemStartDay <= attExportEnd && itemEndDay >= attExportStart;
+    }).forEach(i => {
+        const startStr = TimeService.formatDateTime(i.start, true);
+        const endStr = TimeService.formatDateTime(i.end, true);
+        otData.push([
+            i.userId, i.userName, "加班", startStr, endStr, i.hours, getStatusText(i.status), i.reason || ''
+        ]);
+    });
+
+    // --- Create and Download Excel File ---
+    import('xlsx').then(XLSX => {
+        const wb = XLSX.utils.book_new();
+        
+        const wsAttendance = XLSX.utils.aoa_to_sheet(attendanceData);
+        XLSX.utils.book_append_sheet(wb, wsAttendance, "出勤");
+        
+        const wsLeave = XLSX.utils.aoa_to_sheet(leaveData);
+        XLSX.utils.book_append_sheet(wb, wsLeave, "請假");
+        
+        const wsOT = XLSX.utils.aoa_to_sheet(otData);
+        XLSX.utils.book_append_sheet(wb, wsOT, "加班");
+        
+        XLSX.writeFile(wb, `考勤紀錄_${attExportStart}_${attExportEnd}.xlsx`);
+        
+        setIsExportAttendanceModalOpen(false);
+        showToast("匯出成功", 'success');
+    }).catch(err => {
+        console.error('Failed to load xlsx for export:', err);
+        showToast("匯出失敗：缺少匯出套件", 'error');
+    });
   };
 
   const handleEditUser = async () => {
@@ -604,8 +682,25 @@ export const AdminDashboard: React.FC = () => {
     const dayOfWeek = targetDate.getDay();
     const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === targetDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
 
-    const firstIn = userRecords.filter(r => r.type === 'in').sort((a,b) => a.time.localeCompare(b.time))[0];
-    const lastOut = userRecords.filter(r => r.type === 'out').sort((a,b) => b.time.localeCompare(a.time))[0];
+    userRecords.sort((a,b) => a.time.localeCompare(b.time));
+    const firstInIdx = userRecords.findIndex(r => r.type === 'in');
+    const validRecords = firstInIdx !== -1 ? userRecords.slice(firstInIdx) : [];
+
+    const sortedIn = validRecords.filter(r => r.type === 'in');
+    const sortedOut = validRecords.filter(r => r.type === 'out');
+
+    const firstIn = sortedIn[0];
+    const lastOut = sortedOut[sortedOut.length - 1];
+
+    let midInDisplay = '';
+    let midOutDisplay = '';
+
+    if (sortedIn.length > 1) {
+        midInDisplay = sortedIn.slice(1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+    }
+    if (sortedOut.length > 1) {
+        midOutDisplay = sortedOut.slice(0, sortedOut.length - 1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+    }
 
     const statusTags: { label: string, color: string }[] = [];
 
@@ -632,7 +727,7 @@ export const AdminDashboard: React.FC = () => {
         
         if (!isHoliday && userLeaves.length === 0) {
             statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
-            if (inTimeStr > '08:30') {
+            if (inTimeStr > '08:32') {
                 statusTags.push({ label: '遲到', color: 'text-red-600 bg-red-50 border-red-200' });
             }
         }
@@ -663,7 +758,7 @@ export const AdminDashboard: React.FC = () => {
              const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
              const isPast = targetDateStr < TimeService.getTaiwanDate(new Date());
 
-             if (isPast || (isToday && nowSimple > '08:30')) {
+             if (isPast || (isToday && nowSimple > '08:32')) {
                  statusTags.push({ label: '未到班/曠職', color: 'text-red-600 bg-red-50 border-red-200' });
              } else {
                  statusTags.push({ label: '未打卡', color: 'text-gray-400 bg-gray-50 border-gray-200' });
@@ -683,6 +778,8 @@ export const AdminDashboard: React.FC = () => {
       tags: statusTags, 
       inTime: inDisplay, 
       outTime: outDisplay,
+      midIn: midInDisplay,
+      midOut: midOutDisplay,
       inLoc,
       outLoc
     };
@@ -860,7 +957,7 @@ export const AdminDashboard: React.FC = () => {
                  <div className="overflow-x-auto">
                    <table className="w-full text-left min-w-[800px]">
                       <thead className="bg-gray-50 text-xs font-black uppercase text-gray-400">
-                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班打卡</th><th className="p-4 md:p-6">下班打卡</th><th className="p-4 md:p-6">狀態</th><th className="p-4 md:p-6 text-right">操作</th></tr>
+                         <tr><th className="p-4 md:p-6">帳號</th><th className="p-4 md:p-6">姓名</th><th className="p-4 md:p-6">部門</th><th className="p-4 md:p-6">上班打卡</th><th className="p-4 md:p-6">下班打卡</th><th className="p-4 md:p-6">中途打卡</th><th className="p-4 md:p-6">狀態</th><th className="p-4 md:p-6 text-right">操作</th></tr>
                       </thead>
                       <tbody className="divide-y text-black font-bold text-sm">
                          {data.users.filter(u => u.role !== 'admin' && (showArchived ? u.deleted : !u.deleted)).map(u => {
@@ -897,6 +994,11 @@ export const AdminDashboard: React.FC = () => {
                                  <td className="p-4 md:p-6">
                                     <div className="font-mono text-xs font-black text-gray-800">{status.outTime}</div>
                                     {renderLocInfo(status.outLoc)}
+                                 </td>
+                                 <td className="p-4 md:p-6 text-xs text-gray-500 font-mono font-black space-y-1">
+                                    {status.midOut && <div className="text-orange-600"><span className="text-gray-400 mr-1">中下</span>{status.midOut}</div>}
+                                    {status.midIn && <div className="text-blue-600"><span className="text-gray-400 mr-1">中上</span>{status.midIn}</div>}
+                                    {(!status.midOut && !status.midIn) && <span>--</span>}
                                  </td>
                                  <td className={`p-4 md:p-6`}>
                                    <div className="flex flex-wrap gap-2">
@@ -1506,20 +1608,6 @@ export const AdminDashboard: React.FC = () => {
                     <div className="flex justify-between items-center px-1">
                         <h4 className="text-xs md:text-sm font-black text-gray-500">已核准之請假紀錄 (最近5筆)</h4>
                         <button onClick={() => handleExportSingleUser(targetUser.id)} className="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-lg hover:bg-green-200 transition-all font-black flex items-center gap-1"><Download size={12}/> 匯出</button>
-                    </div>
-                    
-                    <div className="grid grid-cols-3 gap-2">
-                        {['特休', '補休', '生日假'].map(type => {
-                            const used = data.leaves
-                                .filter(l => l.userId === targetUser.id && l.type === type && l.status === 'approved')
-                                .reduce((acc, curr) => acc + curr.hours, 0);
-                            return (
-                                <div key={type} className="bg-white border rounded-xl p-2 text-center shadow-sm">
-                                    <div className="text-[10px] text-gray-400">{type}已用</div>
-                                    <div className="text-sm font-black text-brand-600">{used}hr</div>
-                                </div>
-                            );
-                        })}
                     </div>
 
                     <div className="bg-gray-50 border rounded-2xl p-2 h-40 md:h-60 overflow-y-auto custom-scroll text-xs space-y-1">

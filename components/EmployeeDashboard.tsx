@@ -110,6 +110,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [permissionState, setPermissionState] = useState<PermissionState | 'unknown'>('unknown');
   const watchIdRef = useRef<number | null>(null);
 
+  const handlePunchFilterChange = (setter: React.Dispatch<React.SetStateAction<string>>, val: string) => {
+      if (val && val < minPunchHistoryDate) {
+          setNotification({ type: 'error', message: `最早只能查詢 ${minPunchHistoryDate} 以後的紀錄` });
+          setter(minPunchHistoryDate);
+      } else if (val && val > maxPunchHistoryDate) {
+          setter(maxPunchHistoryDate);
+      } else {
+          setter(val);
+      }
+  };
+
   // Auto-hide notification
   useEffect(() => {
     if (notification) {
@@ -140,6 +151,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     }
     return opts;
   }, []);
+
+  const maxPunchHistoryDate = TimeService.getTaiwanDate(now);
+  const minPunchHistoryDate = useMemo(() => {
+     const maxDate = TimeService.getTaiwanDate(now);
+     const d = new Date(maxDate.replace(/-/g, '/')); // safe parsing
+     d.setMonth(d.getMonth() - 3);
+     return TimeService.getTaiwanDate(d);
+  }, [TimeService.getTaiwanDate(now)]);
 
   // Update dynamic offset if parent provides a new one (initial load)
   useEffect(() => {
@@ -179,6 +198,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
       const successHandler = (pos: GeolocationPosition) => {
         setGpsError('');
+        setPermissionState('granted');
         if (settings.companyLat && settings.companyLng) {
           setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
         } else {
@@ -188,55 +208,45 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
       const errorHandler = (err: GeolocationPositionError) => {
          console.warn(`Location error (HighAccuracy: ${enableHighAccuracy}):`, err);
+         
+         if (err.code === 1) { // PERMISSION_DENIED
+             setGpsError("定位權限已被拒絕");
+             setPermissionState('denied');
+             setDistance(null);
+             return; // Crucial: Do not retry if explicitly denied
+         }
+         
          if (enableHighAccuracy) {
              console.log("Attempting fallback to low accuracy mode...");
              startWatching(false); 
          } else {
-             setGpsError("無法獲取位置資訊 (請檢查系統權限)");
+             setGpsError("無法獲取位置資訊 (請檢查定位權限)");
              setDistance(null);
          }
       };
 
+      // Set a very long timeout for the first high accuracy prompt to let the user think
       watchIdRef.current = navigator.geolocation.watchPosition(
         successHandler,
         errorHandler,
         { 
             enableHighAccuracy: enableHighAccuracy, 
-            timeout: enableHighAccuracy ? 15000 : 30000, 
+            timeout: enableHighAccuracy ? 60000 : 30000, 
             maximumAge: 10000 
         }
       );
     };
 
-    if (navigator.permissions && navigator.permissions.query) {
-      navigator.permissions.query({ name: 'geolocation' }).then((res) => {
-        setPermissionState(res.state);
-        res.onchange = () => {
-           setPermissionState(res.state);
-           if (res.state === 'granted') {
-               startWatching(true);
-           }
-        };
-
-        if (res.state === 'granted' || res.state === 'prompt') {
-           startWatching(true);
-        } else {
-           setGpsError("定位權限已被拒絕");
-        }
-      }).catch((e) => {
-         // Fallback
-         startWatching(true);
-      });
-    } else {
-      startWatching(true);
-    }
+    // We do not use navigator.permissions because of iOS Safari bugs.
+    // Instead we just normally start watching.
+    startWatching(true);
 
     return () => {
       if (watchIdRef.current !== null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
       }
     };
-  }, [settings]);
+  }, [settings.companyLat, settings.companyLng]);
 
   // Data Sync and Time Ticker
   useEffect(() => {
@@ -259,10 +269,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   // Derive state from localData whenever it changes
   useEffect(() => {
-      const userRecords = localData.records.filter(r => r.userId === user.id).sort((a, b) => b.id - a.id);
+      const userRecords = localData.records
+        .filter(r => r.userId === user.id && r.date >= minPunchHistoryDate)
+        .sort((a, b) => b.id - a.id);
       setRecords(userRecords);
       setHolidays(localData.holidays);
-  }, [localData, user.id]);
+  }, [localData, user.id, minPunchHistoryDate]);
 
   useEffect(() => {
     let timer: any;
@@ -502,19 +514,21 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const recentOT = allOvertime.length > 0 ? allOvertime[0] : null;
 
   const quotaStats = useMemo(() => {
-    const calculateUsed = (type: string) => 
+    // Only pending leaves count against the UI remaining calculation now,
+    // because approved leaves have already been deducted from user.quota.
+    const calculatePendingUsed = (type: string) => 
         allLeaves
-        .filter(l => l.type === type && (l.status === 'approved' || l.status === 'pending'))
+        .filter(l => l.type === type && l.status === 'pending')
         .reduce((acc, curr) => acc + curr.hours, 0);
 
-    const usedAnnual = calculateUsed('特休');
-    const usedBirthday = calculateUsed('生日假');
-    const usedComp = calculateUsed('補休');
+    const pendingAnnual = calculatePendingUsed('特休');
+    const pendingBirthday = calculatePendingUsed('生日假');
+    const pendingComp = calculatePendingUsed('補休');
 
     return {
-        annual: { total: user.quota_annual || 0, used: usedAnnual, remaining: (user.quota_annual || 0) - usedAnnual },
-        birthday: { total: user.quota_birthday || 0, used: usedBirthday, remaining: (user.quota_birthday || 0) - usedBirthday },
-        comp: { total: user.quota_comp || 0, used: usedComp, remaining: (user.quota_comp || 0) - usedComp },
+        annual: Math.max(0, (user.quota_annual || 0) - pendingAnnual),
+        birthday: Math.max(0, (user.quota_birthday || 0) - pendingBirthday),
+        comp: Math.max(0, (user.quota_comp || 0) - pendingComp),
     };
   }, [allLeaves, user]);
 
@@ -527,9 +541,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const quotaCheck = useMemo(() => {
       let limit = Infinity;
       let label = '';
-      if (leaveForm.type === '特休') { limit = quotaStats.annual.remaining; label = '特休'; }
-      if (leaveForm.type === '生日假') { limit = quotaStats.birthday.remaining; label = '生日假'; }
-      if (leaveForm.type === '補休') { limit = quotaStats.comp.remaining; label = '補休'; }
+      if (leaveForm.type === '特休') { limit = quotaStats.annual; label = '特休'; }
+      if (leaveForm.type === '生日假') { limit = quotaStats.birthday; label = '生日假'; }
+      if (leaveForm.type === '補休') { limit = quotaStats.comp; label = '補休'; }
 
       if (limit !== Infinity && calculatedHours > limit) {
           return { valid: false, msg: `${label}額度不足 (剩餘: ${limit}hr)` };
@@ -793,16 +807,16 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                      
                      <div className="mb-6 grid grid-cols-3 gap-2 md:gap-3">
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-blue-100 shadow-sm flex flex-col items-center text-center">
-                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">特休假</div>
-                            <div className="text-sm md:text-xl font-black text-blue-600">{quotaStats.annual.remaining} <span className="text-[10px] md:text-xs text-gray-400">/ {quotaStats.annual.total} hr</span></div>
+                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">特休假剩餘</div>
+                            <div className="text-sm md:text-xl font-black text-blue-600">{quotaStats.annual} <span className="text-[10px] md:text-xs text-gray-400">小時</span></div>
                         </div>
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-pink-100 shadow-sm flex flex-col items-center text-center">
-                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">生日假</div>
-                            <div className="text-sm md:text-xl font-black text-pink-500">{quotaStats.birthday.remaining} <span className="text-[10px] md:text-xs text-gray-400">/ {quotaStats.birthday.total} hr</span></div>
+                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">生日假剩餘</div>
+                            <div className="text-sm md:text-xl font-black text-pink-500">{quotaStats.birthday} <span className="text-[10px] md:text-xs text-gray-400">小時</span></div>
                         </div>
                         <div className="bg-white p-2 md:p-4 rounded-xl md:rounded-2xl border-2 border-purple-100 shadow-sm flex flex-col items-center text-center">
-                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">補休假</div>
-                            <div className="text-sm md:text-xl font-black text-purple-600">{quotaStats.comp.remaining} <span className="text-[10px] md:text-xs text-gray-400">/ {quotaStats.comp.total} hr</span></div>
+                            <div className="text-[10px] md:text-xs font-black text-gray-400 mb-1">補休假剩餘</div>
+                            <div className="text-sm md:text-xl font-black text-purple-600">{quotaStats.comp} <span className="text-[10px] md:text-xs text-gray-400">小時</span></div>
                         </div>
                      </div>
 
@@ -1184,9 +1198,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="mb-4 bg-gray-50 p-4 rounded-2xl space-y-3">
                  <div className="flex items-center gap-2 text-xs text-gray-500 mb-1"><Filter size={12}/> 篩選條件 (可查三個月內)</div>
                  <div className="flex gap-2">
-                    <input type="date" value={punchFilterStart} onChange={e=>setPunchFilterStart(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="開始" />
+                    <input type="date" min={minPunchHistoryDate} max={maxPunchHistoryDate} value={punchFilterStart} onChange={e=>handlePunchFilterChange(setPunchFilterStart, e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="開始" />
                     <span className="self-center text-gray-300">~</span>
-                    <input type="date" value={punchFilterEnd} onChange={e=>setPunchFilterEnd(e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="結束" />
+                    <input type="date" min={minPunchHistoryDate} max={maxPunchHistoryDate} value={punchFilterEnd} onChange={e=>handlePunchFilterChange(setPunchFilterEnd, e.target.value)} className="w-full p-2 rounded-lg text-xs border border-gray-200 outline-none font-black bg-white text-black [color-scheme:light]" placeholder="結束" />
                  </div>
                  <div className="flex justify-end">
                      <button onClick={()=>{setPunchFilterStart(''); setPunchFilterEnd('');}} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded-lg text-gray-600 flex items-center gap-1"><RotateCcw size={10}/> 清除篩選</button>
