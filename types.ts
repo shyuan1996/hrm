@@ -16,6 +16,24 @@ export interface User {
   quota_annual: number;
   quota_birthday: number;
   quota_comp: number;
+  quotas?: QuotaBucket[];
+}
+
+export interface QuotaBucket {
+  id: string; // Uniquely identifies this bucket (uuid/timestamp)
+  type: string; // '特休' | '補休' | '生日假'
+  originalHours: number;
+  remainingHours: number;
+  addedDate: string; // YYYY-MM-DD
+  expireDate: string; // YYYY-MM-DD
+  note?: string; 
+}
+
+export interface LeaveChangeHistory {
+  date: string;
+  adminName: string;
+  oldType: string;
+  newType: string;
 }
 
 export interface AttendanceRecord {
@@ -53,6 +71,8 @@ export interface LeaveRequest {
   rejectReason?: string;
   created_at: string;
   attachments?: LeaveAttachment[]; // New field for file uploads
+  usedBuckets?: { bucketId: string, hours: number }[];
+  changeHistory?: LeaveChangeHistory[];
 }
 
 export interface OvertimeRequest {

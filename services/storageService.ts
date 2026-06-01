@@ -362,10 +362,43 @@ export const StorageService = {
                     const userDoc = userSnapshot.docs[0];
                     const userData = userDoc.data() as User;
                     let updateData: any = {};
+                    
+                    // Legacy update just in case
                     if (leaveData.type === '特休') updateData.quota_annual = Math.max(0, (userData.quota_annual || 0) - leaveData.hours);
                     else if (leaveData.type === '補休') updateData.quota_comp = Math.max(0, (userData.quota_comp || 0) - leaveData.hours);
                     else if (leaveData.type === '生日假') updateData.quota_birthday = Math.max(0, (userData.quota_birthday || 0) - leaveData.hours);
+                    
+                    // Bucket deduplication
+                    let usedBuckets = leaveData.usedBuckets || [];
+                    if ((userData.quotas || []).length > 0) {
+                        try {
+                            const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
+                            let remaining = leaveData.hours;
+                            usedBuckets = [];
+                            const today = TimeService.getTaiwanDate(new Date());
+                            const validBuckets = newQuotas
+                                .filter(q => q.type === leaveData.type && q.expireDate >= today && q.remainingHours > 0)
+                                .sort((a,b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
+
+                            for (const b of validBuckets) {
+                                if (remaining <= 0) break;
+                                const deductAmt = Math.min(b.remainingHours, remaining);
+                                b.remainingHours -= deductAmt;
+                                remaining -= deductAmt;
+                                usedBuckets.push({ bucketId: b.id, hours: deductAmt });
+                            }
+                            // Store updated quotas back
+                            updateData.quotas = newQuotas;
+                        } catch(e) {
+                            console.error("Bucket deduction failed", e);
+                        }
+                    }
+
                     if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
+                    
+                    // Also save usedBuckets to leave
+                    await updateDoc(doc(db, 'leaves', leaveDoc.id), { status, rejectReason: rejectReason || null, usedBuckets });
+                    return; // Skip the generic update
                 }
             }
         }
@@ -380,6 +413,115 @@ export const StorageService = {
         }
         throw e;
     }
+  },
+
+  updateApprovedLeaveType: async (leaveId: number, adminName: string, newType: string) => {
+    const q = query(collection(db, 'leaves'), where('id', '==', leaveId));
+    const snapshot = await getDocs(q);
+    if (snapshot.docs.length === 0) throw new Error("Leave not found");
+    const leaveDoc = snapshot.docs[0];
+    const leaveData = leaveDoc.data() as LeaveRequest;
+
+    if (leaveData.status !== 'approved' && leaveData.status !== 'pending') {
+        throw new Error("只有待審核或已核准的假單可以修改");
+    }
+    if (leaveData.type === newType) return; // No change
+
+    const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
+    const userSnapshot = await getDocs(userQ);
+    if (userSnapshot.docs.length === 0) throw new Error("User not found");
+    const userDoc = userSnapshot.docs[0];
+    const userData = userDoc.data() as User;
+
+    const oldType = leaveData.type;
+    const hours = leaveData.hours;
+
+    let newBucketsToDeduct: {bucketId: string, hours: number}[] = [];
+    const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
+
+    if (leaveData.status === 'approved') {
+        // 1. Check if the user has enough of the NEW type
+        let hasEnough = false;
+
+        if (newQuotas.length > 0) {
+            let remaining = hours;
+            const today = TimeService.getTaiwanDate(new Date());
+            const validBuckets = newQuotas
+                .filter(q => q.type === newType && q.expireDate >= today && q.remainingHours > 0)
+                .sort((a,b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
+
+            for (const b of validBuckets) {
+                if (remaining <= 0) break;
+                const deductAmt = Math.min(b.remainingHours, remaining);
+                b.remainingHours -= deductAmt;
+                remaining -= deductAmt;
+                newBucketsToDeduct.push({ bucketId: b.id, hours: deductAmt });
+            }
+            if (remaining <= 0) hasEnough = true;
+        }
+
+        if (!hasEnough) {
+            // Check legacy quota fallback
+            let legacyRemaining = 0;
+            if (newType === '特休') legacyRemaining = userData.quota_annual || 0;
+            else if (newType === '補休') legacyRemaining = userData.quota_comp || 0;
+            else if (newType === '生日假') legacyRemaining = userData.quota_birthday || 0;
+
+            // Optional: for non-special types, we don't strictly require 'enough' check here, but assuming it's special.
+            const isSpecial = ['特休', '補休', '生日假'].includes(newType);
+            if (!isSpecial || legacyRemaining >= hours) hasEnough = true;
+        }
+
+        if (!hasEnough) throw new Error(`User does not have enough hours for ${newType}`);
+
+        // ----- Apply changes -----
+        let updateData: any = {};
+        
+        // 2. Refund old buckets
+        if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0) {
+            for (const ub of leaveData.usedBuckets) {
+                const b = newQuotas.find(q => q.id === ub.bucketId);
+                if (b) {
+                    b.remainingHours += ub.hours;
+                    if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
+                }
+            }
+        }
+        
+        // 3. Refund old legacy
+        if (oldType === '特休') updateData.quota_annual = (userData.quota_annual || 0) + hours;
+        else if (oldType === '補休') updateData.quota_comp = (userData.quota_comp || 0) + hours;
+        else if (oldType === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + hours;
+
+        // 4. Deduct new legacy
+        if (newType === '特休') updateData.quota_annual = Math.max(0, (updateData.quota_annual !== undefined ? updateData.quota_annual : (userData.quota_annual || 0)) - hours);
+        else if (newType === '補休') updateData.quota_comp = Math.max(0, (updateData.quota_comp !== undefined ? updateData.quota_comp : (userData.quota_comp || 0)) - hours);
+        else if (newType === '生日假') updateData.quota_birthday = Math.max(0, (updateData.quota_birthday !== undefined ? updateData.quota_birthday : (userData.quota_birthday || 0)) - hours);
+
+        updateData.quotas = newQuotas;
+
+        await updateDoc(doc(db, 'users', userDoc.id), updateData);
+    }
+
+    const changeEntry: LeaveChangeHistory = {
+        date: TimeService.getTaiwanDate(new Date()) + ' ' + TimeService.getTaiwanTime(new Date()),
+        adminName,
+        oldType,
+        newType
+    };
+    
+    const newChangeHistory = [...(leaveData.changeHistory || []), changeEntry];
+
+    let leaveUpdateData: any = {
+        type: newType,
+        changeHistory: newChangeHistory
+    };
+
+    if (leaveData.status === 'approved') {
+        leaveUpdateData.usedBuckets = newBucketsToDeduct;
+    }
+
+    await updateDoc(doc(db, 'leaves', leaveDoc.id), leaveUpdateData);
   },
 
   // Cancel/Delete operations now support userId for restrictive filtering
@@ -399,9 +541,25 @@ export const StorageService = {
                  const userDoc = userSnapshot.docs[0];
                  const userData = userDoc.data() as User;
                  let updateData: any = {};
+                 
+                 // Legacy refund
                  if (leaveData.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + leaveData.hours;
                  else if (leaveData.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + leaveData.hours;
                  else if (leaveData.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + leaveData.hours;
+                 
+                 // Bucket refund
+                 if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0 && userData.quotas) {
+                     const newQuotas = JSON.parse(JSON.stringify(userData.quotas)) as QuotaBucket[];
+                     for (const ub of leaveData.usedBuckets) {
+                         const b = newQuotas.find(q => q.id === ub.bucketId);
+                         if (b) {
+                             b.remainingHours += ub.hours;
+                             if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
+                         }
+                     }
+                     updateData.quotas = newQuotas;
+                 }
+
                  if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
              }
         }
@@ -431,9 +589,25 @@ export const StorageService = {
                      const userDoc = userSnapshot.docs[0];
                      const userData = userDoc.data() as User;
                      let updateData: any = {};
+                     
+                     // Legacy
                      if (data.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + data.hours;
                      else if (data.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + data.hours;
                      else if (data.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + data.hours;
+                     
+                     // Bucket refund
+                     if (data.usedBuckets && data.usedBuckets.length > 0 && userData.quotas) {
+                         const newQuotas = JSON.parse(JSON.stringify(userData.quotas)) as QuotaBucket[];
+                         for (const ub of data.usedBuckets) {
+                             const b = newQuotas.find(q => q.id === ub.bucketId);
+                             if (b) {
+                                 b.remainingHours += ub.hours;
+                                 if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
+                             }
+                         }
+                         updateData.quotas = newQuotas;
+                     }
+
                      if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
                  }
             }

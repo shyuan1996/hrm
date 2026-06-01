@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { User, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
@@ -10,7 +10,7 @@ import { sendPasswordResetEmail } from 'firebase/auth';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter, Paperclip, X
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter, Paperclip, X, Plus
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -46,6 +46,26 @@ export const AdminDashboard: React.FC = () => {
     quotaBirthday: 0,
     quotaComp: 0
   });
+
+  const [changeLeaveTypeModal, setChangeLeaveTypeModal] = useState<{leave: LeaveRequest} | null>(null);
+  const [newLeaveType, setNewLeaveType] = useState('特休');
+
+  const handleChangeLeaveType = async () => {
+       if(!changeLeaveTypeModal) return;
+       const leave = changeLeaveTypeModal.leave;
+       if(leave.type === newLeaveType) {
+           showToast("未更改假別", "error");
+           return;
+       }
+       if(!newLeaveType) return;
+       
+       const n1 = Math.floor(Math.random() * 9) + 1;
+       const n2 = Math.floor(Math.random() * 9) + 1;
+       const ans = n1 + n2;
+       const opts = [ans, ans + 1, ans - 1].sort(() => Math.random() - 0.5);
+       setMathChallenge({ q: `${n1} + ${n2} = ?`, a: ans, opts });
+       setDeleteTarget({ id: leave.id, type: 'changeLeave' });
+  };
   const [seniorityCalc, setSeniorityCalc] = useState('');
 
   // Edit Overtime Modal
@@ -57,7 +77,7 @@ export const AdminDashboard: React.FC = () => {
   const [rejectReason, setRejectReason] = useState('');
 
   // Permanent Delete Modal
-  const [deleteTarget, setDeleteTarget] = useState<{ id: string | number, type: 'user' | 'leave' | 'ot' | 'announcement' | 'holiday' } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string | number, type: 'user' | 'leave' | 'ot' | 'announcement' | 'holiday' | 'changeLeave' } | null>(null);
   const [mathChallenge, setMathChallenge] = useState({ q: '', a: 0, opts: [] as number[] });
 
   // Export Date Range (Leave/OT specific)
@@ -103,7 +123,7 @@ export const AdminDashboard: React.FC = () => {
     if (deleteTarget) {
       timer = setTimeout(() => {
         setDeleteTarget(null);
-        showToast("超時未回答，已取消刪除操作", 'error');
+        showToast(`超時未回答，已取消${deleteTarget.type === 'changeLeave' ? '變更' : '刪除'}操作`, 'error');
       }, 10000);
     }
     return () => clearTimeout(timer);
@@ -165,11 +185,25 @@ export const AdminDashboard: React.FC = () => {
           else if (deleteTarget.type === 'ot') await StorageService.deleteOvertime(deleteTarget.id as number);
           else if (deleteTarget.type === 'announcement') await StorageService.removeAnnouncement(deleteTarget.id as number);
           else if (deleteTarget.type === 'holiday') await StorageService.removeHoliday(deleteTarget.id as number);
+          else if (deleteTarget.type === 'changeLeave') {
+              setIsSubmitting(true);
+              try {
+                  const adminName = data.users.find((u: User) => u.role === 'admin')?.name || '管理員';
+                  await StorageService.updateApprovedLeaveType(deleteTarget.id as number, adminName, newLeaveType);
+                  showToast("假別已更改", "success");
+                  setChangeLeaveTypeModal(null);
+                  refreshData();
+              } finally {
+                  setIsSubmitting(false);
+              }
+              setDeleteTarget(null);
+              return;
+          }
           
           refreshData();
           showToast("資料已刪除", 'success');
       } catch (e: any) {
-          showToast("刪除失敗: " + getErrorMessage(e), 'error');
+          showToast("操作失敗: " + getErrorMessage(e), 'error');
       }
     } else {
       showToast("驗證錯誤，取消操作", 'error');
@@ -220,18 +254,88 @@ export const AdminDashboard: React.FC = () => {
     setSeniorityCalc(`年資約 ${years.toFixed(1)} 年，依法規建議特休：${suggestedDays * 8} 小時 (${suggestedDays} 天)`);
   };
 
+  // Quota Form State
+  const [quotaForm, setQuotaForm] = useState({
+     type: '補休',
+     hours: 0,
+     addedDate: new Date().toISOString().substring(0, 10),
+  });
+
+  const handleAddQuota = async () => {
+    if(!targetUser || quotaForm.hours <= 0) return showToast("時數必須大於0", "error");
+    
+    // Default expire date to 1 year
+    const d = new Date(quotaForm.addedDate);
+    d.setFullYear(d.getFullYear() + 1);
+    const expireDate = TimeService.getTaiwanDate(d.toISOString());
+
+    const newBucket = {
+        id: Math.random().toString(36).substring(2, 10),
+        type: quotaForm.type,
+        originalHours: quotaForm.hours,
+        remainingHours: quotaForm.hours,
+        addedDate: quotaForm.addedDate,
+        expireDate: expireDate
+    };
+
+    const updatedQuotas = [...(targetUser.quotas || []), newBucket];
+    
+    // Also add to legacy counters for backward compatibility
+    const legacyUpdates: any = {};
+    if(quotaForm.type === '特休') legacyUpdates.quota_annual = (targetUser.quota_annual || 0) + quotaForm.hours;
+    if(quotaForm.type === '補休') legacyUpdates.quota_comp = (targetUser.quota_comp || 0) + quotaForm.hours;
+    if(quotaForm.type === '生日假') legacyUpdates.quota_birthday = (targetUser.quota_birthday || 0) + quotaForm.hours;
+
+    try {
+        await StorageService.updateUser(targetUser.id, {
+             quotas: updatedQuotas,
+             ...legacyUpdates
+        });
+        showToast("已新增額度", "success");
+        setQuotaForm({...quotaForm, hours: 0});
+        refreshData();
+        setTargetUser({...targetUser, quotas: updatedQuotas, ...legacyUpdates});
+    } catch(e: any) {
+        showToast("新增失敗", "error");
+    }
+  };
+
+  const handleDeleteQuota = async (bucketId: string) => {
+    if(!targetUser) return;
+    if(!confirm("確定要刪除此額度紀錄嗎？原本由該額度扣除的時數將不會自動返還。")) return;
+      
+    const bucket = targetUser.quotas?.find(q => q.id === bucketId);
+    if(!bucket) return;
+
+    const updatedQuotas = targetUser.quotas?.filter(q => q.id !== bucketId) || [];
+      
+    const legacyUpdates: any = {};
+    if (bucket.type === '特休') legacyUpdates.quota_annual = Math.max(0, (targetUser.quota_annual || 0) - bucket.originalHours);
+    if (bucket.type === '補休') legacyUpdates.quota_comp = Math.max(0, (targetUser.quota_comp || 0) - bucket.originalHours);
+    if (bucket.type === '生日假') legacyUpdates.quota_birthday = Math.max(0, (targetUser.quota_birthday || 0) - bucket.originalHours);
+      
+    try {
+        await StorageService.updateUser(targetUser.id, {
+             quotas: updatedQuotas,
+             ...legacyUpdates
+        });
+        showToast("額度已刪除", "success");
+        refreshData();
+        setTargetUser({...targetUser, quotas: updatedQuotas, ...legacyUpdates});
+    } catch(e) {
+        showToast("刪除失敗", "error");
+    }
+  };
+
   const handleSaveSettings = async () => {
     if (!targetUser) return;
     try {
         await StorageService.updateUser(targetUser.id, {
-            onboard_date: settingsForm.onboardDate,
-            quota_annual: Number(settingsForm.quotaAnnual),
-            quota_birthday: Number(settingsForm.quotaBirthday),
-            quota_comp: Number(settingsForm.quotaComp)
+            onboard_date: settingsForm.onboardDate
         });
         setIsSettingsModalOpen(false);
         refreshData();
-        showToast("員工額度設定已更新", 'success');
+        showToast("員工設定已更新", 'success');
     } catch (e: any) {
         showToast("設定更新失敗: " + getErrorMessage(e), 'error');
     }
@@ -825,6 +929,34 @@ export const AdminDashboard: React.FC = () => {
     { id: 'system', icon: Settings, label: '設定' },
   ];
 
+  const expiringQuotas = useMemo(() => {
+    const today = new Date();
+    const nextMonth = new Date();
+    nextMonth.setDate(nextMonth.getDate() + 30);
+    const todayStr = TimeService.getTaiwanDate(today);
+    const nextMonthStr = TimeService.getTaiwanDate(nextMonth);
+    
+    let alerts: {userName: string, type: string, expireDate: string, remainingHours: number, userId: string}[] = [];
+    
+    data.users.forEach(u => {
+        if(u.quotas) {
+            u.quotas.forEach(q => {
+                if (q.remainingHours > 0 && q.expireDate >= todayStr && q.expireDate <= nextMonthStr) {
+                    alerts.push({
+                        userName: u.name,
+                        userId: u.id,
+                        type: q.type,
+                        expireDate: q.expireDate,
+                        remainingHours: q.remainingHours
+                    });
+                }
+            });
+        }
+    });
+    
+    return alerts;
+  }, [data.users]);
+
   const rocYear = currentTime.getFullYear() - 1911;
   const dateStr = `${rocYear} 年 ${String(currentTime.getMonth()+1).padStart(2,'0')} 月 ${String(currentTime.getDate()).padStart(2,'0')} 日`;
   const westernDateStr = currentTime.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-');
@@ -924,6 +1056,31 @@ export const AdminDashboard: React.FC = () => {
 
           {activeView === 'overview' && (
             <div className="space-y-6 md:space-y-8">
+               {expiringQuotas.length > 0 && (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-[24px] p-4 md:p-6 mb-4 shadow-[0_4px_12px_rgba(234,179,8,0.15)] flex flex-col gap-3">
+                     <div className="flex items-center gap-2 text-yellow-700 font-black text-lg">
+                        <AlertTriangle size={20} className="animate-pulse flex-shrink-0" />
+                        <span>注意：有休假額度即將於一個月內到期</span>
+                     </div>
+                     <div className="bg-white rounded-xl divide-y divide-yellow-100 border border-yellow-100 overflow-hidden text-sm md:text-base text-gray-700">
+                        {expiringQuotas.map((alert, idx) => (
+                           <div key={idx} className="flex justify-between items-center p-3 md:px-4 hover:bg-yellow-50/50 transition-colors cursor-pointer" onClick={() => {
+                               const user = data.users.find(u => u.id === alert.userId);
+                               if(user) openSettingsModal(user);
+                           }}>
+                              <div className="flex items-center gap-3">
+                                  <span className="font-black text-brand-700">{alert.userName}</span>
+                                  <span className={`px-2 py-0.5 rounded text-[10px] md:text-xs font-black ${alert.type==='特休'?'bg-blue-100 text-blue-700':alert.type==='補休'?'bg-purple-100 text-purple-700':'bg-pink-100 text-pink-700'}`}>{alert.type}</span>
+                              </div>
+                              <div className="flex flex-col md:flex-row md:items-center gap-1 md:gap-4 text-right">
+                                  <span className="text-gray-500 font-mono text-xs md:text-sm">到期: {alert.expireDate}</span>
+                                  <span className="font-black text-red-500">剩餘 {alert.remainingHours}h</span>
+                              </div>
+                           </div>
+                        ))}
+                     </div>
+                  </div>
+               )}
                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                  <div className="flex items-center gap-4 flex-wrap">
                     <h2 className="text-2xl md:text-3xl font-black text-gray-800">{showArchived ? '已封存員工' : '在職人員總覽'}</h2>
@@ -1071,6 +1228,12 @@ export const AdminDashboard: React.FC = () => {
                                    {TimeService.formatDateTime(leave.start)} ~ {TimeService.formatDateTime(leave.end)}
                                 </div>
                                 <div className="ml-0 md:ml-2 inline-block text-brand-600 font-black text-lg md:text-xl underline decoration-4 decoration-brand-200 underline-offset-4">({leave.hours}hr)</div>
+                                <button 
+                                   onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); }} 
+                                   className="ml-3 mt-1 inline-block text-[11px] md:text-xs text-brand-500 bg-brand-50 px-2 py-1 border border-brand-100 rounded-lg hover:bg-brand-100 transition-colors"
+                                >
+                                   更改假別
+                                </button>
                                 <div className="text-xs md:text-sm text-gray-600 mt-2 pl-2 border-l-4 border-brand-200">{leave.reason}</div>
                                 
                                 {/* Admin View Attachments (Pending) */}
@@ -1160,11 +1323,27 @@ export const AdminDashboard: React.FC = () => {
                                        <span className="font-mono text-gray-400 mr-2 text-xs md:text-sm">{leave.userId}</span>
                                        {leave.userName} - <span className="text-brand-600 font-black">{leave.type}</span>
                                        <span className="ml-2 text-gray-800 font-black text-base md:text-lg">({leave.hours}小時)</span>
+                                       {leave.status === 'approved' && (
+                                           <button 
+                                               onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); }} 
+                                               className="ml-3 text-[11px] md:text-xs text-brand-500 bg-brand-50 px-2 py-1 border border-brand-100 rounded-lg hover:bg-brand-100 transition-colors"
+                                           >
+                                               更改假別
+                                           </button>
+                                       )}
                                     </div>
                                     <div className="text-xs md:text-sm text-gray-500 mt-1 font-mono">
                                        {TimeService.formatDateTime(leave.start)} ~ {TimeService.formatDateTime(leave.end)}
                                     </div>
                                     <div className="text-xs md:text-sm text-gray-600 mt-1">事由：{leave.reason}</div>
+                                    {leave.changeHistory && leave.changeHistory.length > 0 && (
+                                        <div className="mt-2 text-[10px] text-gray-500 bg-gray-100 border border-gray-200 p-2 rounded-lg space-y-1">
+                                            <div className="font-black text-gray-600 mb-1">假別變更紀錄</div>
+                                            {leave.changeHistory.map((ch, idx) => (
+                                                <div key={idx}>• {ch.date}：{ch.adminName} 將 <b>{ch.oldType}</b> 變更為 <b>{ch.newType}</b></div>
+                                            ))}
+                                        </div>
+                                    )}
                                     
                                     {/* Admin View Attachments (History) */}
                                     {leave.attachments && leave.attachments.length > 0 && (
@@ -1587,21 +1766,95 @@ export const AdminDashboard: React.FC = () => {
                  </div>
 
                  <div className="p-4 md:p-6 bg-gray-50 rounded-[24px] md:rounded-[32px] border border-gray-100 space-y-4">
-                    <h4 className="text-xs md:text-sm font-black text-gray-500 flex items-center gap-2"><Clock size={16}/> 假別額度設定 (小時)</h4>
-                    <div className="grid grid-cols-2 gap-3 md:gap-4">
+                    <h4 className="text-xs md:text-sm font-black text-gray-500 flex items-center gap-2"><Clock size={16}/> 新增假別額度</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-3 items-end">
                         <div className="space-y-1">
-                            <label className="text-[10px] text-gray-400 ml-1">特休假</label>
-                            <input type="number" value={settingsForm.quotaAnnual} onChange={e=>setSettingsForm({...settingsForm, quotaAnnual: Number(e.target.value)})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center" />
+                            <label className="text-[10px] text-gray-400 ml-1">假別</label>
+                            <select value={quotaForm.type} onChange={e=>setQuotaForm({...quotaForm, type: e.target.value})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center appearance-none">
+                                <option>補休</option>
+                                <option>特休</option>
+                                <option>生日假</option>
+                            </select>
                         </div>
                         <div className="space-y-1">
-                            <label className="text-[10px] text-gray-400 ml-1">生日假</label>
-                            <input type="number" value={settingsForm.quotaBirthday} onChange={e=>setSettingsForm({...settingsForm, quotaBirthday: Number(e.target.value)})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center" />
+                            <label className="text-[10px] text-gray-400 ml-1">時數</label>
+                            <input type="number" min="0" value={quotaForm.hours} onChange={e=>setQuotaForm({...quotaForm, hours: Number(e.target.value)})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center" />
                         </div>
-                        <div className="space-y-1 col-span-2">
-                            <label className="text-[10px] text-gray-400 ml-1">補休假 (加班轉入)</label>
-                            <input type="number" value={settingsForm.quotaComp} onChange={e=>setSettingsForm({...settingsForm, quotaComp: Number(e.target.value)})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center" />
+                        <div className="space-y-1 col-span-2 md:col-span-1">
+                            <label className="text-[10px] text-gray-400 ml-1">生效日期</label>
+                            <input type="date" value={quotaForm.addedDate} onChange={e=>setQuotaForm({...quotaForm, addedDate: e.target.value})} className="w-full p-3 bg-white border rounded-xl font-black outline-none text-center [color-scheme:light]" />
+                        </div>
+                        <div className="col-span-2 md:col-span-1">
+                            <Button className="w-full p-3 rounded-xl bg-brand-600 text-white font-black" onClick={handleAddQuota}><Plus size={16} className="inline mr-1"/>新增</Button>
                         </div>
                     </div>
+
+                    {/* Quota records list */}
+                    {targetUser.quotas && targetUser.quotas.length > 0 && (
+                        <div className="mt-4 border-t border-gray-100 pt-4">
+                            <h4 className="text-[10px] font-black text-gray-400 mb-2">現有額度紀錄 (一年內有效)</h4>
+                            <div className="space-y-2 max-h-40 overflow-y-auto custom-scroll pr-1">
+                                {targetUser.quotas.slice().reverse().map(q => (
+                                    <div key={q.id} className="flex justify-between items-center bg-white p-2 border border-gray-100 rounded-lg shadow-sm text-xs">
+                                        <div className="flex flex-col gap-1">
+                                            <span className={`w-min px-1.5 py-0.5 rounded text-[10px] whitespace-nowrap ${q.type==='特休'?'bg-blue-100 text-blue-700':q.type==='補休'?'bg-purple-100 text-purple-700':'bg-pink-100 text-pink-700'}`}>{q.type}</span>
+                                            <div className="text-[9px] text-gray-400 font-mono">
+                                                新增: {q.addedDate} <br/>
+                                                到期: {q.expireDate}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-2 text-right">
+                                            <div className="text-right">
+                                                <div className="font-black text-brand-600">{q.remainingHours} <span className="text-gray-400 font-normal">/ {q.originalHours} hr</span></div>
+                                                {q.remainingHours === 0 && <span className="text-[9px] text-gray-400">已用盡/過期</span>}
+                                            </div>
+                                            <button onClick={() => handleDeleteQuota(q.id)} className="p-1.5 bg-red-50 text-red-500 rounded-md hover:bg-red-100 transition-colors shrink-0" title="刪除此額度"><Trash2 size={12}/></button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                 </div>
+
+                 <div className="grid grid-cols-3 gap-2">
+                    {['特休', '補休', '生日假'].map(type => {
+                        const used = data.leaves
+                            .filter(l => l.userId === targetUser.id && l.type === type && l.status === 'approved')
+                            .reduce((acc, curr) => acc + curr.hours, 0);
+                        
+                        // calc remaining valid
+                        const sumValidBuckets = () => {
+                            if (!targetUser.quotas || targetUser.quotas.length === 0) {
+                                if (type === '特休') return targetUser.quota_annual || 0;
+                                if (type === '補休') return targetUser.quota_comp || 0;
+                                if (type === '生日假') return targetUser.quota_birthday || 0;
+                                return 0;
+                            }
+                            const today = TimeService.getTaiwanDate(new Date());
+                            const validSum = targetUser.quotas
+                                .filter(q => q.type === type && q.expireDate >= today && q.remainingHours > 0)
+                                .reduce((acc, q) => acc + q.remainingHours, 0);
+                            
+                            const hasBucketsOfType = targetUser.quotas.some(q => q.type === type);
+                            if(!hasBucketsOfType) {
+                                if (type === '特休') return targetUser.quota_annual || 0;
+                                if (type === '補休') return targetUser.quota_comp || 0;
+                                if (type === '生日假') return targetUser.quota_birthday || 0;
+                            }
+                            return validSum;
+                        };
+
+                        const remaining = sumValidBuckets();
+
+                        return (
+                            <div key={type} className="bg-gray-50 border border-gray-100 rounded-xl p-2 text-center shadow-sm">
+                                <div className="text-[10px] text-gray-500 font-bold">{type}</div>
+                                <div className="text-xs font-black text-gray-400 mt-1">剩餘 <span className="text-sm text-brand-600">{remaining}</span> hr</div>
+                                <div className="text-[9px] font-bold text-gray-400">已用 {used} hr</div>
+                            </div>
+                        );
+                    })}
                  </div>
 
                  <div className="space-y-3 pt-2">
@@ -1744,6 +1997,138 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
+      {/* Change Leave Type Modal */}
+      {changeLeaveTypeModal && (() => {
+        const leave = changeLeaveTypeModal.leave;
+        const u = data.users.find(usr => usr.id === leave.userId);
+        if (!u) return null;
+
+        const getRemaining = (type: string) => {
+            if (!u.quotas || u.quotas.length === 0) {
+                if (type === '特休') return u.quota_annual || 0;
+                if (type === '補休') return u.quota_comp || 0;
+                if (type === '生日假') return u.quota_birthday || 0;
+                return 0;
+            }
+            const today = TimeService.getTaiwanDate(new Date());
+            const validSum = u.quotas
+                .filter(q => q.type === type && q.expireDate >= today && q.remainingHours > 0)
+                .reduce((acc, q) => acc + q.remainingHours, 0);
+            
+            const hasBucketsOfType = u.quotas.some(q => q.type === type);
+            if(!hasBucketsOfType) {
+                if (type === '特休') return u.quota_annual || 0;
+                if (type === '補休') return u.quota_comp || 0;
+                if (type === '生日假') return u.quota_birthday || 0;
+            }
+            return validSum;
+        };
+
+        const oldTypeRemaining = getRemaining(leave.type);
+        const newTypeRemaining = getRemaining(newLeaveType);
+
+        const isSpecial = (t: string) => ['特休', '補休', '生日假'].includes(t);
+
+        let oldFormula = "";
+        let newFormula = "";
+        if (leave.status === 'approved') {
+            oldFormula = isSpecial(leave.type) ? `退還 ${leave.hours}h → 變更為 ${oldTypeRemaining + leave.hours}h` : "依規定無額度限制";
+            newFormula = isSpecial(newLeaveType) ? `扣除 ${leave.hours}h → 變更為 ${newTypeRemaining - leave.hours}h` : "依規定無額度限制";
+        } else {
+            oldFormula = isSpecial(leave.type) ? `(未扣除，無須退還)` : "依規定無額度限制";
+            newFormula = isSpecial(newLeaveType) ? `(若核准將扣除 ${leave.hours}h)` : "依規定無額度限制";
+        }
+
+        return (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+               <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-10 w-full max-w-4xl shadow-2xl font-bold flex flex-col md:flex-row gap-8">
+                  {/* Left Side: Original Info */}
+                  <div className="flex-1 space-y-6">
+                      <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-gray-800"><Info className="text-gray-400"/> 原本申請資訊</h3>
+                      <div className="bg-gray-50 p-6 rounded-3xl border border-gray-100 space-y-4">
+                          <div className="flex justify-between items-center border-b border-gray-200 pb-3">
+                              <span className="text-gray-400 text-sm">員工姓名</span>
+                              <span className="font-black text-lg text-gray-800">{leave.userName}</span>
+                          </div>
+                          <div className="flex justify-between items-center border-b border-gray-200 pb-3">
+                              <span className="text-gray-400 text-sm">目前假別</span>
+                              <span className="font-black text-lg text-brand-600 bg-brand-50 px-3 py-1 rounded-lg">{leave.type}</span>
+                          </div>
+                          <div className="flex justify-between items-center border-b border-gray-200 pb-3">
+                              <span className="text-gray-400 text-sm">請假時間</span>
+                              <span className="font-mono text-sm text-gray-600 block text-right">{TimeService.formatDateTime(leave.start)}<br/>{TimeService.formatDateTime(leave.end)}</span>
+                          </div>
+                          <div className="flex justify-between items-center">
+                              <span className="text-gray-400 text-sm">請假時數</span>
+                              <span className="font-black text-2xl text-gray-800">{leave.hours} <span className="text-base text-gray-400">hr</span></span>
+                          </div>
+                      </div>
+                  </div>
+
+                  {/* Right Side: New Info & Calculation */}
+                  <div className="flex-1 space-y-6 flex flex-col">
+                      <h3 className="text-xl md:text-2xl font-black flex items-center gap-2 text-brand-600"><Edit3 className="text-brand-500"/> 欲變更假別</h3>
+                      <div className="flex-1 bg-brand-50/50 p-6 rounded-3xl border border-brand-100 space-y-6">
+                          <div className="space-y-2">
+                              <label className="text-xs text-brand-600 font-bold ml-1">選擇新假別</label>
+                              <select value={newLeaveType} onChange={e=>setNewLeaveType(e.target.value)} className="w-full p-4 bg-white text-black border-2 border-brand-200 focus:border-brand-500 rounded-2xl outline-none font-black appearance-none shadow-sm transition-colors text-lg">
+                                  <option>特休</option>
+                                  <option>補休</option>
+                                  <option>生日假</option>
+                                  <option>事假</option>
+                                  <option>病假</option>
+                                  <option>婚假</option>
+                                  <option>喪假</option>
+                                  <option>公假</option>
+                                  <option>產假/陪產假</option>
+                              </select>
+                          </div>
+
+                          <div className="space-y-4 pt-2">
+                             <div className="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm flex flex-col gap-2">
+                                <span className="text-xs text-gray-400 font-bold flex justify-between items-center">
+                                    <span>原本【{leave.type}】</span>
+                                    {isSpecial(leave.type) && <span className="text-gray-500">目前剩餘 {oldTypeRemaining}h</span>}
+                                </span>
+                                <span className="text-sm font-black text-gray-700">{oldFormula}</span>
+                             </div>
+
+                             <div className="text-center text-brand-300">
+                                <Plus size={20} className="inline-block transform rotate-45" />
+                             </div>
+
+                             <div className="bg-white p-4 rounded-2xl border border-brand-100 shadow-sm flex flex-col gap-2">
+                                <span className="text-xs text-brand-600 font-bold flex justify-between items-center">
+                                    <span>變更為【{newLeaveType}】</span>
+                                    {isSpecial(newLeaveType) && <span className="text-brand-500">目前剩餘 {newTypeRemaining}h</span>}
+                                </span>
+                                <span className={`text-sm font-black ${isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved' ? 'text-red-500 animate-pulse' : 'text-brand-700'}`}>
+                                    {newFormula}
+                                </span>
+                                {isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved' && (
+                                    <div className="text-xs text-red-500 mt-1">※ 警告：新假別可用額度不足！</div>
+                                )}
+                             </div>
+                          </div>
+                      </div>
+
+                      <div className="flex gap-4 pt-2">
+                         <Button variant="secondary" className="flex-1 p-5 rounded-2xl text-lg" onClick={()=>setChangeLeaveTypeModal(null)}>取消</Button>
+                         <Button 
+                             className="flex-1 p-5 rounded-2xl bg-brand-600 font-black text-white text-lg shadow-xl hover:shadow-2xl hover:-translate-y-1 transition-all" 
+                             onClick={handleChangeLeaveType}
+                             isLoading={isSubmitting}
+                             disabled={isSubmitting || (isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved')}
+                         >
+                             確認變更
+                         </Button>
+                      </div>
+                  </div>
+               </div>
+            </div>
+        );
+      })()}
+
       {/* Reject Reason Modal */}
       {rejectModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
@@ -1783,24 +2168,28 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
-      {/* Permanent Delete Confirmation Modal */}
+      {/* Permanent Delete & Challenge Action Modal */}
       {deleteTarget && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[300] flex items-center justify-center p-4 md:p-6 text-black">
-           <div className="bg-white rounded-[32px] md:rounded-[48px] p-8 md:p-12 w-full max-w-md shadow-2xl border-4 border-red-600 animate-in bounce-in duration-500">
+           <div className={`bg-white rounded-[32px] md:rounded-[48px] p-8 md:p-12 w-full max-w-md shadow-2xl border-4 ${deleteTarget.type === 'changeLeave' ? 'border-brand-500' : 'border-red-600'} animate-in bounce-in duration-500`}>
               <div className="text-center mb-6 md:mb-10">
-                <h3 className="text-2xl md:text-3xl font-black mb-2 tracking-tight text-red-600">危險操作確認</h3>
-                <div className="text-sm font-black text-gray-500">您正在永久刪除資料，此操作無法復原！</div>
-                <div className="text-xs font-black text-red-600 animate-pulse bg-red-50 py-1 rounded-full mt-4">剩餘回答時間：10 秒</div>
+                <h3 className={`text-2xl md:text-3xl font-black mb-2 tracking-tight ${deleteTarget.type === 'changeLeave' ? 'text-brand-600' : 'text-red-600'}`}>
+                    {deleteTarget.type === 'changeLeave' ? '變更假別確認' : '危險操作確認'}
+                </h3>
+                <div className="text-sm font-black text-gray-500">
+                    {deleteTarget.type === 'changeLeave' ? '請回答下方數學題以確認變更' : '您正在永久刪除資料，此操作無法復原！'}
+                </div>
+                <div className={`text-xs font-black ${deleteTarget.type === 'changeLeave' ? 'text-brand-600 bg-brand-50' : 'text-red-600 bg-red-50'} animate-pulse py-1 rounded-full mt-4`}>剩餘回答時間：10 秒</div>
               </div>
               <div className="bg-gray-100 p-6 md:p-8 rounded-[24px] md:rounded-[32px] text-center mb-6 md:mb-10">
                 <div className="text-4xl md:text-5xl font-black font-mono tracking-widest">{mathChallenge.q}</div>
               </div>
               <div className="grid grid-cols-3 gap-3 md:gap-4 mb-6 md:mb-10">
                 {mathChallenge.opts.map((opt, idx) => (
-                  <button key={idx} onClick={() => handleDeleteResponse(opt)} className="p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black text-red-600 hover:bg-red-600 hover:text-white transition-all shadow-md">{opt}</button>
+                  <button key={idx} onClick={() => handleDeleteResponse(opt)} className={`p-4 md:p-6 bg-white border-2 border-gray-100 rounded-[20px] md:rounded-[24px] text-2xl md:text-3xl font-black ${deleteTarget.type === 'changeLeave' ? 'text-brand-600 hover:bg-brand-600' : 'text-red-600 hover:bg-red-600'} hover:text-white transition-all shadow-md`}>{opt}</button>
                 ))}
               </div>
-              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>setDeleteTarget(null)}>取消刪除</button>
+              <button className="w-full py-3 md:py-4 text-gray-400 font-black hover:text-gray-600 transition-colors" onClick={()=>setDeleteTarget(null)}>取消{deleteTarget.type === 'changeLeave' ? '變更' : '刪除'}</button>
            </div>
         </div>
       )}

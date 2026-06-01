@@ -525,10 +525,24 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     const pendingBirthday = calculatePendingUsed('生日假');
     const pendingComp = calculatePendingUsed('補休');
 
+    const sumValidBuckets = (type: string, legacyVal: number | undefined) => {
+        if (!user.quotas || user.quotas.length === 0) return legacyVal || 0;
+        const today = TimeService.getTaiwanDate(new Date());
+        let validSum = user.quotas
+            .filter(q => q.type === type && q.expireDate >= today && q.remainingHours > 0)
+            .reduce((acc, q) => acc + q.remainingHours, 0);
+        // If there are quotas in the array but maybe for other types, do we use legacy? Wait, if they have ANY bucket, we rely on buckets.
+        // Actually, combining them is safer: validSum + legacyVal IF legacy wasn't touched? No, buckets replace legacy entirely.
+        // For simplicity, if they have NO buckets of THIS type, we fallback to legacy.
+        const hasBucketsOfType = user.quotas.some(q => q.type === type);
+        if(!hasBucketsOfType) return legacyVal || 0;
+        return validSum;
+    };
+
     return {
-        annual: Math.max(0, (user.quota_annual || 0) - pendingAnnual),
-        birthday: Math.max(0, (user.quota_birthday || 0) - pendingBirthday),
-        comp: Math.max(0, (user.quota_comp || 0) - pendingComp),
+        annual: Math.max(0, sumValidBuckets('特休', user.quota_annual) - pendingAnnual),
+        birthday: Math.max(0, sumValidBuckets('生日假', user.quota_birthday) - pendingBirthday),
+        comp: Math.max(0, sumValidBuckets('補休', user.quota_comp) - pendingComp),
     };
   }, [allLeaves, user]);
 
