@@ -84,7 +84,6 @@ export const TimeService = {
     try {
       // Race 模式：嘗試多個外部來源
       const offset = await promiseAny([
-        fetchWithTimeout('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Taipei'),
         fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
         fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601')
       ]);
