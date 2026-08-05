@@ -20,6 +20,7 @@ const App: React.FC = () => {
 
   // 修改密碼相關狀態：包含舊密碼(old)、新密碼(new1)、確認密碼(new2)
   const [isSelfPwdModalOpen, setIsSelfPwdModalOpen] = useState(false);
+  const [isForcedPasswordChange, setIsForcedPasswordChange] = useState(false);
   const [pwdForm, setPwdForm] = useState({ old: '', new1: '', new2: '' });
   const [isProcessing, setIsProcessing] = useState(false);
 
@@ -69,9 +70,11 @@ const App: React.FC = () => {
     });
 
     // 4. Session & Auth State Listener
-    const unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser) => {
+    let authCheckVersion = 0;
+    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      const currentCheck = ++authCheckVersion;
       const savedSessionRaw = localStorage.getItem(SESSION_KEY);
-      let parsed: { id?: string; role?: string } | null = null;
+      let parsed: { id?: string } | null = null;
 
       if (savedSessionRaw) {
         try {
@@ -83,50 +86,51 @@ const App: React.FC = () => {
         }
       }
 
-      if (firebaseUser && parsed && parsed.id) {
-        // 用戶已登入且有 Session
-        const freshData = safeLoadData();
-        const user = freshData.users.find(u => u.id === parsed!.id);
-        if (user && !user.deleted) {
-          setCurrentUser(user);
-          // initRealtimeSync may exist; call it
-          try {
-            StorageService.initRealtimeSync(user.id, user.role);
-          } catch (e) {
-            console.error('initRealtimeSync failed', e);
+      if (firebaseUser) {
+        try {
+          const user = await StorageService.getUserProfileForAuth(
+            firebaseUser.uid,
+            firebaseUser.email,
+            parsed?.id
+          );
+          if (currentCheck !== authCheckVersion) return;
+
+          if (!user || user.deleted) {
+            throw new Error(user?.deleted ? 'USER_ARCHIVED' : 'USER_PROFILE_NOT_FOUND');
           }
-        } else {
-          // session user not found or deleted -> clear session
+
+          setCurrentUser(user);
+          setIsForcedPasswordChange(Boolean(user.mustChangePassword));
+          if (user.mustChangePassword) {
+            setPwdForm({ old: '', new1: '', new2: '' });
+            setIsSelfPwdModalOpen(true);
+          }
+          localStorage.setItem(SESSION_KEY, JSON.stringify({ id: user.id }));
+          StorageService.initRealtimeSync(user.id, user.role);
+        } catch (error) {
+          console.error('Authenticated profile restore failed', error);
+          if (currentCheck !== authCheckVersion) return;
+          StorageService.stopRealtimeSync();
+          StorageService.clearPrivateCache();
           localStorage.removeItem(SESSION_KEY);
           setCurrentUser(null);
+          setIsForcedPasswordChange(false);
+          setIsSelfPwdModalOpen(false);
         }
-      } else if (!firebaseUser) {
-        // Firebase 已登出，強制清除本地狀態
-        try {
-          if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-            (StorageService as any).stopRealtimeSync();
-          }
-        } catch (e) {
-          console.warn('stopRealtimeSync failed or not available', e);
-        }
-        setCurrentUser(null);
-        localStorage.removeItem(SESSION_KEY);
       } else {
-        // firebaseUser exists but no valid parsed session -> clear local session and rely on firebase state
-        localStorage.removeItem(SESSION_KEY);
+        // Firebase 已登出，強制清除本地狀態
+        StorageService.stopRealtimeSync();
+        StorageService.clearPrivateCache();
         setCurrentUser(null);
+        setIsForcedPasswordChange(false);
+        setIsSelfPwdModalOpen(false);
+        localStorage.removeItem(SESSION_KEY);
       }
     });
 
     return () => {
       window.removeEventListener('storage-update', handleStorageUpdate);
-      try {
-        if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-          (StorageService as any).stopRealtimeSync();
-        }
-      } catch (e) {
-        // ignore
-      }
+      StorageService.stopRealtimeSync();
       unsubscribeAuth();
     };
   }, [safeLoadData]);
@@ -180,12 +184,14 @@ const App: React.FC = () => {
       // 4. 執行密碼更新
       await updatePassword(auth.currentUser, pwdForm.new1);
 
-      // 5. 更新 Firestore 狀態 (標記密碼已保護)
+      // 密碼只由 Firebase Authentication 管理；清除首次登入強制變更標記。
       if (currentUser) {
         try {
-          await StorageService.updateUser(currentUser.id, { pass: 'PROTECTED' });
-        } catch (e) {
-          console.warn('updateUser failed', e);
+          await StorageService.updateUser(currentUser.id, { mustChangePassword: false });
+        } catch (error) {
+          // The password is already changed. Keep the session safe and let the
+          // next login retry the marker update after rules are published.
+          console.warn('Failed to clear mustChangePassword marker', error);
         }
       }
 
@@ -195,6 +201,7 @@ const App: React.FC = () => {
       // 7. 成功提示並強制登出
       // 順序優化：先關閉視窗，再顯示成功訊息，最後才登出
       setIsSelfPwdModalOpen(false);
+      setIsForcedPasswordChange(false);
       setPwdForm({ old: '', new1: '', new2: '' });
       
       showNotification('密碼修改成功！請使用新密碼重新登入', 'success');
@@ -209,9 +216,8 @@ const App: React.FC = () => {
         console.error('signOut after password change failed', e);
       } finally {
         try {
-          if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-            (StorageService as any).stopRealtimeSync();
-          }
+          StorageService.stopRealtimeSync();
+          StorageService.clearPrivateCache();
         } catch (e) {
           // ignore
         }
@@ -246,7 +252,12 @@ const App: React.FC = () => {
   // Called when Login component succeeds
   const handleLoginSuccess = (u: User) => {
     setCurrentUser(u);
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ id: u.id, role: u.role }));
+    setIsForcedPasswordChange(Boolean(u.mustChangePassword));
+    if (u.mustChangePassword) {
+      setPwdForm({ old: '', new1: '', new2: '' });
+      setIsSelfPwdModalOpen(true);
+    }
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ id: u.id }));
     // Start listening to this user's data
     try {
       StorageService.initRealtimeSync(u.id, u.role);
@@ -261,15 +272,12 @@ const App: React.FC = () => {
     } catch (error) {
       console.error('Logout failed', error);
     } finally {
-      try {
-        if (typeof (StorageService as any).stopRealtimeSync === 'function') {
-          (StorageService as any).stopRealtimeSync();
-        }
-      } catch (e) {
-        console.warn('stopRealtimeSync failed or not available', e);
-      }
+      StorageService.stopRealtimeSync();
+      StorageService.clearPrivateCache();
       localStorage.removeItem(SESSION_KEY);
       setCurrentUser(null);
+      setIsForcedPasswordChange(false);
+      setIsSelfPwdModalOpen(false);
     }
   };
 
@@ -282,7 +290,7 @@ const App: React.FC = () => {
       }, 0);
 
       const onKeyDown = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape' && !isForcedPasswordChange) {
           setIsSelfPwdModalOpen(false);
           setPwdForm({ old: '', new1: '', new2: '' });
         }
@@ -290,7 +298,7 @@ const App: React.FC = () => {
       window.addEventListener('keydown', onKeyDown);
       return () => window.removeEventListener('keydown', onKeyDown);
     }
-  }, [isSelfPwdModalOpen]);
+  }, [isSelfPwdModalOpen, isForcedPasswordChange]);
 
   if (!appSettings) return null;
 
@@ -341,7 +349,7 @@ const App: React.FC = () => {
       {isSelfPwdModalOpen && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4 text-black" role="dialog" aria-modal="true" aria-labelledby="change-password-title">
           <div className="bg-white rounded-[32px] p-8 md:p-10 w-full max-w-md shadow-2xl animate-in zoom-in-95 duration-200">
-            <h3 id="change-password-title" className="text-xl md:text-2xl font-bold mb-6 md:mb-8 text-center text-gray-800">修改您的登入密碼</h3>
+            <h3 id="change-password-title" className="text-xl md:text-2xl font-bold mb-6 md:mb-8 text-center text-gray-800">{isForcedPasswordChange ? '首次登入，請設定新密碼' : '修改您的登入密碼'}</h3>
             <div className="space-y-5">
               {/* 1. 舊密碼輸入框 (新增) */}
               <div className="space-y-1.5">
@@ -350,7 +358,7 @@ const App: React.FC = () => {
                   <input
                     ref={oldPwdRef}
                     type="password"
-                    placeholder="請輸入舊密碼以驗證身分"
+                    placeholder={isForcedPasswordChange ? '請輸入管理員提供的臨時密碼' : '請輸入舊密碼以驗證身分'}
                     value={pwdForm.old}
                     onChange={e => setPwdForm({ ...pwdForm, old: e.target.value })}
                     className="w-full p-4 pl-5 border-2 border-gray-200 rounded-2xl bg-gray-50 text-black focus:ring-4 focus:ring-brand-100 focus:border-brand-500 outline-none transition-all font-bold placeholder-gray-400"
@@ -394,7 +402,7 @@ const App: React.FC = () => {
               </div>
 
               <div className="flex gap-3 pt-4">
-                <Button variant="secondary" className="flex-1 rounded-2xl py-3.5 font-black border-2 border-gray-100 hover:bg-gray-50" onClick={() => { setIsSelfPwdModalOpen(false); setPwdForm({ old: '', new1: '', new2: '' }); }}>取消</Button>
+                {!isForcedPasswordChange && <Button variant="secondary" className="flex-1 rounded-2xl py-3.5 font-black border-2 border-gray-100 hover:bg-gray-50" onClick={() => { setIsSelfPwdModalOpen(false); setPwdForm({ old: '', new1: '', new2: '' }); }}>取消</Button>}
                 <Button className="flex-1 rounded-2xl py-3.5 font-black shadow-lg bg-brand-600 hover:bg-brand-700 text-white" onClick={handleUpdateSelfPwd} disabled={isProcessing} isLoading={isProcessing}>確認修改</Button>
               </div>
             </div>

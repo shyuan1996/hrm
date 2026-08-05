@@ -2,10 +2,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
-import { auth, db } from '../services/firebase';
-import { signInWithEmailAndPassword } from 'firebase/auth';
-import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { auth } from '../services/firebase';
+import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import { Button } from './ui/Button';
+import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
 import { Building2, AlertTriangle, Megaphone, CloudDownload, Eye, EyeOff } from 'lucide-react';
 
 interface LoginProps {
@@ -35,16 +35,18 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     window.addEventListener('storage-update', updateHandler);
     StorageService.initRealtimeSync();
 
-    // Load Remember Me Data
+    // Load remembered account only. Older versions stored the password in
+    // reversible Base64; migrate it immediately without ever restoring it.
     const storedCreds = localStorage.getItem(REMEMBER_KEY);
     if (storedCreds) {
         try {
-            // Simple Base64 decode
-            const { u, p } = JSON.parse(atob(storedCreds));
-            if (u && p) {
+            const { u } = JSON.parse(atob(storedCreds));
+            if (u) {
                 setUsername(u);
-                setPassword(p);
                 setRememberMe(true);
+                localStorage.setItem(REMEMBER_KEY, btoa(JSON.stringify({ u })));
+            } else {
+                localStorage.removeItem(REMEMBER_KEY);
             }
         } catch (e) {
             console.error("Failed to parse saved credentials", e);
@@ -71,14 +73,11 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     // [資安與體驗修正] 強制轉小寫，實現帳號不分大小寫登入
     const normalizedInput = username.trim().toLowerCase();
     
-    // 解析 ID (去掉 @domain 部分)
-    const originalId = normalizedInput.includes('@') ? normalizedInput.split('@')[0] : normalizedInput;
-
-    // 組合 Email (使用小寫 ID)
-    let email = originalId;
-    if (!email.includes('@')) {
-        email = `${email}@shyuan-hrm.com`;
-    }
+    // 完整 Email 必須保留原網域（例如 service@shyuan.com.tw）；
+    // 只有純員工編號才補上內部登入用的假網域。
+    const isFullEmail = normalizedInput.includes('@');
+    const originalId = isFullEmail ? normalizedInput.split('@')[0] : normalizedInput;
+    const email = isFullEmail ? normalizedInput : `${normalizedInput}@shyuan-hrm.com`;
 
     try {
         // 1. Firebase Auth Login
@@ -87,73 +86,16 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
         if (!firebaseUser) throw new Error("驗證失敗");
 
-        const userDocRef = doc(db, 'users', originalId);
-        
-        // 2. 嘗試「認領」或更新 UID
-        // 這是為了配合 Security Rules: allow write: if request.resource.data.uid == request.auth.uid
-        // 無論是 Admin 還是員工，登入成功後確保資料庫內的 UID 與 Auth UID 一致
-        if (originalId === 'admin') {
-             try {
-                 // 嘗試寫入 Admin 權限標記，如果規則設定正確，這步會成功
-                 await setDoc(userDocRef, {
-                     id: 'admin',
-                     uid: firebaseUser.uid,
-                     role: 'admin',
-                     name: '系統管理員',
-                     dept: '管理部',
-                     pass: 'PROTECTED'
-                 }, { merge: true });
-             } catch (e) {
-                 console.warn("Admin auto-claim failed (possibly strict rules), proceeding to read...", e);
-             }
-        } else {
-             // 一般員工嘗試寫入自己的 UID
-             try {
-                 await setDoc(userDocRef, { uid: firebaseUser.uid }, { merge: true });
-             } catch (e) {
-                 console.warn("User auto-claim failed, proceeding...", e);
-             }
-        }
+        // Resolve the employee profile by immutable Firebase UID. This also
+        // supports legacy mixed-case document IDs without creating new data.
+        const userProfile = await StorageService.getUserProfileForAuth(
+          firebaseUser.uid,
+          firebaseUser.email,
+          originalId
+        );
 
-        // 3. 取得使用者資料
-        let userDocSnap;
-        let userProfile: User | null = null;
-
-        try {
-            userDocSnap = await getDoc(userDocRef);
-        } catch (docErr: any) {
-            if (docErr.code === 'permission-denied') {
-                if (originalId === 'admin') {
-                    throw new Error("ADMIN_PERMISSION_DENIED");
-                }
-                throw new Error("PERMISSION_DENIED_USER");
-            } else {
-                throw docErr;
-            }
-        }
-
-        if (userDocSnap && userDocSnap.exists()) {
-            userProfile = userDocSnap.data() as User;
-        } else {
-             // 新員工首次登入，自動建立檔案
-             userProfile = {
-                 id: originalId,
-                 uid: firebaseUser.uid,
-                 pass: '*****',
-                 name: firebaseUser.displayName || originalId,
-                 role: 'employee',
-                 dept: 'General',
-                 quota_annual: 0, quota_birthday: 0, quota_comp: 0
-             } as User;
-             
-             try {
-                // 這裡的寫入需要符合 request.resource.data.uid == request.auth.uid
-                await setDoc(userDocRef, userProfile);
-             } catch (e: any) {
-                 if (e.code === 'permission-denied') throw new Error("PERMISSION_DENIED_CREATE");
-                 throw e;
-             }
-        }
+        if (!userProfile) throw new Error('USER_PROFILE_NOT_FOUND');
+        if (userProfile.uid !== firebaseUser.uid) throw new Error('PROFILE_UID_MISMATCH');
 
         if (userProfile?.deleted && originalId !== 'admin') {
             setError('此帳號已被封存');
@@ -163,8 +105,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
         // Handle Remember Me Logic (Save after successful login)
         if (rememberMe) {
-            // 注意：這裡儲存原始輸入或小寫皆可，建議儲存標準化後的
-            const jsonStr = JSON.stringify({ u: normalizedInput, p: password });
+            const jsonStr = JSON.stringify({ u: normalizedInput });
             localStorage.setItem(REMEMBER_KEY, btoa(jsonStr));
         } else {
             localStorage.removeItem(REMEMBER_KEY);
@@ -174,6 +115,9 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
     } catch (err: any) {
         console.error("Login Error:", err);
+        if (auth.currentUser) {
+            try { await signOut(auth); } catch { /* best-effort cleanup */ }
+        }
         const errCode = err.code;
         const errMessage = err.message;
 
@@ -184,10 +128,14 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
             setError('嘗試次數過多，請稍後再試');
         } else if (errMessage === 'ADMIN_PERMISSION_DENIED') {
             setError('權限錯誤：無法讀取管理員資料。請確認 Firestore Rules 中 isAdmin() 已正確設定為讀取 users/admin。');
+        } else if (errMessage === 'USER_PROFILE_NOT_FOUND') {
+            setError('登入成功，但找不到對應的員工資料。系統已停止登入以避免建立錯誤的新帳號，請聯繫管理員。');
+        } else if (errMessage === 'DUPLICATE_USER_PROFILE') {
+            setError('此登入帳號對應到多份員工資料，為保護資料已停止登入，請聯繫管理員處理。');
+        } else if (errMessage === 'PROFILE_UID_MISMATCH') {
+            setError('帳號與員工資料的安全識別不一致，請聯繫管理員。');
         } else if (errCode === 'permission-denied' || errMessage === 'PERMISSION_DENIED_USER') {
             setError('權限不足：無法讀取使用者資料。請聯繫管理員確認資料庫規則。');
-        } else if (errMessage === 'PERMISSION_DENIED_CREATE') {
-            setError('無法建立帳號資料：請聯繫管理員手動建立您的員工檔案。');
         } else {
             setError('登入失敗: ' + (errMessage || '未知錯誤'));
         }
@@ -226,7 +174,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
           <div className="flex justify-between items-center">
              <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500 font-black">
                 <input type="checkbox" checked={rememberMe} onChange={e=>setRememberMe(e.target.checked)} className="rounded text-brand-600" />
-                記住我
+                記住帳號
              </label>
              {announcements.length > 0 && (
                 <button type="button" onClick={() => setShowAnnouncementModal(true)} className="text-xs font-black text-brand-600 hover:underline flex items-center gap-1">
@@ -262,7 +210,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
                       </span>
                     </div>
                     <h4 className="font-black text-gray-800 text-lg mb-4">{ann.title}</h4>
-                    <div className="text-sm text-gray-500 prose prose-sm max-w-none font-bold leading-relaxed break-words" dangerouslySetInnerHTML={{ __html: ann.content }} />
+                    <div className="text-sm text-gray-500 prose prose-sm max-w-none font-bold leading-relaxed break-words" dangerouslySetInnerHTML={{ __html: sanitizeAnnouncementHtml(ann.content) }} />
                   </div>
                  ))}
               </div>

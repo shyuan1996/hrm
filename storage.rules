@@ -1,0 +1,38 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        (firestore.exists(/databases/(default)/documents/users/admin) &&
+         firestore.get(/databases/(default)/documents/users/admin).data.uid == request.auth.uid) ||
+        (firestore.exists(/databases/(default)/documents/users/syhr) &&
+         firestore.get(/databases/(default)/documents/users/syhr).data.uid == request.auth.uid)
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() &&
+             request.auth.token.email != null &&
+             request.auth.token.email.lower() == (userId + '@shyuan-hrm.com').lower();
+    }
+
+    // Leave attachments are the only files used by the application.
+    match /leave_attachments/{userId}/{fileName} {
+      allow read: if isAdmin() || isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       request.resource.size <= 5 * 1024 * 1024 &&
+                       request.resource.contentType != null &&
+                       (request.resource.contentType.matches('image/.*') ||
+                        request.resource.contentType == 'application/pdf');
+
+      // Uploads use unique filenames, so replacing an existing file is never needed.
+      allow update: if false;
+      allow delete: if isAdmin() || isOwner(userId);
+    }
+  }
+}

@@ -1,5 +1,5 @@
 
-import { Holiday } from '../types';
+import type { AttendanceRecord, Holiday } from '../types';
 
 // 使用模組級變數作為 Singleton 狀態儲存
 // 這是為了確保時間計算基準點 (Anchor) 唯一且不受元件重繪影響
@@ -16,6 +16,7 @@ export const TimeService = {
     const fetchWithTimeout = async (url: string, timeout = 3000) => {
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), timeout);
+      const requestStartedAt = Date.now();
       try {
         const response = await fetch(url, { 
             signal: controller.signal,
@@ -51,12 +52,9 @@ export const TimeService = {
 
         if (!serverTime) throw new Error('Invalid Data Format');
         
-        // 核心邏輯：建立時間錨點
-        _anchorServerTime = serverTime;
-        _anchorPerfTime = performance.now();
-
-        const localTime = Date.now();
-        return serverTime - localTime;
+        const responseReceivedAt = Date.now();
+        const localMidpoint = requestStartedAt + (responseReceivedAt - requestStartedAt) / 2;
+        return serverTime - localMidpoint;
       } catch (e) {
         clearTimeout(id);
         throw e;
@@ -71,7 +69,7 @@ export const TimeService = {
           return reject(new Error('No promises passed'));
         }
         promises.forEach(p => {
-          Promise.resolve(p).then(resolve).catch((e) => {
+          Promise.resolve(p).then(resolve).catch(() => {
             rejectedCount++;
             if (rejectedCount === promises.length) {
               reject(new Error('All promises rejected'));
@@ -87,6 +85,14 @@ export const TimeService = {
         fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
         fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601')
       ]);
+
+      // Only the winning request may establish the page clock, and only once.
+      // The old implementation let both racing requests overwrite the shared
+      // anchor every ten seconds, causing visible time jumps.
+      if (_anchorServerTime === null) {
+        _anchorServerTime = Date.now() + offset;
+        _anchorPerfTime = performance.now();
+      }
       return offset;
     } catch (e) {
       // 網路時間獲取完全失敗，嚴格禁止使用本機時間或任何後備方案
@@ -108,6 +114,22 @@ export const TimeService = {
     // 降級方案：如果尚未對時成功，只能依賴本地時間 + 偏移量
     // (注意：打卡功能會強制要求 getNetworkTimeOffset() 成功，此處僅供 UI 顯示)
     return new Date(Date.now() + offset);
+  },
+
+  getAttendanceDate: (record: AttendanceRecord): string => {
+    const timestamp = record.createdAt as any;
+    if (timestamp?.toDate instanceof Function) {
+      return TimeService.getTaiwanDate(timestamp.toDate());
+    }
+    return TimeService.getTaiwanDate(record.date);
+  },
+
+  getAttendanceTime: (record: AttendanceRecord, withSeconds = true): string => {
+    const timestamp = record.createdAt as any;
+    if (timestamp?.toDate instanceof Function) {
+      return TimeService.getTaiwanTime(timestamp.toDate()).substring(0, withSeconds ? 8 : 5);
+    }
+    return TimeService.formatTimeOnly(record.time, withSeconds);
   },
 
   /**

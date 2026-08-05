@@ -7,11 +7,11 @@ export enum UserRole {
 export interface User {
   id: string; // Username (e.g. 'admin')
   uid?: string; // Firebase Auth UID (Critical for Security Rules)
-  pass: string;
   name: string;
   role: UserRole;
   dept: string;
   deleted?: boolean;
+  mustChangePassword?: boolean;
   onboard_date?: string;
   quota_annual: number;
   quota_birthday: number;
@@ -38,6 +38,7 @@ export interface LeaveChangeHistory {
 
 export interface AttendanceRecord {
   id: number;
+  firestoreId?: string;
   userId: string;
   userName: string;
   date: string; // YYYY-MM-DD
@@ -49,6 +50,7 @@ export interface AttendanceRecord {
   dist: number;
   photo?: string; // Base64 string of the selfie
   uid?: string; // Added for robust security rules
+  createdAt?: { toDate: () => Date } | Date | string; // Trusted Firestore server timestamp for new records
 }
 
 export interface LeaveAttachment {
@@ -106,7 +108,6 @@ export interface Holiday {
 }
 
 export interface AppSettings {
-  gasUrl: string;
   companyLat: number;
   companyLng: number;
   allowedRadius: number;

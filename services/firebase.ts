@@ -3,6 +3,7 @@ import { initializeApp, getApp, getApps } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signOut } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
+import { getFunctions } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: "AIzaSyChRSqy8ubnhGQgGAA0bfe-gFOLWTJxmMk",
@@ -15,10 +16,12 @@ const firebaseConfig = {
 };
 
 // 1. 主要 App (當前登入者使用)
-const app = initializeApp(firebaseConfig);
+export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 export const storage = getStorage(app); // Standard initialization
+// The callable password-reset function is deployed in the Taiwan region.
+export const functions = getFunctions(app, 'asia-east1');
 
 // 2. 次要 App (專門用來讓管理員建立新員工帳號)
 // 這是因為 Firebase Client SDK 只要一呼叫 createUserWithEmailAndPassword 就會自動把當前使用者登出並登入新帳號

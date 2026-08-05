@@ -1,16 +1,18 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { User, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
+import { User, LeaveRequest, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { calculateOTWithDeduction } from '../utils/otCalculator';
+import { analyzeAttendanceCompleteness } from '../utils/attendanceStatus';
+import { createXlsxBlob } from '../utils/xlsxExporter';
+import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
+import { AdminService } from '../services/adminService';
 import { Button } from './ui/Button';
-import { auth } from '../services/firebase';
-import { sendPasswordResetEmail } from 'firebase/auth';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, Mail, Filter, Paperclip, X, Plus
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, KeyRound, Filter, Paperclip, X, Plus
 } from 'lucide-react';
 
 export const AdminDashboard: React.FC = () => {
@@ -38,6 +40,8 @@ export const AdminDashboard: React.FC = () => {
   const [targetUser, setTargetUser] = useState<User | null>(null);
   const [editUserForm, setEditUserForm] = useState({ name: '', dept: '' });
   const [addUserForm, setAddUserForm] = useState({ id: '', pass: '', name: '', dept: '' });
+  const [isResettingPassword, setIsResettingPassword] = useState(false);
+  const [temporaryPassword, setTemporaryPassword] = useState<string | null>(null);
   
   // Settings Modal State
   const [settingsForm, setSettingsForm] = useState({
@@ -214,6 +218,7 @@ export const AdminDashboard: React.FC = () => {
   const openEditUserModal = (user: User) => {
     setTargetUser(user);
     setEditUserForm({ name: user.name, dept: user.dept });
+    setTemporaryPassword(null);
     setIsEditUserModalOpen(true);
   };
 
@@ -359,8 +364,20 @@ export const AdminDashboard: React.FC = () => {
     link.click();
   };
 
-  const handleExportAllAttendance = () => {
+  const handleExportAllAttendance = async () => {
     if (!attExportStart || !attExportEnd) return showToast("請選擇匯出日期區間", "error");
+
+    let attendanceRecords: AppData['records'];
+    try {
+        // The live dashboard intentionally holds only the latest 500 records.
+        // Export the requested range from Firestore so an incomplete cache can
+        // never produce a misleading report.
+        attendanceRecords = await StorageService.fetchAttendanceRecords(attExportStart, attExportEnd);
+    } catch (error) {
+        console.error('Attendance export query failed', error);
+        showToast('無法取得完整打卡資料，已取消匯出，請稍後再試', 'error');
+        return;
+    }
 
     // 1. Generate all dates in range for Attendance
     const dateArray: string[] = [];
@@ -390,8 +407,8 @@ export const AdminDashboard: React.FC = () => {
 
         dateArray.forEach(dateStr => {
             // Find Records for this User & Date
-            const dayRecords = data.records.filter(r => 
-                r.userId === user.id && TimeService.getTaiwanDate(r.date) === dateStr
+            const dayRecords = attendanceRecords.filter(r => 
+                r.userId === user.id && TimeService.getAttendanceDate(r) === dateStr
             );
 
             // Find Approved Leaves for this User & Date
@@ -421,7 +438,7 @@ export const AdminDashboard: React.FC = () => {
             let inRecord: any = null;
             let outRecord: any = null;
             if (dayRecords.length > 0) {
-                dayRecords.sort((a,b) => a.time.localeCompare(b.time));
+                dayRecords.sort((a,b) => TimeService.getAttendanceTime(a).localeCompare(TimeService.getAttendanceTime(b)));
                 
                 const firstInIdx = dayRecords.findIndex(r => r.type === 'in');
                 const validRecords = firstInIdx !== -1 ? dayRecords.slice(firstInIdx) : [];
@@ -433,19 +450,23 @@ export const AdminDashboard: React.FC = () => {
                 outRecord = outRecords.length > 0 ? outRecords[outRecords.length - 1] : null; // Latest out
                 
                 if (inRecords.length > 1) {
-                    midInTime = inRecords.slice(1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+                    midInTime = inRecords.slice(1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
                 }
                 if (outRecords.length > 1) {
-                    midOutTime = outRecords.slice(0, outRecords.length - 1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+                    midOutTime = outRecords.slice(0, outRecords.length - 1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
                 }
 
                 if (inRecord) {
-                    inTime = TimeService.formatTimeOnly(inRecord.time, true);
-                    inLoc = `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`;
+                    inTime = TimeService.getAttendanceTime(inRecord, true);
+                    inLoc = Number.isFinite(inRecord.lat) && Number.isFinite(inRecord.lng)
+                      ? `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`
+                      : '--';
                 }
                 if (outRecord) {
-                    outTime = TimeService.formatTimeOnly(outRecord.time, true);
-                    outLoc = `(${outRecord.lat.toFixed(5)}, ${outRecord.lng.toFixed(5)})`;
+                    outTime = TimeService.getAttendanceTime(outRecord, true);
+                    outLoc = Number.isFinite(outRecord.lat) && Number.isFinite(outRecord.lng)
+                      ? `(${outRecord.lat.toFixed(5)}, ${outRecord.lng.toFixed(5)})`
+                      : '--';
                 }
             }
 
@@ -506,6 +527,8 @@ export const AdminDashboard: React.FC = () => {
                     // 2. Add work tracking to events timeline
                     if (dayRecords.length > 0) {
                         let workParts: string[] = [];
+                        const completeness = analyzeAttendanceCompleteness(dayRecords);
+                        if (completeness === 'invalid') workParts.push('無法辨識的打卡紀錄');
                         if (inRecord) {
                             if (inTime <= "08:00:00") workParts.push("提早打卡");
                             if (inTime > expectedInThreshold) workParts.push("遲到");
@@ -521,10 +544,14 @@ export const AdminDashboard: React.FC = () => {
                             }
                         }
 
-                        if (inRecord && !outRecord) workParts.push("缺下班卡");
-                        if (!inRecord && outRecord) workParts.push("缺上班卡");
+                        if (completeness === 'missing-out') workParts.push("缺下班卡");
+                        if (completeness === 'missing-in') workParts.push("缺上班卡");
 
-                        if (workParts.length === 0) workParts.push("正常");
+                        if (workParts.length === 0 && completeness === 'complete') {
+                            workParts.push("正常");
+                        } else if (workParts.length === 0) {
+                            workParts.push("打卡資料異常");
+                        }
 
                         events.push({
                             start: inTime !== '--' ? inTime : expectedIn,
@@ -598,26 +625,25 @@ export const AdminDashboard: React.FC = () => {
     });
 
     // --- Create and Download Excel File ---
-    import('xlsx').then(XLSX => {
-        const wb = XLSX.utils.book_new();
-        
-        const wsAttendance = XLSX.utils.aoa_to_sheet(attendanceData);
-        XLSX.utils.book_append_sheet(wb, wsAttendance, "出勤");
-        
-        const wsLeave = XLSX.utils.aoa_to_sheet(leaveData);
-        XLSX.utils.book_append_sheet(wb, wsLeave, "請假");
-        
-        const wsOT = XLSX.utils.aoa_to_sheet(otData);
-        XLSX.utils.book_append_sheet(wb, wsOT, "加班");
-        
-        XLSX.writeFile(wb, `考勤紀錄_${attExportStart}_${attExportEnd}.xlsx`);
-        
+    try {
+        const blob = createXlsxBlob([
+          { name: '出勤', rows: attendanceData },
+          { name: '請假', rows: leaveData },
+          { name: '加班', rows: otData }
+        ]);
+        const downloadUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = `考勤紀錄_${attExportStart}_${attExportEnd}.xlsx`;
+        link.click();
+        URL.revokeObjectURL(downloadUrl);
+
         setIsExportAttendanceModalOpen(false);
         showToast("匯出成功", 'success');
-    }).catch(err => {
-        console.error('Failed to load xlsx for export:', err);
+    } catch (err) {
+        console.error('Failed to create Excel export:', err);
         showToast("匯出失敗：缺少匯出套件", 'error');
-    });
+    }
   };
 
   const handleEditUser = async () => {
@@ -630,6 +656,7 @@ export const AdminDashboard: React.FC = () => {
         await StorageService.updateUser(targetUser.id, updates);
         setIsEditUserModalOpen(false);
         setTargetUser(null);
+        setTemporaryPassword(null);
         refreshData();
         showToast("員工資料更新成功", 'success');
     } catch (e: any) {
@@ -637,17 +664,34 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleSendResetEmail = async () => {
-      if(!targetUser) return;
-      let email = targetUser.id;
-      if (!email.includes('@')) {
-          email = `${email}@shyuan-hrm.com`;
+  const handleResetEmployeePassword = async () => {
+      if (!targetUser || isResettingPassword) return;
+      if (targetUser.role !== UserRole.EMPLOYEE) {
+          showToast('只有一般員工帳號可以使用此功能', 'error');
+          return;
       }
+      if (!window.confirm(`確定要重設 ${targetUser.id} 的密碼嗎？目前密碼會立即失效。`)) return;
+
+      setIsResettingPassword(true);
+      setTemporaryPassword(null);
       try {
-          await sendPasswordResetEmail(auth, email);
-          alert(`密碼重設信件已發送至：${email}\n請員工查收信件並設定新密碼。`);
+          const result = await AdminService.resetEmployeePassword(targetUser.id);
+          setTemporaryPassword(result.temporaryPassword);
+          showToast('密碼已重設，請安全交付臨時密碼', 'success');
       } catch (e: any) {
-          alert("發送失敗: " + e.message);
+          showToast('密碼重設失敗：' + getErrorMessage(e), 'error');
+      } finally {
+          setIsResettingPassword(false);
+      }
+  };
+
+  const copyTemporaryPassword = async () => {
+      if (!temporaryPassword) return;
+      try {
+          await navigator.clipboard.writeText(temporaryPassword);
+          showToast('臨時密碼已複製', 'success');
+      } catch {
+          showToast('瀏覽器不允許自動複製，請手動抄錄', 'error');
       }
   };
 
@@ -688,10 +732,11 @@ export const AdminDashboard: React.FC = () => {
   };
 
   const startEditAnn = (ann: Announcement) => {
+    const safeContent = sanitizeAnnouncementHtml(ann.content);
     setEditAnnId(ann.id);
-    setAnnContent(ann.content);
+    setAnnContent(safeContent);
     if (editorRef.current) {
-        editorRef.current.innerHTML = ann.content;
+        editorRef.current.innerHTML = safeContent;
     }
     setTimeout(() => {
         const titleInput = document.getElementById('annTitle') as HTMLInputElement;
@@ -704,7 +749,8 @@ export const AdminDashboard: React.FC = () => {
   const handleAnnSave = async () => {
     const titleInput = document.getElementById('annTitle') as HTMLInputElement;
     const catInput = document.getElementById('annCat') as HTMLSelectElement;
-    if (!titleInput.value || !annContent) return alert("請填寫標題與內容");
+    const safeContent = sanitizeAnnouncementHtml(annContent);
+    if (!titleInput.value || !safeContent.trim()) return alert("請填寫標題與內容");
     
     const today = new Date();
     const year = today.getFullYear();
@@ -714,7 +760,7 @@ export const AdminDashboard: React.FC = () => {
 
     try {
         await StorageService.addAnnouncement({
-          id: editAnnId || Date.now(), title: titleInput.value, content: annContent,
+          id: editAnnId || Date.now(), title: titleInput.value, content: safeContent,
           category: catInput.value as any, date: dateStr, author: '管理員'
         });
         titleInput.value = '';
@@ -772,7 +818,7 @@ export const AdminDashboard: React.FC = () => {
 
   // Modified to support historical date lookup
   const getEmployeeStatus = (uid: string, targetDateStr: string) => {
-    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getTaiwanDate(r.date) === targetDateStr);
+    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getAttendanceDate(r) === targetDateStr);
     
     // Check for approved leaves covering this date
     const userLeaves = data.leaves.filter(l => 
@@ -786,7 +832,7 @@ export const AdminDashboard: React.FC = () => {
     const dayOfWeek = targetDate.getDay();
     const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === targetDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
 
-    userRecords.sort((a,b) => a.time.localeCompare(b.time));
+    userRecords.sort((a,b) => TimeService.getAttendanceTime(a).localeCompare(TimeService.getAttendanceTime(b)));
     const firstInIdx = userRecords.findIndex(r => r.type === 'in');
     const validRecords = firstInIdx !== -1 ? userRecords.slice(firstInIdx) : [];
 
@@ -800,10 +846,10 @@ export const AdminDashboard: React.FC = () => {
     let midOutDisplay = '';
 
     if (sortedIn.length > 1) {
-        midInDisplay = sortedIn.slice(1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+        midInDisplay = sortedIn.slice(1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
     }
     if (sortedOut.length > 1) {
-        midOutDisplay = sortedOut.slice(0, sortedOut.length - 1).map(r => TimeService.formatTimeOnly(r.time, true)).join(', ');
+        midOutDisplay = sortedOut.slice(0, sortedOut.length - 1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
     }
 
     const statusTags: { label: string, color: string }[] = [];
@@ -827,7 +873,7 @@ export const AdminDashboard: React.FC = () => {
 
     // 3. Attendance Logic
     if (firstIn) {
-        const inTimeStr = TimeService.formatTimeOnly(firstIn.time);
+        const inTimeStr = TimeService.getAttendanceTime(firstIn, false);
         
         if (!isHoliday && userLeaves.length === 0) {
             statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
@@ -839,7 +885,7 @@ export const AdminDashboard: React.FC = () => {
         if (lastOut) {
             if (!isHoliday && userLeaves.length === 0) {
                  statusTags.push({ label: '已下班', color: 'text-gray-600 bg-gray-100 border-gray-300' });
-                 const outTimeStr = TimeService.formatTimeOnly(lastOut.time);
+                 const outTimeStr = TimeService.getAttendanceTime(lastOut, false);
                  if (outTimeStr < '17:30') {
                     statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
                  }
@@ -871,8 +917,8 @@ export const AdminDashboard: React.FC = () => {
     }
 
     // Prepare Display Data
-    const inDisplay = firstIn ? `${TimeService.formatTimeOnly(firstIn.time, true)}` : '--';
-    const outDisplay = lastOut ? `${TimeService.formatTimeOnly(lastOut.time, true)}` : '--';
+    const inDisplay = firstIn ? TimeService.getAttendanceTime(firstIn, true) : '--';
+    const outDisplay = lastOut ? TimeService.getAttendanceTime(lastOut, true) : '--';
     
     // Coordinates & Distance
     const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist } : null;
@@ -994,12 +1040,6 @@ export const AdminDashboard: React.FC = () => {
                     {currentTime.toLocaleTimeString('zh-TW', { hour12: false })}
                   </div>
                </div>
-               <div className="flex items-center gap-3">
-                  <div className={`w-3 h-3 rounded-full ${data.settings.gasUrl ? "bg-green-500" : "bg-red-500"} animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]`}></div>
-                  <span className={`text-xl font-black ${data.settings.gasUrl ? "text-green-600" : "text-red-500"}`}>
-                    {data.settings.gasUrl ? "雲端已連線" : "雲端未連線"}
-                  </span>
-               </div>
             </div>
           </div>
           <nav className="flex-1 p-4 space-y-1 overflow-y-auto font-bold">
@@ -1033,7 +1073,7 @@ export const AdminDashboard: React.FC = () => {
         </div>
 
         <main className="flex-1 overflow-auto p-4 md:p-12 pb-24 text-black font-bold custom-scroll">
-          {/* Mobile Header for Time & Cloud Status */}
+          {/* Mobile Header for Time */}
           <div className="md:hidden w-full mb-6 p-4 bg-brand-50 rounded-[24px] border border-brand-100 flex flex-col gap-2">
              <div className="flex justify-between items-start">
                 <div className="flex flex-col">
@@ -1045,12 +1085,6 @@ export const AdminDashboard: React.FC = () => {
                    <div className="font-mono text-2xl font-black text-brand-800">{currentTime.toLocaleTimeString('zh-TW', { hour12: false })}</div>
                    <div className="font-mono text-xs font-black text-brand-700">{currentTime.toLocaleDateString('zh-TW', { weekday: 'long' })}</div>
                 </div>
-             </div>
-             <div className="flex items-center gap-2 mt-1 border-t border-brand-100 pt-2">
-                <div className={`w-2 h-2 rounded-full ${data.settings.gasUrl ? "bg-green-500" : "bg-red-500"} animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]`}></div>
-                <span className={`text-xs font-black ${data.settings.gasUrl ? "text-green-600" : "text-red-500"}`}>
-                  {data.settings.gasUrl ? "雲端已連線" : "雲端未連線"}
-                </span>
              </div>
           </div>
 
@@ -1559,7 +1593,7 @@ export const AdminDashboard: React.FC = () => {
                                  </span>
                               </div>
                               <h4 className="text-lg md:text-xl font-black text-gray-800 mb-3">{ann.title}</h4>
-                              <div className="text-gray-600 prose prose-sm max-w-none font-bold text-sm md:text-base" dangerouslySetInnerHTML={{ __html: ann.content }} />
+                              <div className="text-gray-600 prose prose-sm max-w-none font-bold text-sm md:text-base" dangerouslySetInnerHTML={{ __html: sanitizeAnnouncementHtml(ann.content) }} />
                            </div>
                            <div className="flex gap-2 self-end md:self-start md:opacity-0 group-hover:opacity-100 transition-all md:ml-4">
                               <button onClick={()=>startEditAnn(ann)} className="p-2 md:p-3 hover:bg-brand-50 text-brand-600 rounded-2xl"><Edit3 size={18}/></button>
@@ -1658,7 +1692,6 @@ export const AdminDashboard: React.FC = () => {
 
                    try {
                        await StorageService.updateSettings({
-                          gasUrl: "disabled", 
                           companyLat,
                           companyLng,
                           allowedRadius,
@@ -1668,7 +1701,6 @@ export const AdminDashboard: React.FC = () => {
                        showToast("設定儲存失敗: " + getErrorMessage(e), 'error');
                    }
                 }}>
-                   {/* Google Sheets API Input REMOVED */}
                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-8">
                       <div className="space-y-4">
                         <label className="text-base md:text-lg font-black text-gray-800 ml-2">公司座標 (緯度)</label>
@@ -1705,7 +1737,7 @@ export const AdminDashboard: React.FC = () => {
                               }
                           
                               let fixedCount = 0;
-                              for (const [key, userOts] of groups) {
+                              for (const [, userOts] of groups) {
                                   userOts.sort((a,b) => new Date(a.start.replace(' ', 'T')).getTime() - new Date(b.start.replace(' ', 'T')).getTime());
                                   const existing: any[] = [];
                                   
@@ -1921,15 +1953,24 @@ export const AdminDashboard: React.FC = () => {
                  <div className="bg-yellow-50 p-4 rounded-2xl border border-yellow-100 mt-2">
                     <div className="flex items-start gap-2 text-yellow-700 text-xs font-black mb-3">
                        <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
-                       <span>安全提示：管理員無法直接修改員工密碼，請使用下方按鈕發送重設信件。</span>
+                       <span>重設後原密碼立即失效，員工首次登入必須更換新密碼。</span>
                     </div>
-                    <Button type="button" onClick={handleSendResetEmail} className="w-full bg-white border-2 border-yellow-200 text-yellow-700 hover:bg-yellow-100 rounded-xl py-3 text-sm flex items-center justify-center gap-2">
-                       <Mail size={16}/> 發送密碼重設信件
+                    <Button type="button" onClick={handleResetEmployeePassword} disabled={isResettingPassword || targetUser.role !== UserRole.EMPLOYEE} isLoading={isResettingPassword} className="w-full bg-white border-2 border-yellow-200 text-yellow-700 hover:bg-yellow-100 rounded-xl py-3 text-sm flex items-center justify-center gap-2">
+                       <KeyRound size={16}/> 產生臨時密碼並重設
                     </Button>
+                    {temporaryPassword && (
+                      <div className="mt-3 rounded-xl border border-yellow-200 bg-white p-3">
+                        <div className="text-[11px] text-yellow-700 font-black mb-1">請只透過安全管道交付，關閉視窗後不會再次顯示</div>
+                        <div className="flex items-center gap-2">
+                          <code className="flex-1 rounded-lg bg-gray-100 px-3 py-2 text-center text-base tracking-widest text-gray-900 select-all">{temporaryPassword}</code>
+                          <Button type="button" variant="secondary" className="rounded-lg px-3 py-2 text-xs" onClick={copyTemporaryPassword}>複製</Button>
+                        </div>
+                      </div>
+                    )}
                  </div>
 
                  <div className="flex gap-4 pt-4">
-                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>setIsEditUserModalOpen(false)}>取消</Button>
+                    <Button variant="secondary" className="flex-1 rounded-2xl" onClick={()=>{setIsEditUserModalOpen(false); setTemporaryPassword(null);}}>取消</Button>
                     <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleEditUser}>儲存變更</Button>
                  </div>
               </div>
@@ -1949,7 +1990,7 @@ export const AdminDashboard: React.FC = () => {
                  </div>
                  <div className="space-y-1">
                     <label className="text-xs text-gray-400 ml-2">預設密碼</label>
-                    <input type="text" value={addUserForm.pass} onChange={e=>setAddUserForm({...addUserForm, pass: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" placeholder="至少6位數" />
+                    <input type="password" autoComplete="new-password" value={addUserForm.pass} onChange={e=>setAddUserForm({...addUserForm, pass: e.target.value})} className="w-full p-4 bg-white border border-gray-100 rounded-2xl outline-none font-black" placeholder="至少6位數" />
                  </div>
                  <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-1">

@@ -5,7 +5,7 @@ import { TimeService } from '../services/timeService';
 import { getDistanceFromLatLonInM } from '../utils/geo';
 import { calculateOTWithDeduction } from '../utils/otCalculator';
 import { Button } from './ui/Button';
-import { MapPin, Calendar, BadgeCheck, Zap, Clock, Search, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw, Paperclip, FileText, X } from 'lucide-react';
+import { MapPin, Calendar, BadgeCheck, Zap, Clock, XCircle, RotateCcw, CheckCircle, AlertTriangle, Loader2, Filter, Trash2, RefreshCw, Paperclip, FileText, X } from 'lucide-react';
 import { LEAVE_TYPES } from '../constants';
 
 interface EmployeeDashboardProps {
@@ -16,8 +16,8 @@ interface EmployeeDashboardProps {
 }
 
 const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
-  const dateStr = TimeService.getTaiwanDate(r.date);
-  const displayTime = TimeService.formatTimeOnly(r.time, true);
+  const dateStr = TimeService.getAttendanceDate(r);
+  const displayTime = TimeService.getAttendanceTime(r, true);
 
   return (
     <div className="p-4 bg-white border-2 rounded-[24px] shadow-sm transition-all hover:shadow-md flex items-center justify-between">
@@ -107,7 +107,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     reason: ''
   });
 
-  const [permissionState, setPermissionState] = useState<PermissionState | 'unknown'>('unknown');
   const watchIdRef = useRef<number | null>(null);
 
   const handlePunchFilterChange = (setter: React.Dispatch<React.SetStateAction<string>>, val: string) => {
@@ -165,8 +164,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     setDynamicOffset(timeOffset);
   }, [timeOffset]);
 
-  // 1. [Requirement: 10s Interval Sync]
-  // Polling network time every 10 seconds to ensure the clock is always calibrated
+  // Recheck the external source infrequently. TimeService keeps the page clock
+  // monotonic and will not re-anchor it while the user is viewing the page.
   useEffect(() => {
     const syncTimer = setInterval(async () => {
       // Background sync - silent unless major error (optional to log)
@@ -178,7 +177,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       } catch (e) {
         // Silently fail in background, keep using last known offset
       }
-    }, 10000);
+    }, 5 * 60 * 1000);
 
     return () => clearInterval(syncTimer);
   }, []);
@@ -198,7 +197,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
       const successHandler = (pos: GeolocationPosition) => {
         setGpsError('');
-        setPermissionState('granted');
         if (settings.companyLat && settings.companyLng) {
           setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
         } else {
@@ -211,7 +209,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
          
          if (err.code === 1) { // PERMISSION_DENIED
              setGpsError("定位權限已被拒絕");
-             setPermissionState('denied');
              setDistance(null);
              return; // Crucial: Do not retry if explicitly denied
          }
@@ -270,7 +267,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   // Derive state from localData whenever it changes
   useEffect(() => {
       const userRecords = localData.records
-        .filter(r => r.userId === user.id && r.date >= minPunchHistoryDate)
+        .filter(r => r.userId === user.id && TimeService.getAttendanceDate(r) >= minPunchHistoryDate)
         .sort((a, b) => b.id - a.id);
       setRecords(userRecords);
       setHolidays(localData.holidays);
@@ -292,7 +289,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const todayStr = TimeService.getTaiwanDate(now);
   const currentTimeStr = TimeService.getTaiwanTime(now);
   
-  const lastRecord = records.length > 0 ? records[0] : null;
+  // Punch direction must be derived from today's records only. Previously the
+  // final punch from a prior day could make today's first punch an "out".
+  const lastRecord = records.find(record => TimeService.getAttendanceDate(record) === todayStr) || null;
   const currentPunchType = lastRecord?.type === 'in' ? 'out' : 'in';
   
   const isLocationReady = distance !== null;
@@ -312,6 +311,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       for (const file of filesArray) {
         if (file.size > 5 * 1024 * 1024) {
           setNotification({ type: 'error', message: `文件 ${file.name} 超過 5MB 上限` });
+          return;
+        }
+        if (!(file.type.startsWith('image/') || file.type === 'application/pdf')) {
+          setNotification({ type: 'error', message: `文件 ${file.name} 不是允許的圖片或 PDF` });
           return;
         }
       }
@@ -451,6 +454,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const finishPunch = async (status: string, lat: number, lng: number) => {
     let finalStatus = status;
+    const punchNow = TimeService.getCorrectedNow(dynamicOffset);
     
     // Server-side check simulation: Re-verify distance with fresh coords
     if (settings.companyLat) {
@@ -481,8 +485,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       userId: user.id,
       uid: user.uid, // PASS UID HERE
       userName: user.name,
-      date: todayStr,
-      time: currentTimeStr,
+      date: TimeService.getTaiwanDate(punchNow),
+      time: TimeService.getTaiwanTime(punchNow),
       type: currentPunchType,
       status: finalStatus,
       lat: lat, 
@@ -1224,8 +1228,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               <div className="flex-1 overflow-y-auto custom-scroll space-y-3">
                  {(() => {
                     const filteredRecords = records.filter(r => {
-                       if (punchFilterStart && r.date < punchFilterStart) return false;
-                       if (punchFilterEnd && r.date > punchFilterEnd) return false;
+                       const recordDate = TimeService.getAttendanceDate(r);
+                       if (punchFilterStart && recordDate < punchFilterStart) return false;
+                       if (punchFilterEnd && recordDate > punchFilterEnd) return false;
                        return true;
                     });
                     
@@ -1236,11 +1241,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     return filteredRecords.map(r => (
                         <div key={r.id} className="p-4 bg-gray-50 border rounded-2xl flex items-center justify-between">
                            <div>
-                              <div className="text-xs font-black text-gray-400">{TimeService.getTaiwanDate(r.date)}</div>
+                              <div className="text-xs font-black text-gray-400">{TimeService.getAttendanceDate(r)}</div>
                               <div className={`text-sm font-black ${r.type==='in'?'text-brand-600':'text-red-600'}`}>{r.type==='in'?'上班':'下班'}</div>
                            </div>
                            <div className="flex-1 text-center">
-                              <div className="text-xl font-mono font-black text-gray-800">{TimeService.formatTimeOnly(r.time, true)}</div>
+                              <div className="text-xl font-mono font-black text-gray-800">{TimeService.getAttendanceTime(r, true)}</div>
                            </div>
                            <div className="flex flex-col items-end gap-1 min-w-[60px]">
                               <div className={`px-2 py-0.5 rounded text-[10px] text-white text-center w-full font-black ${r.type === 'in' ? 'bg-green-600' : 'bg-red-600'}`}>

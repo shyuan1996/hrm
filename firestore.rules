@@ -6,14 +6,27 @@ service cloud.firestore {
     // --- Helper Functions ---
 
     function isAdmin() {
-      return request.auth != null && 
-             exists(/databases/$(database)/documents/users/admin) &&
-             get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid;
+      return request.auth != null && (
+        (exists(/databases/$(database)/documents/users/admin) &&
+         get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid) ||
+        (exists(/databases/$(database)/documents/users/syhr) &&
+         get(/databases/$(database)/documents/users/syhr).data.get('uid', '') == request.auth.uid)
+      );
     }
 
     // Helper: Normalize email to lowercase for comparison
     function isEmailMatch(id) {
-       return request.auth.token.email.lower() == (id + '@shyuan-hrm.com').lower();
+       return request.auth != null &&
+              request.auth.token.email != null &&
+              request.auth.token.email.lower() == (id + '@shyuan-hrm.com').lower();
+    }
+
+    // A temporary-password account may read its own profile so it can clear
+    // this marker, but it cannot access attendance or request data first.
+    function canUseEmployeeData(userId) {
+      return userId != '' &&
+             exists(/databases/$(database)/documents/users/$(userId)) &&
+             get(/databases/$(database)/documents/users/$(userId)).data.get('mustChangePassword', false) != true;
     }
 
     // Helper: Check if the user owns the document (Read/Update/Delete context)
@@ -22,25 +35,34 @@ service cloud.firestore {
       let docUserId = resource.data.get('userId', '');
       
       return request.auth != null && (
-        (docUid != null && docUid == request.auth.uid) || 
-        (docUserId != '' && isEmailMatch(docUserId))
+        (docUid != null && docUid == request.auth.uid &&
+         (docUserId == '' || canUseEmployeeData(docUserId))) ||
+        (docUserId != '' && isEmailMatch(docUserId) && canUseEmployeeData(docUserId))
       );
     }
 
     // Helper: Check if the user is creating data for themselves (Create context)
     function isCreatingOwnResource() {
-       return request.auth != null && (
-         request.resource.data.get('uid', '') == request.auth.uid ||
-         isEmailMatch(request.resource.data.get('userId', ''))
-       );
+       return request.auth != null &&
+              request.resource.data.get('uid', '') == request.auth.uid &&
+              isEmailMatch(request.resource.data.get('userId', '')) &&
+              canUseEmployeeData(request.resource.data.get('userId', ''));
     }
 
     // --- Collection Rules ---
 
     // Security Logs (New)
     match /security_logs/{logId} {
-      // 允許所有已認證使用者寫入日誌 (為了記錄異常嘗試)
-      allow create: if request.auth != null;
+      allow create: if request.auth != null &&
+                       request.resource.data.uid == request.auth.uid &&
+                       request.resource.data.timestamp == request.time &&
+                       request.resource.data.action is string &&
+                       request.resource.data.action.size() <= 100 &&
+                       request.resource.data.details is string &&
+                       request.resource.data.details.size() <= 1000 &&
+                       request.resource.data.keys().hasOnly([
+                         'uid', 'email', 'action', 'details', 'timestamp', 'userAgent'
+                       ]);
       // 僅管理員可讀取與管理日誌
       allow read, update, delete: if isAdmin();
     }
@@ -48,48 +70,42 @@ service cloud.firestore {
     // Users Collection
     match /users/{userId} {
       // Security fix: Employees can only read their own data. Admin can read all.
-      allow read: if isAdmin() || (request.auth != null && (userId == 'admin' ? false : isResourceOwner()));
+      allow read: if isAdmin() || (
+        request.auth != null &&
+        userId != 'admin' &&
+        userId != 'syhr' &&
+        isResourceOwner()
+      );
       
-      // Write Rules (Update/Create)
-      allow write: if 
-        // 1. 管理員擁有完全權限
-        isAdmin() || 
-        (
-          request.auth != null &&
-          
-          // 2. 安全核心：絕對禁止非管理員寫入/覆蓋 'admin' 文件
-          userId != 'admin' &&
-          
-          // 3. 權限檢查：必須是該文件的擁有者
-          (isEmailMatch(userId) || resource == null || resource.data.get('uid', '') == request.auth.uid) &&
-          
-          // 4. 防止權限提升 (Privilege Escalation)
-          // 嘗試寫入的 role 必須是 'employee'，或者保持原值不變 (不能把自己改成 admin)
-          (request.resource.data.get('role', 'employee') == 'employee' || request.resource.data.get('role', '') == resource.data.get('role', '')) &&
-          
-          // 5. 資料完整性保護 (Data Integrity)
-          // 更新時：禁止修改額度、到職日、部門
-          // 創建時：允許 (Login.tsx 自動建立檔案時會寫入初始值)
-          (
-            resource == null || 
-            (
-              // 禁止修改假別額度
-              request.resource.data.get('quota_annual', 0) == resource.data.get('quota_annual', 0) &&
-              request.resource.data.get('quota_birthday', 0) == resource.data.get('quota_birthday', 0) &&
-              request.resource.data.get('quota_comp', 0) == resource.data.get('quota_comp', 0) &&
-              // 禁止修改人事核心資料 (防止員工竄改年資或部門)
-              request.resource.data.get('onboard_date', '') == resource.data.get('onboard_date', '') &&
-              request.resource.data.get('dept', '') == resource.data.get('dept', '')
-            )
-          )
-        );
+      // New employee profiles and all HR fields are administrator-managed.
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        request.auth != null &&
+        userId != 'admin' &&
+        userId != 'syhr' &&
+        isEmailMatch(userId) &&
+        request.resource.data.get('uid', '') == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid', 'mustChangePassword']) &&
+        request.resource.data.get('mustChangePassword', false) == false
+      );
     }
 
     // Records (Attendance)
     match /records/{recordId} {
       allow read: if isAdmin() || isResourceOwner();
-      // 建立打卡紀錄：必須是本人
-      allow create: if isCreatingOwnResource();
+      // The employee may only create a structurally valid record for themself.
+      // During rollout, an already-open legacy page may omit createdAt. New
+      // clients always send serverTimestamp(), which must resolve to request.time.
+      // After all clients have refreshed, remove the fallback to enforce it.
+      allow create: if isCreatingOwnResource() &&
+                       request.resource.data.get('createdAt', request.time) == request.time &&
+                       request.resource.data.type in ['in', 'out'] &&
+                       request.resource.data.status in ['正常', '地點異常'] &&
+                       request.resource.data.date is string &&
+                       request.resource.data.time is string &&
+                       request.resource.data.lat is number &&
+                       request.resource.data.lng is number &&
+                       request.resource.data.dist is number;
       // 修改/刪除：僅限管理員
       allow update, delete: if isAdmin();
     }
@@ -105,11 +121,9 @@ service cloud.firestore {
       
       // 更新規則：本人只能將狀態改為 cancelled (取消申請)
       allow update: if isAdmin() || (
-        isResourceOwner() && 
+        isResourceOwner() &&
         request.resource.data.status == 'cancelled' &&
-        // 防止在取消時順便修改時數或事由
-        request.resource.data.hours == resource.data.hours &&
-        request.resource.data.type == resource.data.type
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
       );
       
       // 刪除規則：僅限管理員
@@ -127,9 +141,9 @@ service cloud.firestore {
       
       // 更新規則：本人只能將狀態改為 cancelled
       allow update: if isAdmin() || (
-        isResourceOwner() && 
+        isResourceOwner() &&
         request.resource.data.status == 'cancelled' &&
-        request.resource.data.hours == resource.data.hours
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
       );
       
       // 刪除規則：僅限管理員

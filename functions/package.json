@@ -1,0 +1,22 @@
+{
+  "name": "smart-attendance-functions",
+  "private": true,
+  "engines": {
+    "node": "20"
+  },
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.2.0",
+    "firebase-functions": "^7.3.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
+}

@@ -1,11 +1,11 @@
 
-import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, UserRole, LeaveAttachment } from '../types';
+import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, LeaveAttachment, QuotaBucket, LeaveChangeHistory } from '../types';
 import { STORAGE_KEY, DEFAULT_SETTINGS } from '../constants';
 import { TimeService } from './timeService';
 import { db, auth, createAuthUser, storage } from './firebase'; // Import storage
 import { 
-  collection, doc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, 
-  onSnapshot, query, orderBy, where, Timestamp, limit 
+  collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, 
+  onSnapshot, query, orderBy, where, limit, serverTimestamp
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 
@@ -34,6 +34,81 @@ let _memoryCache: AppData = getInitialData();
 let _listeners: Function[] = [];
 
 export const StorageService = {
+
+  /**
+   * Resolve the Firestore profile from the authenticated Firebase UID.
+   * Account IDs are only a legacy fallback because their casing was not
+   * historically normalized when an administrator created an employee.
+   */
+  getUserProfileForAuth: async (uid: string, email?: string | null, preferredId?: string): Promise<User | null> => {
+    const byUid = query(collection(db, 'users'), where('uid', '==', uid), limit(2));
+    try {
+      const snapshot = await getDocs(byUid);
+      if (snapshot.size > 1) {
+        throw new Error('DUPLICATE_USER_PROFILE');
+      }
+      if (snapshot.size === 1) {
+        const profileDoc = snapshot.docs[0];
+        return { ...profileDoc.data(), id: profileDoc.id } as User;
+      }
+    } catch (error: any) {
+      if (error?.message === 'DUPLICATE_USER_PROFILE') throw error;
+      // Older rule deployments may reject UID collection queries. The
+      // document-ID fallback below remains safe and never creates a profile.
+      console.warn('UID profile lookup failed; trying legacy document ID.', error?.code || error);
+    }
+
+    const emailId = email?.split('@')[0]?.trim().toLowerCase();
+    const candidateIds = Array.from(new Set([preferredId, emailId].filter(Boolean) as string[]));
+
+    for (const candidateId of candidateIds) {
+      const profileRef = doc(db, 'users', candidateId);
+      try {
+        const profileSnap = await getDoc(profileRef);
+        if (profileSnap.exists()) {
+          const profile = profileSnap.data() as User;
+          if (profile.uid && profile.uid !== uid) throw new Error('PROFILE_UID_MISMATCH');
+          return { ...profile, id: profileSnap.id, uid } as User;
+        }
+      } catch (error: any) {
+        if (error?.message === 'PROFILE_UID_MISMATCH') throw error;
+        if (error?.code !== 'permission-denied') throw error;
+      }
+
+      // Legacy profiles without a UID cannot be read by current rules. Use
+      // updateDoc (never setDoc) so a missing profile cannot become a new,
+      // empty employee account by accident.
+      if (candidateId === emailId && candidateId !== 'admin') {
+        try {
+          await updateDoc(profileRef, { uid });
+          const claimedSnap = await getDoc(profileRef);
+          if (claimedSnap.exists()) {
+            return { ...claimedSnap.data(), id: claimedSnap.id, uid } as User;
+          }
+        } catch (error: any) {
+          if (error?.code !== 'not-found' && error?.code !== 'permission-denied') throw error;
+        }
+      }
+    }
+
+    return null;
+  },
+
+  stopRealtimeSync: () => {
+    _listeners.forEach(unsubscribe => unsubscribe());
+    _listeners = [];
+  },
+
+  clearPrivateCache: () => {
+    _memoryCache = {
+      ..._memoryCache,
+      users: [],
+      records: [],
+      leaves: [],
+      overtimes: []
+    };
+    StorageService._saveToLocal();
+  },
   
   /**
    * 初始化 Firestore 監聽器 (Realtime Sync)
@@ -41,8 +116,13 @@ export const StorageService = {
    */
   initRealtimeSync: (userId?: string, role?: string) => {
     // Clear existing listeners
-    _listeners.forEach(unsubscribe => unsubscribe());
-    _listeners = [];
+    StorageService.stopRealtimeSync();
+
+    // Never expose the previous account's protected cache while listeners for
+    // another account are still loading (especially on shared browsers).
+    if (!userId || !_memoryCache.users.some(user => user.id === userId)) {
+      StorageService.clearPrivateCache();
+    }
 
     // --- Public Data (Announcements, Holidays) ---
     // Assuming Firestore Security Rules allow public read for these
@@ -148,7 +228,16 @@ export const StorageService = {
   // Helper: Save memory cache to localStorage
   _saveToLocal: () => {
     try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(_memoryCache));
+        // Persist public configuration only. Employee profiles, attendance,
+        // leave and overtime data remain in memory and disappear on logout or
+        // browser close instead of being left readable on a shared device.
+        const publicCache: AppData = {
+          ...getInitialData(),
+          announcements: _memoryCache.announcements,
+          holidays: _memoryCache.holidays,
+          settings: _memoryCache.settings
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(publicCache));
     } catch (e) {
         console.warn("Failed to save cache to local storage:", e);
     }
@@ -169,13 +258,6 @@ export const StorageService = {
     return _memoryCache;
   },
 
-  /**
-   * Dummy fetch for backward compatibility
-   */
-  fetchCloudData: async (): Promise<AppData | null> => {
-    return _memoryCache;
-  },
-
   // --- Security Logger ---
   logSecurityEvent: async (action: string, details: string) => {
     const user = auth.currentUser;
@@ -186,7 +268,7 @@ export const StorageService = {
                 email: user.email,
                 action,
                 details,
-                timestamp: Timestamp.now(),
+                timestamp: serverTimestamp(),
                 userAgent: navigator.userAgent
             });
         } catch (e) {
@@ -204,6 +286,13 @@ export const StorageService = {
     const uploaded: LeaveAttachment[] = [];
 
     for (const file of files) {
+        if (file.size > 5 * 1024 * 1024) {
+            throw new Error(`檔案 ${file.name} 超過 5MB 上限。`);
+        }
+        if (!(file.type.startsWith('image/') || file.type === 'application/pdf')) {
+            throw new Error(`檔案 ${file.name} 不是允許的圖片或 PDF。`);
+        }
+
         // Path: leave_attachments/{userId}/{timestamp}_{filename}
         const timestamp = Date.now();
         const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_'); // Sanitize filename
@@ -265,19 +354,20 @@ export const StorageService = {
 
   // --- Write Operations (Direct to Firestore) ---
 
-  addUser: async (user: User) => {
+  addUser: async (user: User & { pass: string }) => {
     // 1. 呼叫 Firebase Auth 建立真實的登入帳號
     // 注意：createAuthUser 已經在內部處理了小寫化
-    const authUser = await createAuthUser(user.id, user.pass);
+    const { pass, ...profile } = user;
+    const authUser = await createAuthUser(user.id, pass);
 
     // 2. 建立成功後，將使用者資料寫入 Firestore
     // 這裡同樣確保寫入 Firestore 的 ID 是小寫
     const userIdLower = user.id.toLowerCase();
     await setDoc(doc(db, 'users', userIdLower), {
-        ...user,
+        ...profile,
         id: userIdLower,
-        uid: authUser.uid, // Save UID here
-        pass: 'PROTECTED' 
+        uid: authUser.uid,
+        mustChangePassword: true
     });
   },
 
@@ -333,7 +423,10 @@ export const StorageService = {
     StorageService._saveToLocal();
 
     try {
-        await addDoc(collection(db, 'records'), record);
+        await addDoc(collection(db, 'records'), {
+          ...record,
+          createdAt: serverTimestamp()
+        });
     } catch (e) {
         // Rollback on failure
         console.error("Add Record Failed, rolling back optimistic update", e);
@@ -341,6 +434,19 @@ export const StorageService = {
         StorageService._saveToLocal();
         throw e;
     }
+  },
+
+  fetchAttendanceRecords: async (startDate: string, endDate: string): Promise<AttendanceRecord[]> => {
+    const recordsQ = query(
+      collection(db, 'records'),
+      where('date', '>=', startDate),
+      where('date', '<=', endDate)
+    );
+    const snapshot = await getDocs(recordsQ);
+    return snapshot.docs.map(recordDoc => ({
+      ...recordDoc.data(),
+      firestoreId: recordDoc.id
+    } as AttendanceRecord));
   },
 
   addLeave: async (leave: LeaveRequest) => {
@@ -728,11 +834,9 @@ export const StorageService = {
 
   removeAnnouncement: async (id: number | string) => {
     try {
-        let deleted = false;
         if (typeof id === 'string') {
             try {
                 await deleteDoc(doc(db, 'announcements', id));
-                deleted = true;
             } catch (e) {
                 // Ignore and fallback
             }
@@ -743,7 +847,6 @@ export const StorageService = {
         if (!snapshot.empty) {
             const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
             await Promise.all(promises);
-            deleted = true;
         }
         if (typeof id === 'string') {
             const qs = query(collection(db, 'announcements'), where('id', '==', id));
@@ -774,12 +877,10 @@ export const StorageService = {
 
   removeHoliday: async (id: number | string) => {
     try {
-        let deleted = false;
         // First try to delete by document ID if it's a string
         if (typeof id === 'string') {
             try {
                 await deleteDoc(doc(db, 'holidays', id));
-                deleted = true;
             } catch (e) {
                 // Ignore and fallback
             }
@@ -792,7 +893,6 @@ export const StorageService = {
         if (!snapshot.empty) {
             const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
             await Promise.all(promises);
-            deleted = true;
         }
         
         // Also query by string id if needed
@@ -815,7 +915,6 @@ export const StorageService = {
   updateSettings: async (settings: AppSettings) => {
     try {
         const safeSettings = {
-            gasUrl: settings.gasUrl || "disabled",
             companyLat: Number(settings.companyLat) || 0,
             companyLng: Number(settings.companyLng) || 0,
             allowedRadius: Number(settings.allowedRadius) || 100
