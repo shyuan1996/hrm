@@ -194,16 +194,39 @@ export const StorageService = {
             leavesQ = query(collection(db, 'leaves'), orderBy('id', 'desc'));
             overtimesQ = query(collection(db, 'overtimes'), orderBy('id', 'desc'));
         } else {
-            // Employee sees own
-            // FIX: Remove orderBy and limit in Firestore Query to avoid "Missing Index" errors.
-            // We will sort the data in memory inside the snapshot callback.
-            recordsQ = query(collection(db, 'records'), where('userId', '==', userId));
-            leavesQ = query(collection(db, 'leaves'), where('userId', '==', userId));
-            overtimesQ = query(collection(db, 'overtimes'), where('userId', '==', userId));
+            // Employee queries must include the immutable Firebase UID. The
+            // Firestore rules authorize a resource by its `uid`; querying only
+            // by the legacy account ID (`userId`) cannot be proven safe for a
+            // collection query and is rejected by the rules, leaving the
+            // dashboard empty even though the documents still exist.
+            const authenticatedUid = auth.currentUser?.uid;
+            if (!authenticatedUid) {
+                console.error('Protected data sync skipped: Firebase user is not available.');
+                return;
+            }
+            recordsQ = query(
+                collection(db, 'records'),
+                where('uid', '==', authenticatedUid),
+                where('userId', '==', userId)
+            );
+            leavesQ = query(
+                collection(db, 'leaves'),
+                where('uid', '==', authenticatedUid),
+                where('userId', '==', userId)
+            );
+            overtimesQ = query(
+                collection(db, 'overtimes'),
+                where('uid', '==', authenticatedUid),
+                where('userId', '==', userId)
+            );
         }
 
         _listeners.push(onSnapshot(recordsQ, (snapshot) => {
-            const list = snapshot.docs.map(d => ({ ...d.data() } as AttendanceRecord));
+            const list = snapshot.docs
+                .map(d => ({ ...d.data() } as AttendanceRecord))
+                // Keep the account ID check as defence in depth for profiles
+                // whose Auth UID was accidentally reused in old data.
+                .filter(record => role === 'admin' || record.userId === userId);
             if (role !== 'admin') {
                 list.sort((a, b) => b.id - a.id); // In-memory sort for employees
             }
@@ -212,7 +235,9 @@ export const StorageService = {
         }, (e) => console.warn("Records sync error:", e.code)));
 
         _listeners.push(onSnapshot(leavesQ, (snapshot) => {
-            const list = snapshot.docs.map(d => ({ ...d.data() } as LeaveRequest));
+            const list = snapshot.docs
+                .map(d => ({ ...d.data() } as LeaveRequest))
+                .filter(leave => role === 'admin' || leave.userId === userId);
             if (role !== 'admin') {
                 list.sort((a, b) => b.id - a.id);
             }
@@ -221,7 +246,9 @@ export const StorageService = {
         }, (e) => console.warn("Leaves sync error:", e.code)));
 
         _listeners.push(onSnapshot(overtimesQ, (snapshot) => {
-            const list = snapshot.docs.map(d => ({ ...d.data() } as OvertimeRequest));
+            const list = snapshot.docs
+                .map(d => ({ ...d.data() } as OvertimeRequest))
+                .filter(overtime => role === 'admin' || overtime.userId === userId);
             if (role !== 'admin') {
                 list.sort((a, b) => b.id - a.id);
             }

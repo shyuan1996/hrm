@@ -112,6 +112,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   });
 
   const watchIdRef = useRef<number | null>(null);
+  const initialLocationRequestRef = useRef(false);
+  const settingsRef = useRef(settings);
+  const lastPositionRef = useRef<{ lat: number; lng: number } | null>(null);
 
   const getFreshPosition = (options: PositionOptions = {}): Promise<GeolocationPosition> => {
     if (!navigator.geolocation) {
@@ -121,6 +124,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       navigator.geolocation.getCurrentPosition(resolve, reject, options);
     });
   };
+
+  // Keep the watcher independent from the asynchronous settings listener. If
+  // the company coordinates arrive after the dashboard mounts, restarting a
+  // pending mobile permission request can cancel it and leave the page unable
+  // to obtain a position.
+  useEffect(() => {
+    settingsRef.current = settings;
+    const lastPosition = lastPositionRef.current;
+    if (!lastPosition) return;
+
+    if (settings.companyLat && settings.companyLng) {
+      setDistance(getDistanceFromLatLonInM(
+        lastPosition.lat,
+        lastPosition.lng,
+        settings.companyLat,
+        settings.companyLng
+      ));
+    } else {
+      setDistance(0);
+    }
+  }, [settings.companyLat, settings.companyLng]);
 
   const handlePunchFilterChange = (setter: React.Dispatch<React.SetStateAction<string>>, val: string) => {
       if (val && val < minPunchHistoryDate) {
@@ -195,10 +219,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return () => clearInterval(syncTimer);
   }, []);
 
-  // Do not request location as soon as the dashboard mounts. Mobile browsers
+  // Query the permission state before starting the watcher. Mobile browsers
   // may treat every automatic watch as a new prompt (especially iOS "Allow
-  // Once"). Query the permission state when possible and only request a
-  // prompt from the user's punch action when the state is still "prompt".
+  // Once"), so only one initial request is made per dashboard session. Once
+  // permission is granted, the browser will not prompt again for this origin.
   useEffect(() => {
     if (!navigator.geolocation) {
       setLocationPermissionState('denied');
@@ -215,8 +239,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       const successHandler = (pos: GeolocationPosition) => {
         setGpsError('');
         setLocationPermissionState('granted');
-        if (settings.companyLat && settings.companyLng) {
-          setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
+        lastPositionRef.current = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const currentSettings = settingsRef.current;
+        if (currentSettings.companyLat && currentSettings.companyLng) {
+          setDistance(getDistanceFromLatLonInM(
+            pos.coords.latitude,
+            pos.coords.longitude,
+            currentSettings.companyLat,
+            currentSettings.companyLng
+          ));
         } else {
            setDistance(0);
         }
@@ -256,6 +287,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     let permissionStatus: PermissionStatus | null = null;
     let disposed = false;
 
+    const requestInitialLocation = () => {
+      if (disposed || initialLocationRequestRef.current) return;
+      initialLocationRequestRef.current = true;
+      startWatching(true);
+    };
+
     const initializePermissionAwareLocation = async () => {
       try {
         if (navigator.permissions?.query) {
@@ -279,9 +316,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
               setGpsError('');
             }
           };
-          if (permissionStatus.state === 'granted') {
-            startWatching(true);
-          }
+          if (permissionStatus.state === 'granted') startWatching(true);
+          else if (permissionStatus.state === 'prompt') requestInitialLocation();
           return;
         }
       } catch (error) {
@@ -289,10 +325,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         console.debug('Geolocation permission state unavailable', error);
       }
 
-      // Permission API is unavailable: do not trigger a prompt automatically.
+      // Permission API is unavailable (common on mobile Safari). Request the
+      // position once; the browser itself remembers the user's decision.
       if (!disposed) {
         setLocationPermissionState('prompt');
         setGpsError('');
+        requestInitialLocation();
       }
     };
 
@@ -306,7 +344,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         watchIdRef.current = null;
       }
     };
-  }, [settings.companyLat, settings.companyLng]);
+  }, []);
 
   // Data Sync and Time Ticker
   useEffect(() => {
