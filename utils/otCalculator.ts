@@ -5,12 +5,44 @@ export const calculateOTWithDeduction = (
 ): number => {
     type Interval = { start: number, end: number, isExisting: boolean };
     const allIntervals: Interval[] = [];
+
+    /**
+     * Weekday overtime is eligible from 18:00.  The 17:30-18:00 period is
+     * the regular break, so an interval that starts before 18:00 is clipped
+     * instead of trusting a client-provided duration.  Splitting at midnight
+     * also keeps a multi-day request deterministic.
+     */
+    const eligibleSegments = (start: Date, end: Date): { start: number, end: number }[] => {
+        const startMs = start.getTime();
+        const endMs = end.getTime();
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
+
+        const segments: { start: number, end: number }[] = [];
+        let day = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+        const lastDay = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+
+        while (day <= lastDay) {
+            const nextDay = new Date(day);
+            nextDay.setDate(nextDay.getDate() + 1);
+            const segmentStart = Math.max(startMs, day.getTime());
+            const segmentEnd = Math.min(endMs, nextDay.getTime());
+            const weekday = day.getDay() >= 1 && day.getDay() <= 5;
+            const weekdayCutoff = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 18, 0, 0, 0).getTime();
+            const eligibleStart = weekday ? Math.max(segmentStart, weekdayCutoff) : segmentStart;
+
+            if (segmentEnd > eligibleStart) {
+                segments.push({ start: eligibleStart, end: segmentEnd });
+            }
+            day = nextDay;
+        }
+        return segments;
+    };
     
     existingOts.forEach(ot => {
-        allIntervals.push({
-            start: new Date(ot.start.replace(' ', 'T')).getTime(),
-            end: new Date(ot.end.replace(' ', 'T')).getTime(),
-            isExisting: true
+        const start = new Date(ot.start.replace(' ', 'T'));
+        const end = new Date(ot.end.replace(' ', 'T'));
+        eligibleSegments(start, end).forEach(segment => {
+            allIntervals.push({ ...segment, isExisting: true });
         });
     });
     
@@ -19,7 +51,9 @@ export const calculateOTWithDeduction = (
     
     if (newEndMs <= newStartMs) return 0;
     
-    allIntervals.push({ start: newStartMs, end: newEndMs, isExisting: false });
+    eligibleSegments(currentOtStart, currentOtEnd).forEach(segment => {
+        allIntervals.push({ ...segment, isExisting: false });
+    });
     
     // Helper to compute net hours for a set of intervals
     const computeNetHours = (intervals: Interval[]) => {

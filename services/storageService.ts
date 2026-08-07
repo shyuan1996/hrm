@@ -5,7 +5,7 @@ import { TimeService } from './timeService';
 import { db, auth, createAuthUser, storage } from './firebase'; // Import storage
 import { 
   collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, 
-  onSnapshot, query, orderBy, where, limit, serverTimestamp
+  onSnapshot, query, orderBy, where, limit, serverTimestamp, writeBatch
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 
@@ -105,7 +105,10 @@ export const StorageService = {
       users: [],
       records: [],
       leaves: [],
-      overtimes: []
+      overtimes: [],
+      // Geofence coordinates/radius are protected system data; do not keep
+      // the previous account's copy when logging out or switching accounts.
+      settings: DEFAULT_SETTINGS
     };
     StorageService._saveToLocal();
   },
@@ -185,8 +188,11 @@ export const StorageService = {
         if (role === 'admin') {
             // Admin sees all (Admin query does not use 'where', so orderBy is safe without composite index)
             recordsQ = query(collection(db, 'records'), orderBy('id', 'desc'), limit(500));
-            leavesQ = query(collection(db, 'leaves'), orderBy('id', 'desc'), limit(200));
-            overtimesQ = query(collection(db, 'overtimes'), orderBy('id', 'desc'), limit(200));
+            // Keep the complete leave/overtime history in the admin cache;
+            // the dashboard applies a small, predictable ten-row page in the
+            // UI so older records remain reachable without a second query.
+            leavesQ = query(collection(db, 'leaves'), orderBy('id', 'desc'));
+            overtimesQ = query(collection(db, 'overtimes'), orderBy('id', 'desc'));
         } else {
             // Employee sees own
             // FIX: Remove orderBy and limit in Firestore Query to avoid "Missing Index" errors.
@@ -234,8 +240,7 @@ export const StorageService = {
         const publicCache: AppData = {
           ...getInitialData(),
           announcements: _memoryCache.announcements,
-          holidays: _memoryCache.holidays,
-          settings: _memoryCache.settings
+          holidays: _memoryCache.holidays
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(publicCache));
     } catch (e) {
@@ -450,7 +455,10 @@ export const StorageService = {
   },
 
   addLeave: async (leave: LeaveRequest) => {
-    await addDoc(collection(db, 'leaves'), leave);
+    await addDoc(collection(db, 'leaves'), {
+      ...leave,
+      createdAt: serverTimestamp()
+    });
   },
 
   updateLeaveStatus: async (id: number, status: LeaveRequest['status'], rejectReason?: string) => {
@@ -521,7 +529,12 @@ export const StorageService = {
     }
   },
 
-  updateApprovedLeaveType: async (leaveId: number, adminName: string, newType: string) => {
+  updateApprovedLeaveType: async (leaveId: number, adminName: string, newType: string, newHours: number) => {
+    const normalizedHours = Number(newHours);
+    if (!Number.isFinite(normalizedHours) || normalizedHours <= 0 || normalizedHours > 744) {
+      throw new Error('休假時數必須介於 0.5 至 744 小時');
+    }
+
     const q = query(collection(db, 'leaves'), where('id', '==', leaveId));
     const snapshot = await getDocs(q);
     if (snapshot.docs.length === 0) throw new Error("Leave not found");
@@ -529,105 +542,125 @@ export const StorageService = {
     const leaveData = leaveDoc.data() as LeaveRequest;
 
     if (leaveData.status !== 'approved' && leaveData.status !== 'pending') {
-        throw new Error("只有待審核或已核准的假單可以修改");
+      throw new Error("只有待審核或已核准的假單可以修改");
     }
-    if (leaveData.type === newType) return; // No change
-
-    const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
-    const userSnapshot = await getDocs(userQ);
-    if (userSnapshot.docs.length === 0) throw new Error("User not found");
-    const userDoc = userSnapshot.docs[0];
-    const userData = userDoc.data() as User;
+    if (leaveData.type === newType && Number(leaveData.hours) === normalizedHours) {
+      throw new Error('未更改假別或時數');
+    }
 
     const oldType = leaveData.type;
-    const hours = leaveData.hours;
+    const oldHours = Number(leaveData.hours) || 0;
+    const specialTypes = ['特休', '補休', '生日假'];
+    const isSpecial = (type: string) => specialTypes.includes(type);
+    const legacyField = (type: string): 'quota_annual' | 'quota_comp' | 'quota_birthday' | null => {
+      if (type === '特休') return 'quota_annual';
+      if (type === '補休') return 'quota_comp';
+      if (type === '生日假') return 'quota_birthday';
+      return null;
+    };
 
-    let newBucketsToDeduct: {bucketId: string, hours: number}[] = [];
-    const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
+    let userUpdateData: Record<string, any> = {};
+    let newBucketsToDeduct: { bucketId: string, hours: number }[] = [];
 
     if (leaveData.status === 'approved') {
-        // 1. Check if the user has enough of the NEW type
-        let hasEnough = false;
+      const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
+      const userSnapshot = await getDocs(userQ);
+      if (userSnapshot.docs.length === 0) throw new Error("User not found");
+      const userDoc = userSnapshot.docs[0];
+      const userData = userDoc.data() as User;
+      const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
 
-        if (newQuotas.length > 0) {
-            let remaining = hours;
-            const today = TimeService.getTaiwanDate(new Date());
-            const validBuckets = newQuotas
-                .filter(q => q.type === newType && q.expireDate >= today && q.remainingHours > 0)
-                .sort((a,b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
-
-            for (const b of validBuckets) {
-                if (remaining <= 0) break;
-                const deductAmt = Math.min(b.remainingHours, remaining);
-                b.remainingHours -= deductAmt;
-                remaining -= deductAmt;
-                newBucketsToDeduct.push({ bucketId: b.id, hours: deductAmt });
-            }
-            if (remaining <= 0) hasEnough = true;
+      // Refund the allocation used by the old approved request before
+      // checking/deducting the replacement. This also handles changing only
+      // the number of hours and prevents a same-type edit from double charging.
+      if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0) {
+        for (const usedBucket of leaveData.usedBuckets) {
+          const bucket = newQuotas.find(qb => qb.id === usedBucket.bucketId);
+          if (!bucket) continue;
+          bucket.remainingHours = Math.min(
+            bucket.originalHours,
+            bucket.remainingHours + Math.max(0, Number(usedBucket.hours) || 0)
+          );
         }
+      }
 
-        if (!hasEnough) {
-            // Check legacy quota fallback
-            let legacyRemaining = 0;
-            if (newType === '特休') legacyRemaining = userData.quota_annual || 0;
-            else if (newType === '補休') legacyRemaining = userData.quota_comp || 0;
-            else if (newType === '生日假') legacyRemaining = userData.quota_birthday || 0;
+      const newTypeBuckets = newQuotas
+        .filter(bucket => bucket.type === newType && bucket.remainingHours > 0 && bucket.expireDate >= TimeService.getTaiwanDate(new Date()))
+        .sort((a, b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
+      const hasNewTypeBuckets = newQuotas.some(bucket => bucket.type === newType);
 
-            // Optional: for non-special types, we don't strictly require 'enough' check here, but assuming it's special.
-            const isSpecial = ['特休', '補休', '生日假'].includes(newType);
-            if (!isSpecial || legacyRemaining >= hours) hasEnough = true;
+      if (isSpecial(newType) && hasNewTypeBuckets) {
+        const bucketHours = newTypeBuckets.reduce((sum, bucket) => sum + Math.max(0, bucket.remainingHours), 0);
+        if (bucketHours < normalizedHours) {
+          throw new Error(`新假別可用額度不足，目前最多 ${bucketHours} 小時`);
         }
-
-        if (!hasEnough) throw new Error(`User does not have enough hours for ${newType}`);
-
-        // ----- Apply changes -----
-        let updateData: any = {};
-        
-        // 2. Refund old buckets
-        if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0) {
-            for (const ub of leaveData.usedBuckets) {
-                const b = newQuotas.find(q => q.id === ub.bucketId);
-                if (b) {
-                    b.remainingHours += ub.hours;
-                    if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
-                }
-            }
+        let remaining = normalizedHours;
+        for (const bucket of newTypeBuckets) {
+          if (remaining <= 0) break;
+          const deductAmount = Math.min(bucket.remainingHours, remaining);
+          bucket.remainingHours -= deductAmount;
+          remaining -= deductAmount;
+          newBucketsToDeduct.push({ bucketId: bucket.id, hours: deductAmount });
         }
-        
-        // 3. Refund old legacy
-        if (oldType === '特休') updateData.quota_annual = (userData.quota_annual || 0) + hours;
-        else if (oldType === '補休') updateData.quota_comp = (userData.quota_comp || 0) + hours;
-        else if (oldType === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + hours;
+      } else if (isSpecial(newType)) {
+        const field = legacyField(newType)!;
+        const availableLegacy = (Number(userData[field]) || 0) + (oldType === newType ? oldHours : 0);
+        if (availableLegacy < normalizedHours) {
+          throw new Error(`新假別可用額度不足，目前最多 ${availableLegacy} 小時`);
+        }
+      }
 
-        // 4. Deduct new legacy
-        if (newType === '特休') updateData.quota_annual = Math.max(0, (updateData.quota_annual !== undefined ? updateData.quota_annual : (userData.quota_annual || 0)) - hours);
-        else if (newType === '補休') updateData.quota_comp = Math.max(0, (updateData.quota_comp !== undefined ? updateData.quota_comp : (userData.quota_comp || 0)) - hours);
-        else if (newType === '生日假') updateData.quota_birthday = Math.max(0, (updateData.quota_birthday !== undefined ? updateData.quota_birthday : (userData.quota_birthday || 0)) - hours);
+      // Keep legacy counters in sync for older profiles. Newer profiles use
+      // quota buckets for display, while old profiles only have these fields.
+      const oldField = legacyField(oldType);
+      const newField = legacyField(newType);
+      if (oldField) userUpdateData[oldField] = (Number(userData[oldField]) || 0) + oldHours;
+      if (newField) {
+        const base = userUpdateData[newField] !== undefined
+          ? userUpdateData[newField]
+          : (Number(userData[newField]) || 0);
+        userUpdateData[newField] = Math.max(0, base - normalizedHours);
+      }
+      if (newQuotas.length > 0) userUpdateData.quotas = newQuotas;
 
-        updateData.quotas = newQuotas;
-
-        await updateDoc(doc(db, 'users', userDoc.id), updateData);
-    }
-
-    const changeEntry: LeaveChangeHistory = {
+      const changeUserRef = doc(db, 'users', userDoc.id);
+      const changeEntry: LeaveChangeHistory = {
         date: TimeService.getTaiwanDate(new Date()) + ' ' + TimeService.getTaiwanTime(new Date()),
         adminName,
         oldType,
-        newType
-    };
-    
-    const newChangeHistory = [...(leaveData.changeHistory || []), changeEntry];
-
-    let leaveUpdateData: any = {
+        newType,
+        oldHours,
+        newHours: normalizedHours
+      };
+      const newChangeHistory = [...(leaveData.changeHistory || []), changeEntry];
+      const leaveUpdateData: Record<string, any> = {
         type: newType,
-        changeHistory: newChangeHistory
-    };
+        hours: normalizedHours,
+        changeHistory: newChangeHistory,
+        usedBuckets: newBucketsToDeduct
+      };
 
-    if (leaveData.status === 'approved') {
-        leaveUpdateData.usedBuckets = newBucketsToDeduct;
+      // Keep the user quota and leave record consistent if either write fails.
+      const batch = writeBatch(db);
+      if (Object.keys(userUpdateData).length > 0) batch.update(changeUserRef, userUpdateData);
+      batch.update(doc(db, 'leaves', leaveDoc.id), leaveUpdateData);
+      await batch.commit();
+      return;
     }
 
-    await updateDoc(doc(db, 'leaves', leaveDoc.id), leaveUpdateData);
+    const changeEntry: LeaveChangeHistory = {
+      date: TimeService.getTaiwanDate(new Date()) + ' ' + TimeService.getTaiwanTime(new Date()),
+      adminName,
+      oldType,
+      newType,
+      oldHours,
+      newHours: normalizedHours
+    };
+    await updateDoc(doc(db, 'leaves', leaveDoc.id), {
+      type: newType,
+      hours: normalizedHours,
+      changeHistory: [...(leaveData.changeHistory || []), changeEntry]
+    });
   },
 
   // Cancel/Delete operations now support userId for restrictive filtering
@@ -749,7 +782,10 @@ export const StorageService = {
   },
 
   addOvertime: async (ot: OvertimeRequest) => {
-    await addDoc(collection(db, 'overtimes'), ot);
+    await addDoc(collection(db, 'overtimes'), {
+      ...ot,
+      createdAt: serverTimestamp()
+    });
   },
 
   updateOvertime: async (id: number, updates: Partial<OvertimeRequest>) => {
@@ -823,7 +859,10 @@ export const StorageService = {
                 }
             }
         }
-        await addDoc(collection(db, 'announcements'), ann);
+        await addDoc(collection(db, 'announcements'), {
+          ...ann,
+          createdAt: serverTimestamp()
+        });
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_WRITE', `Attempted to write announcement`);
@@ -866,7 +905,10 @@ export const StorageService = {
 
   addHoliday: async (h: Holiday) => {
     try {
-        await addDoc(collection(db, 'holidays'), h);
+        await addDoc(collection(db, 'holidays'), {
+          ...h,
+          createdAt: serverTimestamp()
+        });
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_HOLIDAY_ADD', `Attempted to add holiday`);

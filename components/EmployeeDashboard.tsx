@@ -15,6 +15,8 @@ interface EmployeeDashboardProps {
   isTimeSynced: boolean;
 }
 
+type LocationPermissionState = 'unknown' | 'prompt' | 'granted' | 'denied';
+
 const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
   const dateStr = TimeService.getAttendanceDate(r);
   const displayTime = TimeService.getAttendanceTime(r, true);
@@ -48,6 +50,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
+  const [locationPermissionState, setLocationPermissionState] = useState<LocationPermissionState>('unknown');
   
   // Use state to hold data instead of relying on prop updates to avoid flicker
   const [localData, setLocalData] = useState(StorageService.loadData());
@@ -57,6 +60,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const [isVerifying, setIsVerifying] = useState(false);
   const [punchStep, setPunchStep] = useState<'idle' | 'syncing' | 'locating' | 'verifying'>('idle'); // Granular status
   const [isSubmittingLeave, setIsSubmittingLeave] = useState(false); // New loading state for leave submit
+  const [isSubmittingOt, setIsSubmittingOt] = useState(false);
   
   // Mobile View State
   const [mobileView, setMobileView] = useState<'punch' | 'apply'>('punch');
@@ -108,6 +112,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   });
 
   const watchIdRef = useRef<number | null>(null);
+
+  const getFreshPosition = (options: PositionOptions = {}): Promise<GeolocationPosition> => {
+    if (!navigator.geolocation) {
+      return Promise.reject(new Error('瀏覽器不支援定位'));
+    }
+    return new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, options);
+    });
+  };
 
   const handlePunchFilterChange = (setter: React.Dispatch<React.SetStateAction<string>>, val: string) => {
       if (val && val < minPunchHistoryDate) {
@@ -182,9 +195,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return () => clearInterval(syncTimer);
   }, []);
 
-  // Optimized Geolocation with Fallback Strategy
+  // Do not request location as soon as the dashboard mounts. Mobile browsers
+  // may treat every automatic watch as a new prompt (especially iOS "Allow
+  // Once"). Query the permission state when possible and only request a
+  // prompt from the user's punch action when the state is still "prompt".
   useEffect(() => {
     if (!navigator.geolocation) {
+      setLocationPermissionState('denied');
       setGpsError("瀏覽器不支援定位");
       return;
     }
@@ -197,6 +214,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
       const successHandler = (pos: GeolocationPosition) => {
         setGpsError('');
+        setLocationPermissionState('granted');
         if (settings.companyLat && settings.companyLng) {
           setDistance(getDistanceFromLatLonInM(pos.coords.latitude, pos.coords.longitude, settings.companyLat, settings.companyLng));
         } else {
@@ -207,8 +225,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       const errorHandler = (err: GeolocationPositionError) => {
          console.warn(`Location error (HighAccuracy: ${enableHighAccuracy}):`, err);
          
-         if (err.code === 1) { // PERMISSION_DENIED
-             setGpsError("定位權限已被拒絕");
+          if (err.code === 1) { // PERMISSION_DENIED
+              setLocationPermissionState('denied');
+              setGpsError("定位權限已被拒絕");
              setDistance(null);
              return; // Crucial: Do not retry if explicitly denied
          }
@@ -234,13 +253,57 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
       );
     };
 
-    // We do not use navigator.permissions because of iOS Safari bugs.
-    // Instead we just normally start watching.
-    startWatching(true);
+    let permissionStatus: PermissionStatus | null = null;
+    let disposed = false;
+
+    const initializePermissionAwareLocation = async () => {
+      try {
+        if (navigator.permissions?.query) {
+          permissionStatus = await navigator.permissions.query({ name: 'geolocation' });
+          if (disposed) return;
+          setLocationPermissionState(permissionStatus.state as LocationPermissionState);
+          if (permissionStatus.state !== 'denied') setGpsError('');
+          permissionStatus.onchange = () => {
+            if (permissionStatus?.state === 'granted') {
+              setLocationPermissionState('granted');
+              startWatching(true);
+            } else if (permissionStatus?.state === 'denied') {
+              setLocationPermissionState('denied');
+              setDistance(null);
+              if (watchIdRef.current !== null) {
+                navigator.geolocation.clearWatch(watchIdRef.current);
+                watchIdRef.current = null;
+              }
+            } else {
+              setLocationPermissionState('prompt');
+              setGpsError('');
+            }
+          };
+          if (permissionStatus.state === 'granted') {
+            startWatching(true);
+          }
+          return;
+        }
+      } catch (error) {
+        // Some Safari versions expose permissions.query but reject geolocation.
+        console.debug('Geolocation permission state unavailable', error);
+      }
+
+      // Permission API is unavailable: do not trigger a prompt automatically.
+      if (!disposed) {
+        setLocationPermissionState('prompt');
+        setGpsError('');
+      }
+    };
+
+    initializePermissionAwareLocation();
 
     return () => {
+      disposed = true;
+      if (permissionStatus) permissionStatus.onchange = null;
       if (watchIdRef.current !== null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
       }
     };
   }, [settings.companyLat, settings.companyLng]);
@@ -371,20 +434,40 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         // Short delay to let UI update to "Locating..."
         await new Promise(r => setTimeout(r, 500));
 
-        if (!isLocationReady) {
-          setNotification({ type: 'error', message: "定位中或無法定位，請確認已開啟 GPS" });
+        let freshDistance: number | null = distance;
+        try {
+          const position = await getFreshPosition({
+            enableHighAccuracy: true,
+            timeout: 15000,
+            maximumAge: 30000
+          });
+          setLocationPermissionState('granted');
+          setGpsError('');
+          freshDistance = settings.companyLat
+            ? getDistanceFromLatLonInM(position.coords.latitude, position.coords.longitude, settings.companyLat, settings.companyLng)
+            : 0;
+          setDistance(freshDistance);
+        } catch (error) {
+          const locationError = error as GeolocationPositionError;
+          if (locationError?.code === 1) {
+            setLocationPermissionState('denied');
+            setGpsError('定位權限已被拒絕，請在瀏覽器設定中允許位置');
+          } else {
+            setGpsError('無法取得位置，請確認手機 GPS 已開啟');
+          }
+          setDistance(null);
+          setNotification({ type: 'error', message: "無法取得位置，請確認已開啟 GPS 或允許網站取用位置" });
           setIsVerifying(false);
           setPunchStep('idle');
           return;
         }
 
-        if (currentPunchType === 'in') {
-            if (settings.companyLat && !inRange) {
-               setNotification({ type: 'error', message: `距離公司過遠 (${distance?.toFixed(0)}m)，無法上班打卡` });
-               setIsVerifying(false);
-               setPunchStep('idle');
-               return;
-            }
+        if (currentPunchType === 'in' && settings.companyLat &&
+            (freshDistance === null || freshDistance > settings.allowedRadius)) {
+            setNotification({ type: 'error', message: `距離公司過遠 (${freshDistance?.toFixed(0)}m)，無法上班打卡` });
+            setIsVerifying(false);
+            setPunchStep('idle');
+            return;
         }
 
         // Proceed to Math Challenge
@@ -720,10 +803,6 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                  <div className="text-5xl md:text-7xl font-mono font-black tracking-tighter text-gray-800">
                    {currentTimeStr}
                  </div>
-                 {/* Auto Sync Indicator */}
-                 <div className="absolute top-0 right-0 flex items-center gap-1 text-[10px] text-gray-400 opacity-50">
-                    <RefreshCw size={10} className="animate-spin" /> 自動校時中
-                 </div>
               </div>
 
               <div className="flex flex-col items-center w-full max-w-sm">
@@ -775,8 +854,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                      <span>{gpsError}</span>
                    ) : !isTimeSynced ? (
                      <span className="animate-pulse">正在校正系統時間...</span>
-                   ) : !isLocationReady ? (
-                     <span className="animate-pulse">正在獲取位置...</span>
+                    ) : !isLocationReady ? (
+                      <span className="animate-pulse">
+                        {locationPermissionState === 'prompt' ? '按下打卡時取得位置' : '正在獲取位置...'}
+                      </span>
                    ) : settings.companyLat ? (
                      <span>距離：{distance?.toFixed(1) || '--'} m ({inRange ? '範圍內' : '範圍外'})</span>
                    ) : (
@@ -1070,8 +1151,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                            <Button 
                              type="submit" 
                              className={`w-full py-4 md:py-5 rounded-[24px] md:rounded-[32px] text-lg md:text-xl font-black shadow-2xl bg-indigo-600 hover:bg-indigo-700 transition-all text-white ${!isOtDateValid ? 'bg-gray-300 cursor-not-allowed shadow-none hover:bg-gray-300' : ''}`}
-                             disabled={!isOtDateValid}
-                             onClick={() => {
+                             disabled={!isOtDateValid || isSubmittingOt}
+                             isLoading={isSubmittingOt}
+                             onClick={async () => {
                              if(!otForm.startDate || !otForm.endDate) {
                                setNotification({ type: 'error', message: "請填寫完整加班日期" });
                                return;
@@ -1080,15 +1162,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                setNotification({ type: 'error', message: "請填寫加班事由" });
                                return;
                              }
-                             StorageService.addOvertime({
-                               id: Date.now(), userId: user.id, uid: user.uid, // PASS UID HERE
-                               userName: user.name,
-                               start: `${otForm.startDate} ${otForm.startTime}`, end: `${otForm.endDate} ${otForm.endTime}`, 
-                               hours: calculatedOTHours, reason: otForm.reason,
-                               status: 'pending', created_at: new Date().toLocaleString()
-                             });
-                             setOtForm({startDate: '', startTime: '18:00', endDate: '', endTime: '20:00', reason: ''});
-                             setNotification({ type: 'success', message: "加班申請已提交！" });
+                             if (calculatedOTHours <= 0) {
+                               setNotification({ type: 'error', message: "可申請的加班時數必須大於 0（平日 18:00 前為休息時間）" });
+                               return;
+                             }
+                             setIsSubmittingOt(true);
+                             try {
+                               await StorageService.addOvertime({
+                                 id: Date.now(), userId: user.id, uid: user.uid,
+                                 userName: user.name,
+                                 start: `${otForm.startDate} ${otForm.startTime}`, end: `${otForm.endDate} ${otForm.endTime}`,
+                                 hours: calculatedOTHours, reason: otForm.reason,
+                                 status: 'pending', created_at: new Date().toLocaleString()
+                               });
+                               setOtForm({startDate: '', startTime: '18:00', endDate: '', endTime: '20:00', reason: ''});
+                               setNotification({ type: 'success', message: "加班申請已提交！" });
+                             } catch (e: any) {
+                               console.error('Overtime submit failed', e);
+                               setNotification({ type: 'error', message: `加班申請失敗：${e?.message || '請稍後再試'}` });
+                             } finally {
+                               setIsSubmittingOt(false);
+                             }
                            }}>
                              {isOtDateValid ? '送出加班審核申請' : '日期選擇錯誤'}
                            </Button>

@@ -34,6 +34,8 @@ export interface LeaveChangeHistory {
   adminName: string;
   oldType: string;
   newType: string;
+  oldHours?: number;
+  newHours?: number;
 }
 
 export interface AttendanceRecord {
@@ -72,6 +74,8 @@ export interface LeaveRequest {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   rejectReason?: string;
   created_at: string;
+  /** Firestore/server creation time for stable administrator sorting. */
+  createdAt?: { toDate: () => Date } | Date | string;
   attachments?: LeaveAttachment[]; // New field for file uploads
   usedBuckets?: { bucketId: string, hours: number }[];
   changeHistory?: LeaveChangeHistory[];
@@ -90,6 +94,8 @@ export interface OvertimeRequest {
   rejectReason?: string;
   adminNote?: string; // Reason for admin modification
   created_at: string;
+  /** Firestore/server creation time for stable administrator sorting. */
+  createdAt?: { toDate: () => Date } | Date | string;
 }
 
 export interface Announcement {
@@ -99,12 +105,16 @@ export interface Announcement {
   category: 'general' | 'urgent' | 'system';
   date: string;
   author: string;
+  /** Optional precise creation time; legacy documents only have date. */
+  createdAt?: { toDate: () => Date } | Date | string;
 }
 
 export interface Holiday {
   id: number;
   date: string;
   note: string;
+  /** Optional precise creation time; legacy documents only have date. */
+  createdAt?: { toDate: () => Date } | Date | string;
 }
 
 export interface AppSettings {

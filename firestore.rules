@@ -8,9 +8,14 @@ service cloud.firestore {
     function isAdmin() {
       return request.auth != null && (
         (exists(/databases/$(database)/documents/users/admin) &&
-         get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid) ||
+         get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid &&
+         get(/databases/$(database)/documents/users/admin).data.get('role', '') == 'admin') ||
         (exists(/databases/$(database)/documents/users/syhr) &&
-         get(/databases/$(database)/documents/users/syhr).data.get('uid', '') == request.auth.uid)
+         get(/databases/$(database)/documents/users/syhr).data.get('uid', '') == request.auth.uid &&
+         get(/databases/$(database)/documents/users/syhr).data.get('role', '') == 'admin') ||
+        (exists(/databases/$(database)/documents/users/service) &&
+         get(/databases/$(database)/documents/users/service).data.get('uid', '') == request.auth.uid &&
+         get(/databases/$(database)/documents/users/service).data.get('role', '') == 'admin')
       );
     }
 
@@ -19,6 +24,22 @@ service cloud.firestore {
        return request.auth != null &&
               request.auth.token.email != null &&
               request.auth.token.email.lower() == (id + '@shyuan-hrm.com').lower();
+    }
+
+    // Profile ownership is intentionally independent from the forced
+    // password-change marker. Otherwise a freshly reset employee could not
+    // read their own profile to complete the required password change.
+    function isOwnProfile(userId) {
+      return request.auth != null &&
+             userId != '' &&
+             userId != 'admin' &&
+             userId != 'syhr' &&
+             userId != 'service' &&
+             exists(/databases/$(database)/documents/users/$(userId)) &&
+             (
+               get(/databases/$(database)/documents/users/$(userId)).data.get('uid', '') == request.auth.uid ||
+               isEmailMatch(userId)
+             );
     }
 
     // A temporary-password account may read its own profile so it can clear
@@ -35,9 +56,8 @@ service cloud.firestore {
       let docUserId = resource.data.get('userId', '');
       
       return request.auth != null && (
-        (docUid != null && docUid == request.auth.uid &&
-         (docUserId == '' || canUseEmployeeData(docUserId))) ||
-        (docUserId != '' && isEmailMatch(docUserId) && canUseEmployeeData(docUserId))
+        docUid != null && docUid == request.auth.uid &&
+        isOwnProfile(docUserId) && canUseEmployeeData(docUserId)
       );
     }
 
@@ -45,7 +65,7 @@ service cloud.firestore {
     function isCreatingOwnResource() {
        return request.auth != null &&
               request.resource.data.get('uid', '') == request.auth.uid &&
-              isEmailMatch(request.resource.data.get('userId', '')) &&
+              isOwnProfile(request.resource.data.get('userId', '')) &&
               canUseEmployeeData(request.resource.data.get('userId', ''));
     }
 
@@ -74,7 +94,7 @@ service cloud.firestore {
         request.auth != null &&
         userId != 'admin' &&
         userId != 'syhr' &&
-        isResourceOwner()
+        isOwnProfile(userId)
       );
       
       // New employee profiles and all HR fields are administrator-managed.
@@ -83,7 +103,7 @@ service cloud.firestore {
         request.auth != null &&
         userId != 'admin' &&
         userId != 'syhr' &&
-        isEmailMatch(userId) &&
+        isOwnProfile(userId) &&
         request.resource.data.get('uid', '') == request.auth.uid &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid', 'mustChangePassword']) &&
         request.resource.data.get('mustChangePassword', false) == false
@@ -94,18 +114,28 @@ service cloud.firestore {
     match /records/{recordId} {
       allow read: if isAdmin() || isResourceOwner();
       // The employee may only create a structurally valid record for themself.
-      // During rollout, an already-open legacy page may omit createdAt. New
-      // clients always send serverTimestamp(), which must resolve to request.time.
-      // After all clients have refreshed, remove the fallback to enforce it.
       allow create: if isCreatingOwnResource() &&
-                       request.resource.data.get('createdAt', request.time) == request.time &&
+                       request.resource.data.keys().hasOnly([
+                         'id', 'userId', 'uid', 'userName', 'date', 'time',
+                         'type', 'status', 'lat', 'lng', 'dist', 'photo', 'createdAt'
+                       ]) &&
+                       request.resource.data.createdAt == request.time &&
+                       request.resource.data.id is int &&
+                       request.resource.data.userId is string &&
+                       request.resource.data.uid == request.auth.uid &&
+                       request.resource.data.userName is string &&
                        request.resource.data.type in ['in', 'out'] &&
                        request.resource.data.status in ['正常', '地點異常'] &&
                        request.resource.data.date is string &&
+                       request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
                        request.resource.data.time is string &&
+                       request.resource.data.time.matches('^[0-9]{2}:[0-9]{2}:[0-9]{2}$') &&
                        request.resource.data.lat is number &&
+                       request.resource.data.lat >= -90 && request.resource.data.lat <= 90 &&
                        request.resource.data.lng is number &&
-                       request.resource.data.dist is number;
+                       request.resource.data.lng >= -180 && request.resource.data.lng <= 180 &&
+                       request.resource.data.dist is number &&
+                       request.resource.data.dist >= 0 && request.resource.data.dist <= 20000000;
       // 修改/刪除：僅限管理員
       allow update, delete: if isAdmin();
     }
@@ -117,11 +147,31 @@ service cloud.firestore {
       // 建立假單：
       // 1. 必須是本人
       // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
-      allow create: if isCreatingOwnResource() && request.resource.data.status == 'pending';
+      allow create: if isCreatingOwnResource() &&
+        request.resource.data.keys().hasOnly([
+          'id', 'userId', 'uid', 'userName', 'type', 'start', 'end', 'hours',
+          'reason', 'status', 'rejectReason', 'created_at', 'createdAt',
+           'attachments'
+        ]) &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.id is int &&
+        request.resource.data.userId is string &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.userName is string && request.resource.data.userName.size() <= 100 &&
+        request.resource.data.type is string && request.resource.data.type.size() <= 50 &&
+        request.resource.data.start is string && request.resource.data.end is string &&
+        request.resource.data.start.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
+        request.resource.data.end.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
+        request.resource.data.hours is number && request.resource.data.hours > 0 && request.resource.data.hours <= 744 &&
+        request.resource.data.reason is string && request.resource.data.reason.size() <= 2000 &&
+         request.resource.data.created_at is string && request.resource.data.created_at.size() <= 100 &&
+         request.resource.data.get('attachments', []) is list && request.resource.data.get('attachments', []).size() <= 5;
       
       // 更新規則：本人只能將狀態改為 cancelled (取消申請)
       allow update: if isAdmin() || (
         isResourceOwner() &&
+        resource.data.status == 'pending' &&
         request.resource.data.status == 'cancelled' &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
       );
@@ -137,11 +187,28 @@ service cloud.firestore {
       // 建立加班單：
       // 1. 必須是本人
       // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
-      allow create: if isCreatingOwnResource() && request.resource.data.status == 'pending';
+      allow create: if isCreatingOwnResource() &&
+        request.resource.data.keys().hasOnly([
+           'id', 'userId', 'uid', 'userName', 'start', 'end', 'hours',
+           'reason', 'status', 'created_at', 'createdAt'
+        ]) &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.id is int &&
+        request.resource.data.userId is string &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.userName is string && request.resource.data.userName.size() <= 100 &&
+        request.resource.data.start is string && request.resource.data.end is string &&
+        request.resource.data.start.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
+        request.resource.data.end.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
+        request.resource.data.hours is number && request.resource.data.hours > 0 && request.resource.data.hours <= 744 &&
+        request.resource.data.reason is string && request.resource.data.reason.size() <= 2000 &&
+         request.resource.data.created_at is string && request.resource.data.created_at.size() <= 100;
       
       // 更新規則：本人只能將狀態改為 cancelled
       allow update: if isAdmin() || (
         isResourceOwner() &&
+        resource.data.status == 'pending' &&
         request.resource.data.status == 'cancelled' &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
       );
@@ -157,12 +224,13 @@ service cloud.firestore {
     }
 
     match /holidays/{id} {
-      allow read: if true;
+      allow read: if request.auth != null;
       allow write: if isAdmin();
     }
 
     match /system/{document=**} {
-      allow read: if true;
+      // Company coordinates and geofence radius are not public information.
+      allow read: if request.auth != null;
       allow write: if isAdmin();
     }
   }

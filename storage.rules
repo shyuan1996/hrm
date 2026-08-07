@@ -8,16 +8,27 @@ service firebase.storage {
     function isAdmin() {
       return isSignedIn() && (
         (firestore.exists(/databases/(default)/documents/users/admin) &&
-         firestore.get(/databases/(default)/documents/users/admin).data.uid == request.auth.uid) ||
+         firestore.get(/databases/(default)/documents/users/admin).data.get('uid', '') == request.auth.uid &&
+         firestore.get(/databases/(default)/documents/users/admin).data.get('role', '') == 'admin') ||
         (firestore.exists(/databases/(default)/documents/users/syhr) &&
-         firestore.get(/databases/(default)/documents/users/syhr).data.uid == request.auth.uid)
+         firestore.get(/databases/(default)/documents/users/syhr).data.get('uid', '') == request.auth.uid &&
+         firestore.get(/databases/(default)/documents/users/syhr).data.get('role', '') == 'admin') ||
+        (firestore.exists(/databases/(default)/documents/users/service) &&
+         firestore.get(/databases/(default)/documents/users/service).data.get('uid', '') == request.auth.uid &&
+         firestore.get(/databases/(default)/documents/users/service).data.get('role', '') == 'admin')
       );
     }
 
     function isOwner(userId) {
       return isSignedIn() &&
-             request.auth.token.email != null &&
-             request.auth.token.email.lower() == (userId + '@shyuan-hrm.com').lower();
+             userId != 'admin' && userId != 'syhr' && userId != 'service' &&
+             firestore.exists(/databases/(default)/documents/users/$(userId)) &&
+             firestore.get(/databases/(default)/documents/users/$(userId)).data.get('mustChangePassword', false) != true &&
+             (
+               firestore.get(/databases/(default)/documents/users/$(userId)).data.get('uid', '') == request.auth.uid ||
+               (request.auth.token.email != null &&
+                request.auth.token.email.lower() == (userId + '@shyuan-hrm.com').lower())
+             );
     }
 
     // Leave attachments are the only files used by the application.

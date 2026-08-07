@@ -5,6 +5,7 @@ export type AttendanceCompleteness =
   | 'complete'
   | 'missing-in'
   | 'missing-out'
+  | 'invalid-sequence'
   | 'invalid';
 
 /**
@@ -19,9 +20,33 @@ export const analyzeAttendanceCompleteness = (
     return 'invalid';
   }
 
-  const hasIn = chronologicalRecords.some(record => record.type === 'in');
-  const hasOut = chronologicalRecords.some(record => record.type === 'out');
-  if (!hasIn || chronologicalRecords[0].type === 'out') return 'missing-in';
-  if (!hasOut || chronologicalRecords[chronologicalRecords.length - 1].type === 'in') return 'missing-out';
+  const records = [...chronologicalRecords].sort((a, b) => {
+    const left = `${a.date || ''} ${a.time || ''}`;
+    const right = `${b.date || ''} ${b.time || ''}`;
+    return left.localeCompare(right);
+  });
+  const hasIn = records.some(record => record.type === 'in');
+  const hasOut = records.some(record => record.type === 'out');
+  if (!hasIn || records[0].type === 'out') return 'missing-in';
+  if (!hasOut || records[records.length - 1].type === 'in') return 'missing-out';
+
+  // A valid day alternates IN -> OUT. Duplicate consecutive punches are
+  // reported separately instead of being silently treated as normal.
+  let expected: AttendanceRecord['type'] = 'in';
+  for (const record of records) {
+    if (record.type !== expected) return 'invalid-sequence';
+    expected = expected === 'in' ? 'out' : 'in';
+  }
   return 'complete';
+};
+
+export const getAttendanceCompletenessLabel = (status: AttendanceCompleteness): string => {
+  switch (status) {
+    case 'missing-in': return '缺上班卡';
+    case 'missing-out': return '缺下班卡';
+    case 'invalid-sequence': return '打卡順序異常';
+    case 'invalid': return '無法辨識的打卡紀錄';
+    case 'empty': return '曠職/未打卡';
+    default: return '正常';
+  }
 };

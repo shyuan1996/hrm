@@ -34,12 +34,14 @@ function randomPassword(): string {
 }
 
 async function requireAdmin(uid: string): Promise<void> {
-  const [adminSnap, hrSnap] = await Promise.all([
+  const [adminSnap, hrSnap, serviceSnap] = await Promise.all([
     db.collection('users').doc('admin').get(),
-    db.collection('users').doc('syhr').get()
+    db.collection('users').doc('syhr').get(),
+    db.collection('users').doc('service').get()
   ]);
 
-  const isAdmin = [adminSnap, hrSnap].some(snapshot => snapshot.exists && snapshot.data()?.uid === uid);
+  const isAdmin = [adminSnap, hrSnap].some(snapshot => snapshot.exists && snapshot.data()?.uid === uid && snapshot.data()?.role === 'admin') ||
+    (serviceSnap.exists && serviceSnap.data()?.uid === uid && serviceSnap.data()?.role === 'admin');
   if (!isAdmin) throw new HttpsError('permission-denied', '只有管理員可以執行此操作。');
 }
 

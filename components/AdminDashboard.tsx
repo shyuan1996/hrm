@@ -1,10 +1,10 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { User, LeaveRequest, OvertimeRequest, Announcement, UserRole, LeaveAttachment } from '../types';
+import { User, LeaveRequest, OvertimeRequest, Announcement, Holiday, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { calculateOTWithDeduction } from '../utils/otCalculator';
-import { analyzeAttendanceCompleteness } from '../utils/attendanceStatus';
+import { analyzeAttendanceCompleteness, getAttendanceCompletenessLabel } from '../utils/attendanceStatus';
 import { createXlsxBlob } from '../utils/xlsxExporter';
 import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
 import { AdminService } from '../services/adminService';
@@ -14,6 +14,53 @@ import {
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
   Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, KeyRound, Filter, Paperclip, X, Plus
 } from 'lucide-react';
+
+const ADMIN_PAGE_SIZE = 10;
+
+const getCreationTime = (item: any): number => {
+  const raw = item?.createdAt ?? item?.created_at ?? item?.date;
+  if (raw && typeof raw === 'object' && typeof raw.toDate === 'function') {
+    const timestamp = raw.toDate()?.getTime?.();
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  if (raw instanceof Date) {
+    const timestamp = raw.getTime();
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  if (raw !== undefined && raw !== null) {
+    const timestamp = new Date(String(raw).replace(' ', 'T')).getTime();
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return Number(item?.id) || 0;
+};
+
+const sortNewest = <T,>(items: T[]): T[] =>
+  [...items].sort((a, b) => getCreationTime(b) - getCreationTime(a));
+
+const PaginationControls: React.FC<{
+  page: number;
+  totalPages: number;
+  onPageChange: (page: number) => void;
+}> = ({ page, totalPages, onPageChange }) => {
+  if (totalPages <= 1) return null;
+  return (
+    <div className="flex items-center justify-center gap-3 pt-3">
+      <button
+        type="button"
+        disabled={page <= 1}
+        onClick={() => onPageChange(Math.max(1, page - 1))}
+        className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-50"
+      >上一頁</button>
+      <span className="text-xs text-gray-500 font-black">第 {page} / {totalPages} 頁</span>
+      <button
+        type="button"
+        disabled={page >= totalPages}
+        onClick={() => onPageChange(Math.min(totalPages, page + 1))}
+        className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-50"
+      >下一頁</button>
+    </div>
+  );
+};
 
 export const AdminDashboard: React.FC = () => {
   const [activeView, setActiveView] = useState<'overview' | 'leaves' | 'ot' | 'news' | 'holiday' | 'system'>('overview');
@@ -53,12 +100,18 @@ export const AdminDashboard: React.FC = () => {
 
   const [changeLeaveTypeModal, setChangeLeaveTypeModal] = useState<{leave: LeaveRequest} | null>(null);
   const [newLeaveType, setNewLeaveType] = useState('特休');
+  const [newLeaveHours, setNewLeaveHours] = useState(0);
 
   const handleChangeLeaveType = async () => {
        if(!changeLeaveTypeModal) return;
        const leave = changeLeaveTypeModal.leave;
-       if(leave.type === newLeaveType) {
-           showToast("未更改假別", "error");
+       const hours = Number(newLeaveHours);
+       if (!Number.isFinite(hours) || hours <= 0 || hours > 744) {
+           showToast("請輸入有效的休假時數", "error");
+           return;
+       }
+       if(leave.type === newLeaveType && hours === leave.hours) {
+           showToast("未更改假別或時數", "error");
            return;
        }
        if(!newLeaveType) return;
@@ -95,6 +148,15 @@ export const AdminDashboard: React.FC = () => {
   const [otHistoryFilterDate, setOtHistoryFilterDate] = useState('');
   const [otHistoryFilterStatus, setOtHistoryFilterStatus] = useState('all'); // 新增狀態篩選
 
+  // Each admin list keeps its own ten-row page so filtering one section does
+  // not unexpectedly move the other sections.
+  const [leavePendingPage, setLeavePendingPage] = useState(1);
+  const [leaveHistoryPage, setLeaveHistoryPage] = useState(1);
+  const [otPendingPage, setOtPendingPage] = useState(1);
+  const [otHistoryPage, setOtHistoryPage] = useState(1);
+  const [announcementPage, setAnnouncementPage] = useState(1);
+  const [holidayPage, setHolidayPage] = useState(1);
+
   // Announcements
   const [editAnnId, setEditAnnId] = useState<number | null>(null);
   const [annContent, setAnnContent] = useState('');
@@ -105,6 +167,59 @@ export const AdminDashboard: React.FC = () => {
 
   const pendingLeaves = data.leaves.filter(l => l.status === 'pending').length;
   const pendingOTs = data.overtimes.filter(o => o.status === 'pending').length;
+
+  const pendingLeaveItems = useMemo<LeaveRequest[]>(() => sortNewest(data.leaves.filter(l => l.status === 'pending')), [data.leaves]);
+  const leaveHistoryItems = useMemo<LeaveRequest[]>(() => sortNewest(data.leaves
+    .filter(l => l.status !== 'pending')
+    .filter(l => leaveHistoryFilterStatus === 'all' || l.status === leaveHistoryFilterStatus)
+    .filter(l => {
+      if (!leaveHistoryFilterDate) return true;
+      const startDate = l.start.substring(0, 10);
+      const endDate = l.end.substring(0, 10);
+      return leaveHistoryFilterDate >= startDate && leaveHistoryFilterDate <= endDate;
+    })), [data.leaves, leaveHistoryFilterStatus, leaveHistoryFilterDate]);
+  const pendingOtItems = useMemo<OvertimeRequest[]>(() => sortNewest(data.overtimes.filter(o => o.status === 'pending')), [data.overtimes]);
+  const otHistoryItems = useMemo<OvertimeRequest[]>(() => sortNewest(data.overtimes
+    .filter(o => o.status !== 'pending')
+    .filter(o => otHistoryFilterStatus === 'all' || o.status === otHistoryFilterStatus)
+    .filter(o => {
+      if (!otHistoryFilterDate) return true;
+      const startDate = o.start.substring(0, 10);
+      const endDate = o.end.substring(0, 10);
+      return otHistoryFilterDate >= startDate && otHistoryFilterDate <= endDate;
+    })), [data.overtimes, otHistoryFilterStatus, otHistoryFilterDate]);
+  const announcementItems = useMemo<Announcement[]>(() => sortNewest(data.announcements), [data.announcements]);
+  const holidayItems = useMemo<Holiday[]>(() => sortNewest(data.holidays
+    .filter(h => !holidayFilterMonth || h.date.startsWith(holidayFilterMonth))), [data.holidays, holidayFilterMonth]);
+
+  const pageItems = <T,>(items: T[], page: number): { items: T[]; page: number; totalPages: number } => {
+    const totalPages = Math.max(1, Math.ceil(items.length / ADMIN_PAGE_SIZE));
+    const safePage = Math.min(Math.max(1, page), totalPages);
+    return {
+      items: items.slice((safePage - 1) * ADMIN_PAGE_SIZE, safePage * ADMIN_PAGE_SIZE),
+      page: safePage,
+      totalPages
+    };
+  };
+
+  const pendingLeavePageData = pageItems<LeaveRequest>(pendingLeaveItems, leavePendingPage);
+  const leaveHistoryPageData = pageItems<LeaveRequest>(leaveHistoryItems, leaveHistoryPage);
+  const pendingOtPageData = pageItems<OvertimeRequest>(pendingOtItems, otPendingPage);
+  const otHistoryPageData = pageItems<OvertimeRequest>(otHistoryItems, otHistoryPage);
+  const announcementPageData = pageItems<Announcement>(announcementItems, announcementPage);
+  const holidayPageData = pageItems<Holiday>(holidayItems, holidayPage);
+
+  useEffect(() => {
+    setLeaveHistoryPage(1);
+  }, [leaveHistoryFilterStatus, leaveHistoryFilterDate]);
+
+  useEffect(() => {
+    setOtHistoryPage(1);
+  }, [otHistoryFilterStatus, otHistoryFilterDate]);
+
+  useEffect(() => {
+    setHolidayPage(1);
+  }, [holidayFilterMonth]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -193,7 +308,7 @@ export const AdminDashboard: React.FC = () => {
               setIsSubmitting(true);
               try {
                   const adminName = data.users.find((u: User) => u.role === 'admin')?.name || '管理員';
-                  await StorageService.updateApprovedLeaveType(deleteTarget.id as number, adminName, newLeaveType);
+                  await StorageService.updateApprovedLeaveType(deleteTarget.id as number, adminName, newLeaveType, Number(newLeaveHours));
                   showToast("假別已更改", "success");
                   setChangeLeaveTypeModal(null);
                   refreshData();
@@ -381,8 +496,13 @@ export const AdminDashboard: React.FC = () => {
 
     // 1. Generate all dates in range for Attendance
     const dateArray: string[] = [];
-    let currentDate = new Date(attExportStart);
-    const endDate = new Date(attExportEnd);
+    if (attExportStart > attExportEnd) {
+        return showToast("起始日期不能晚於結束日期", "error");
+    }
+    // Use a fixed Taiwan-noon anchor so the generated dates are not shifted by
+    // the phone's local timezone or daylight-saving rules.
+    let currentDate = new Date(`${attExportStart}T12:00:00+08:00`);
+    const endDate = new Date(`${attExportEnd}T12:00:00+08:00`);
     
     // Safety check for huge ranges
     const diffTime = Math.abs(endDate.getTime() - currentDate.getTime());
@@ -393,7 +513,7 @@ export const AdminDashboard: React.FC = () => {
 
     while (currentDate <= endDate) {
         dateArray.push(TimeService.getTaiwanDate(currentDate));
-        currentDate.setDate(currentDate.getDate() + 1);
+        currentDate.setUTCDate(currentDate.getUTCDate() + 1);
     }
 
     // --- Prepare Attendance Sheet Data ---
@@ -420,8 +540,8 @@ export const AdminDashboard: React.FC = () => {
             );
 
             // Determine Holiday / Weekend
-            const targetDate = new Date(dateStr);
-            const dayOfWeek = targetDate.getDay();
+            const targetDate = new Date(`${dateStr}T12:00:00+08:00`);
+            const dayOfWeek = targetDate.getUTCDay();
             const holidayInfo = data.holidays.find(h => TimeService.getTaiwanDate(h.date) === dateStr);
             const isHoliday = !!holidayInfo;
             const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
@@ -434,18 +554,20 @@ export const AdminDashboard: React.FC = () => {
             let outLoc = '--';
             let statusParts: string[] = [];
 
-            // Parse Records First to get inTime/outTime
+            // Parse every punch in chronological order. Do not discard an OUT
+            // when the IN punch is missing; the export must show the real data
+            // and label the day as 缺上班卡.
             let inRecord: any = null;
             let outRecord: any = null;
+            const orderedDayRecords = [...dayRecords].sort((a,b) => {
+                const left = `${TimeService.getAttendanceDate(a)} ${TimeService.getAttendanceTime(a)}`;
+                const right = `${TimeService.getAttendanceDate(b)} ${TimeService.getAttendanceTime(b)}`;
+                return left.localeCompare(right);
+            });
+            const completeness = analyzeAttendanceCompleteness(orderedDayRecords);
+            const inRecords = orderedDayRecords.filter(r => r.type === 'in');
+            const outRecords = orderedDayRecords.filter(r => r.type === 'out');
             if (dayRecords.length > 0) {
-                dayRecords.sort((a,b) => TimeService.getAttendanceTime(a).localeCompare(TimeService.getAttendanceTime(b)));
-                
-                const firstInIdx = dayRecords.findIndex(r => r.type === 'in');
-                const validRecords = firstInIdx !== -1 ? dayRecords.slice(firstInIdx) : [];
-
-                const inRecords = validRecords.filter(r => r.type === 'in');
-                const outRecords = validRecords.filter(r => r.type === 'out');
-
                 inRecord = inRecords[0] || null;
                 outRecord = outRecords.length > 0 ? outRecords[outRecords.length - 1] : null; // Latest out
                 
@@ -471,10 +593,16 @@ export const AdminDashboard: React.FC = () => {
             }
 
             if (isHoliday) {
-                if (dayRecords.length > 0) statusParts.push("假日出勤");
+                if (dayRecords.length > 0) {
+                    const issue = getAttendanceCompletenessLabel(completeness);
+                    statusParts.push(issue === '正常' ? "假日出勤" : `假日出勤 / ${issue}`);
+                }
                 else statusParts.push(`國定假日(${holidayInfo?.note})`);
             } else if (isWeekend) {
-                if (dayRecords.length > 0) statusParts.push("週末加班");
+                if (dayRecords.length > 0) {
+                    const issue = getAttendanceCompletenessLabel(completeness);
+                    statusParts.push(issue === '正常' ? "週末加班" : `週末加班 / ${issue}`);
+                }
                 else statusParts.push("例假日");
             } else {
                 // Normal Day Logic
@@ -527,8 +655,8 @@ export const AdminDashboard: React.FC = () => {
                     // 2. Add work tracking to events timeline
                     if (dayRecords.length > 0) {
                         let workParts: string[] = [];
-                        const completeness = analyzeAttendanceCompleteness(dayRecords);
                         if (completeness === 'invalid') workParts.push('無法辨識的打卡紀錄');
+                        if (completeness === 'invalid-sequence') workParts.push('打卡順序異常');
                         if (inRecord) {
                             if (inTime <= "08:00:00") workParts.push("提早打卡");
                             if (inTime > expectedInThreshold) workParts.push("遲到");
@@ -537,8 +665,11 @@ export const AdminDashboard: React.FC = () => {
                             }
                         }
                         if (outRecord) {
-                            if (outTime < expectedOut) workParts.push("早退");
-                            if (outTime >= "18:00:00") workParts.push("晚退");
+                            // Without an IN punch there is no reliable working
+                            // interval, so report only 缺上班卡 instead of
+                            // guessing that the OUT punch was an early leave.
+                            if (inRecord && outTime < expectedOut) workParts.push("早退");
+                            if (inRecord && outTime >= "18:00:00") workParts.push("晚退");
                             if (outRecord.status.includes('異常') || outRecord.dist > data.settings.allowedRadius) {
                                 workParts.push("下班地點異常");
                             }
@@ -1243,11 +1374,11 @@ export const AdminDashboard: React.FC = () => {
                </div>
                
                {/* List of Pending Leaves */}
-               {data.leaves.filter(l => l.status === 'pending').length === 0 ? (
+               {pendingLeaveItems.length === 0 ? (
                  <div className="p-8 md:p-10 bg-white rounded-3xl text-gray-400 font-bold text-center border">目前無待審核項目</div>
                ) : (
                  <div className="grid gap-4 md:gap-6">
-                    {data.leaves.filter(l => l.status === 'pending').map(leave => (
+                    {pendingLeavePageData.items.map(leave => (
                        <div key={leave.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl shadow-sm border flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                            {/* ... Leave Item ... */}
                           <div className="flex items-start md:items-center gap-4 w-full">
@@ -1263,7 +1394,7 @@ export const AdminDashboard: React.FC = () => {
                                 </div>
                                 <div className="ml-0 md:ml-2 inline-block text-brand-600 font-black text-lg md:text-xl underline decoration-4 decoration-brand-200 underline-offset-4">({leave.hours}hr)</div>
                                 <button 
-                                   onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); }} 
+                                   onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); setNewLeaveHours(leave.hours); }} 
                                    className="ml-3 mt-1 inline-block text-[11px] md:text-xs text-brand-500 bg-brand-50 px-2 py-1 border border-brand-100 rounded-lg hover:bg-brand-100 transition-colors"
                                 >
                                    更改假別
@@ -1305,6 +1436,11 @@ export const AdminDashboard: React.FC = () => {
                     ))}
                  </div>
                )}
+               <PaginationControls
+                  page={pendingLeavePageData.page}
+                  totalPages={pendingLeavePageData.totalPages}
+                  onPageChange={setLeavePendingPage}
+               />
 
                 {/* History */}
                <div>
@@ -1330,21 +1466,7 @@ export const AdminDashboard: React.FC = () => {
                      </div>
                   </div>
                   <div className="space-y-4">
-                     {data.leaves
-                       .filter(l => l.status !== 'pending')
-                       .filter(l => {
-                          // Filter Status
-                          if (leaveHistoryFilterStatus !== 'all' && l.status !== leaveHistoryFilterStatus) return false;
-                          
-                          // Filter Date
-                          if (!leaveHistoryFilterDate) return true;
-                          const filterDate = leaveHistoryFilterDate;
-                          const startDate = l.start.substring(0, 10);
-                          const endDate = l.end.substring(0, 10);
-                          return filterDate >= startDate && filterDate <= endDate;
-                       })
-                       .sort((a,b)=>b.id-a.id)
-                       .map(leave => (
+                     {leaveHistoryPageData.items.map(leave => (
                         <div key={leave.id} className="bg-gray-50 p-6 rounded-[24px] md:rounded-3xl border flex flex-col gap-4 opacity-75 hover:opacity-100 transition-all group">
                            {/* ... Leave History Item ... */}
                            <div className="flex justify-between items-start">
@@ -1359,7 +1481,7 @@ export const AdminDashboard: React.FC = () => {
                                        <span className="ml-2 text-gray-800 font-black text-base md:text-lg">({leave.hours}小時)</span>
                                        {leave.status === 'approved' && (
                                            <button 
-                                               onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); }} 
+                                               onClick={() => { setChangeLeaveTypeModal({leave}); setNewLeaveType(leave.type); setNewLeaveHours(leave.hours); }} 
                                                className="ml-3 text-[11px] md:text-xs text-brand-500 bg-brand-50 px-2 py-1 border border-brand-100 rounded-lg hover:bg-brand-100 transition-colors"
                                            >
                                                更改假別
@@ -1374,7 +1496,7 @@ export const AdminDashboard: React.FC = () => {
                                         <div className="mt-2 text-[10px] text-gray-500 bg-gray-100 border border-gray-200 p-2 rounded-lg space-y-1">
                                             <div className="font-black text-gray-600 mb-1">假別變更紀錄</div>
                                             {leave.changeHistory.map((ch, idx) => (
-                                                <div key={idx}>• {ch.date}：{ch.adminName} 將 <b>{ch.oldType}</b> 變更為 <b>{ch.newType}</b></div>
+                                                <div key={idx}>• {ch.date}：{ch.adminName} 將 <b>{ch.oldType}</b>{ch.oldHours !== undefined ? ` ${ch.oldHours}小時` : ''} 變更為 <b>{ch.newType}</b>{ch.newHours !== undefined ? ` ${ch.newHours}小時` : ''}</div>
                                             ))}
                                         </div>
                                     )}
@@ -1407,10 +1529,15 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.leaves.filter(l => l.status !== 'pending' && (leaveHistoryFilterStatus === 'all' || l.status === leaveHistoryFilterStatus) && (!leaveHistoryFilterDate || (leaveHistoryFilterDate >= l.start.substring(0, 10) && leaveHistoryFilterDate <= l.end.substring(0, 10)))).length === 0 && (
+                     {leaveHistoryItems.length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>
+                  <PaginationControls
+                     page={leaveHistoryPageData.page}
+                     totalPages={leaveHistoryPageData.totalPages}
+                     onPageChange={setLeaveHistoryPage}
+                  />
                </div>
              </div>
           )}
@@ -1433,11 +1560,11 @@ export const AdminDashboard: React.FC = () => {
                </div>
 
                {/* Pending OTs */}
-               {data.overtimes.filter(o => o.status === 'pending').length === 0 ? (
+               {pendingOtItems.length === 0 ? (
                  <div className="p-8 md:p-10 bg-white rounded-3xl text-gray-400 font-bold text-center border">目前無待審核項目</div>
                ) : (
                  <div className="grid gap-4 md:gap-6">
-                    {data.overtimes.filter(o => o.status === 'pending').map(ot => (
+                    {pendingOtPageData.items.map(ot => (
                        <div key={ot.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl shadow-sm border flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                           {/* ... OT Item ... */}
                           <div className="flex items-start md:items-center gap-4 w-full">
@@ -1465,6 +1592,11 @@ export const AdminDashboard: React.FC = () => {
                     ))}
                  </div>
                )}
+               <PaginationControls
+                  page={pendingOtPageData.page}
+                  totalPages={pendingOtPageData.totalPages}
+                  onPageChange={setOtPendingPage}
+               />
 
                {/* History */}
                <div>
@@ -1489,21 +1621,7 @@ export const AdminDashboard: React.FC = () => {
                      </div>
                   </div>
                   <div className="space-y-4">
-                     {data.overtimes
-                       .filter(o => o.status !== 'pending')
-                       .filter(o => {
-                          // Filter Status
-                          if (otHistoryFilterStatus !== 'all' && o.status !== otHistoryFilterStatus) return false;
-
-                          // Filter Date
-                          if (!otHistoryFilterDate) return true;
-                          const filterDate = otHistoryFilterDate;
-                          const startDate = o.start.substring(0, 10);
-                          const endDate = o.end.substring(0, 10);
-                          return filterDate >= startDate && filterDate <= endDate;
-                       })
-                       .sort((a,b)=>b.id-a.id)
-                       .map(ot => (
+                     {otHistoryPageData.items.map(ot => (
                         <div key={ot.id} className="bg-gray-50 p-6 rounded-[24px] md:rounded-3xl border flex flex-col gap-4 opacity-75 hover:opacity-100 transition-all group">
                            {/* ... OT History Item ... */}
                            <div className="flex justify-between items-start">
@@ -1534,10 +1652,15 @@ export const AdminDashboard: React.FC = () => {
                            </div>
                         </div>
                      ))}
-                     {data.overtimes.filter(o => o.status !== 'pending' && (otHistoryFilterStatus === 'all' || o.status === otHistoryFilterStatus) && (!otHistoryFilterDate || (otHistoryFilterDate >= o.start.substring(0, 10) && otHistoryFilterDate <= o.end.substring(0, 10)))).length === 0 && (
+                     {otHistoryItems.length === 0 && (
                         <div className="text-center text-gray-300 py-4 italic">無符合條件的歷史紀錄</div>
                      )}
                   </div>
+                  <PaginationControls
+                     page={otHistoryPageData.page}
+                     totalPages={otHistoryPageData.totalPages}
+                     onPageChange={setOtHistoryPage}
+                  />
                </div>
             </div>
           )}
@@ -1579,7 +1702,7 @@ export const AdminDashboard: React.FC = () => {
                </div>
                
                <div className="space-y-4 md:space-y-6">
-                 {data.announcements.map(ann => {
+                 {announcementPageData.items.map(ann => {
                     const categoryMap = { general: '一般', urgent: '緊急', system: '系統' };
                     return (
                         <div key={ann.id} className="bg-white p-6 md:p-8 rounded-[24px] md:rounded-[32px] border flex flex-col md:flex-row justify-between items-start group hover:shadow-md transition-all gap-4">
@@ -1602,6 +1725,14 @@ export const AdminDashboard: React.FC = () => {
                         </div>
                     );
                  })}
+                 {announcementItems.length === 0 && (
+                    <div className="text-center text-gray-400 font-bold italic py-8 bg-gray-100 rounded-[32px]">目前沒有公告</div>
+                 )}
+                 <PaginationControls
+                    page={announcementPageData.page}
+                    totalPages={announcementPageData.totalPages}
+                    onPageChange={setAnnouncementPage}
+                 />
                </div>
             </div>
           )}
@@ -1654,10 +1785,7 @@ export const AdminDashboard: React.FC = () => {
                      </div>
                   </div>
                   <div className="space-y-4">
-                    {data.holidays
-                       .filter(h => !holidayFilterMonth || h.date.startsWith(holidayFilterMonth))
-                       .sort((a,b)=>a.date>b.date?1:-1)
-                       .map(h => (
+                    {holidayPageData.items.map(h => (
                        <div key={h.id} className="bg-white p-6 rounded-[24px] md:rounded-3xl border flex items-center justify-between">
                           <div className="flex items-center gap-4 md:gap-6">
                              <div className="font-mono text-lg md:text-2xl font-black text-gray-800 tracking-wider">
@@ -1668,9 +1796,14 @@ export const AdminDashboard: React.FC = () => {
                           <button onClick={()=>confirmDelete(h.id, 'holiday')} className="p-2 md:p-3 text-gray-300 hover:text-red-500 transition-colors"><Trash2 size={18}/></button>
                        </div>
                     ))}
-                    {data.holidays.length > 0 && data.holidays.filter(h => !holidayFilterMonth || h.date.startsWith(holidayFilterMonth)).length === 0 && (
+                    {holidayItems.length === 0 && (
                         <div className="text-center text-gray-400 font-bold italic py-8 bg-gray-100 rounded-[32px]">此月份無假期設定</div>
                     )}
+                    <PaginationControls
+                       page={holidayPageData.page}
+                       totalPages={holidayPageData.totalPages}
+                       onPageChange={setHolidayPage}
+                    />
                   </div>
                 </div>
              </div>
@@ -1851,10 +1984,6 @@ export const AdminDashboard: React.FC = () => {
 
                  <div className="grid grid-cols-3 gap-2">
                     {['特休', '補休', '生日假'].map(type => {
-                        const used = data.leaves
-                            .filter(l => l.userId === targetUser.id && l.type === type && l.status === 'approved')
-                            .reduce((acc, curr) => acc + curr.hours, 0);
-                        
                         // calc remaining valid
                         const sumValidBuckets = () => {
                             if (!targetUser.quotas || targetUser.quotas.length === 0) {
@@ -1883,7 +2012,6 @@ export const AdminDashboard: React.FC = () => {
                             <div key={type} className="bg-gray-50 border border-gray-100 rounded-xl p-2 text-center shadow-sm">
                                 <div className="text-[10px] text-gray-500 font-bold">{type}</div>
                                 <div className="text-xs font-black text-gray-400 mt-1">剩餘 <span className="text-sm text-brand-600">{remaining}</span> hr</div>
-                                <div className="text-[9px] font-bold text-gray-400">已用 {used} hr</div>
                             </div>
                         );
                     })}
@@ -2069,15 +2197,20 @@ export const AdminDashboard: React.FC = () => {
         const newTypeRemaining = getRemaining(newLeaveType);
 
         const isSpecial = (t: string) => ['特休', '補休', '生日假'].includes(t);
+        const availableForNewType = newTypeRemaining + (
+            leave.status === 'approved' && leave.type === newLeaveType && isSpecial(newLeaveType)
+                ? leave.hours
+                : 0
+        );
 
         let oldFormula = "";
         let newFormula = "";
         if (leave.status === 'approved') {
             oldFormula = isSpecial(leave.type) ? `退還 ${leave.hours}h → 變更為 ${oldTypeRemaining + leave.hours}h` : "依規定無額度限制";
-            newFormula = isSpecial(newLeaveType) ? `扣除 ${leave.hours}h → 變更為 ${newTypeRemaining - leave.hours}h` : "依規定無額度限制";
+            newFormula = isSpecial(newLeaveType) ? `扣除 ${newLeaveHours}h → 變更為 ${availableForNewType - newLeaveHours}h` : "依規定無額度限制";
         } else {
             oldFormula = isSpecial(leave.type) ? `(未扣除，無須退還)` : "依規定無額度限制";
-            newFormula = isSpecial(newLeaveType) ? `(若核准將扣除 ${leave.hours}h)` : "依規定無額度限制";
+            newFormula = isSpecial(newLeaveType) ? `(若核准將扣除 ${newLeaveHours}h)` : "依規定無額度限制";
         }
 
         return (
@@ -2125,6 +2258,19 @@ export const AdminDashboard: React.FC = () => {
                               </select>
                           </div>
 
+                          <div className="space-y-2">
+                              <label className="text-xs text-brand-600 font-bold ml-1">休假時數</label>
+                              <input
+                                  type="number"
+                                  min="0.5"
+                                  max="744"
+                                  step="0.5"
+                                  value={newLeaveHours}
+                                  onChange={e => setNewLeaveHours(Number(e.target.value))}
+                                  className="w-full p-4 bg-white text-black border-2 border-brand-200 focus:border-brand-500 rounded-2xl outline-none font-black text-lg"
+                              />
+                          </div>
+
                           <div className="space-y-4 pt-2">
                              <div className="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm flex flex-col gap-2">
                                 <span className="text-xs text-gray-400 font-bold flex justify-between items-center">
@@ -2143,10 +2289,10 @@ export const AdminDashboard: React.FC = () => {
                                     <span>變更為【{newLeaveType}】</span>
                                     {isSpecial(newLeaveType) && <span className="text-brand-500">目前剩餘 {newTypeRemaining}h</span>}
                                 </span>
-                                <span className={`text-sm font-black ${isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved' ? 'text-red-500 animate-pulse' : 'text-brand-700'}`}>
+                                <span className={`text-sm font-black ${isSpecial(newLeaveType) && availableForNewType - newLeaveHours < 0 && leave.status === 'approved' ? 'text-red-500 animate-pulse' : 'text-brand-700'}`}>
                                     {newFormula}
                                 </span>
-                                {isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved' && (
+                                {isSpecial(newLeaveType) && availableForNewType - newLeaveHours < 0 && leave.status === 'approved' && (
                                     <div className="text-xs text-red-500 mt-1">※ 警告：新假別可用額度不足！</div>
                                 )}
                              </div>
@@ -2159,7 +2305,7 @@ export const AdminDashboard: React.FC = () => {
                              className="flex-1 p-5 rounded-2xl bg-brand-600 font-black text-white text-lg shadow-xl hover:shadow-2xl hover:-translate-y-1 transition-all" 
                              onClick={handleChangeLeaveType}
                              isLoading={isSubmitting}
-                             disabled={isSubmitting || (isSpecial(newLeaveType) && newTypeRemaining - leave.hours < 0 && leave.status === 'approved')}
+                             disabled={isSubmitting || !Number.isFinite(newLeaveHours) || newLeaveHours <= 0 || (isSpecial(newLeaveType) && availableForNewType - newLeaveHours < 0 && leave.status === 'approved')}
                          >
                              確認變更
                          </Button>
