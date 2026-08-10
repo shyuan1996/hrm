@@ -330,9 +330,15 @@ export const StorageService = {
         const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_'); // Sanitize filename
         const storagePath = `leave_attachments/${userId}/${timestamp}_${safeName}`;
         const storageRef = ref(storage, storagePath);
+        const contentType = file.type || (
+          file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/jpeg'
+        );
 
         try {
-            const snapshot = await uploadBytes(storageRef, file);
+            // Set metadata explicitly. Some mobile browsers provide an empty
+            // File.type even for a valid image, which can make a Storage rule
+            // that checks request.resource.contentType reject the upload.
+            const snapshot = await uploadBytes(storageRef, file, { contentType });
             const url = await getDownloadURL(snapshot.ref);
             uploaded.push({
                 name: file.name,
@@ -340,7 +346,15 @@ export const StorageService = {
                 path: storagePath
             });
         } catch (e: any) {
-            console.error("Upload failed for " + file.name, e);
+            console.error("Upload failed for " + file.name, {
+              code: e?.code,
+              message: e?.message,
+              path: storagePath,
+              contentType
+            });
+            if (typeof e?.code === 'string') {
+              throw new Error(`檔案 ${file.name} 上傳失敗 (${e.code})，請稍後再試。`);
+            }
             throw new Error(`檔案 ${file.name} 上傳失敗，請稍後再試。`);
         }
     }
