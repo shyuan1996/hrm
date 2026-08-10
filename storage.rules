@@ -31,11 +31,18 @@ service firebase.storage {
              );
     }
 
+    // New attachments use the immutable Firebase Auth UID as their folder.
+    // Legacy account-ID folders remain supported for existing files.
+    function isAttachmentOwner(pathUserId) {
+      return isSignedIn() &&
+             (pathUserId == request.auth.uid || isOwner(pathUserId));
+    }
+
     // Leave attachments are the only files used by the application.
     match /leave_attachments/{userId}/{fileName} {
-      allow read: if isAdmin() || isOwner(userId);
+      allow read: if isAdmin() || isAttachmentOwner(userId);
 
-      allow create: if isOwner(userId) &&
+      allow create: if isAttachmentOwner(userId) &&
                        request.resource.size <= 5 * 1024 * 1024 &&
                        request.resource.contentType != null &&
                        (request.resource.contentType.matches('image/.*') ||
@@ -43,7 +50,7 @@ service firebase.storage {
 
       // Uploads use unique filenames, so replacing an existing file is never needed.
       allow update: if false;
-      allow delete: if isAdmin() || isOwner(userId);
+      allow delete: if isAdmin() || isAttachmentOwner(userId);
     }
   }
 }
