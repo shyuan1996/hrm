@@ -325,10 +325,15 @@ export const StorageService = {
             throw new Error(`檔案 ${file.name} 不是允許的圖片或 PDF。`);
         }
 
-        // Path: leave_attachments/{userId}/{timestamp}_{filename}
+        // Store new files under the immutable Firebase Auth UID. Legacy files
+        // may still use the account ID; the Storage Rules support both paths.
         const timestamp = Date.now();
         const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_'); // Sanitize filename
-        const storagePath = `leave_attachments/${userId}/${timestamp}_${safeName}`;
+        const authenticatedUid = auth.currentUser?.uid;
+        if (!authenticatedUid) {
+          throw new Error('請重新登入後再上傳附件。');
+        }
+        const storagePath = `leave_attachments/${authenticatedUid}/${timestamp}_${safeName}`;
         const storageRef = ref(storage, storagePath);
         const contentType = file.type || (
           file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/jpeg'
