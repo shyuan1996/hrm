@@ -1,10 +1,24 @@
 
 import type { AttendanceRecord, Holiday } from '../types';
 
-// 使用模組級變數作為 Singleton 狀態儲存
-// 這是為了確保時間計算基準點 (Anchor) 唯一且不受元件重繪影響
-let _anchorServerTime: number | null = null; // 基準網路時間 (毫秒)
-let _anchorPerfTime: number = 0;             // 取得基準時的 performance.now() (毫秒)
+// 使用模組級變數作為 Singleton 狀態儲存。
+// 每次成功校時都會重新建立錨點，避免頁面長時間開啟後因裝置時鐘漂移而越來越慢。
+let _anchorServerTime: number | null = null; // 錨點當下的標準時間 (毫秒)
+let _anchorPerfTime = 0;                     // 錨點當下的單調計時器 (毫秒)
+let _lastOffset = 0;
+let _lastSyncAt = 0;
+let _syncPromise: Promise<number | null> | null = null;
+
+const getMonotonicTime = (): number => {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+};
+
+type NetworkTimeSample = {
+  offset: number;
+  serverTime: number;
+};
 
 export const TimeService = {
   /**
@@ -13,7 +27,11 @@ export const TimeService = {
    * 若所有 API 請求都失敗，回傳 null (代表時間驗證失敗，禁止操作)。
    */
   getNetworkTimeOffset: async (): Promise<number | null> => {
-    const fetchWithTimeout = async (url: string, timeout = 3000) => {
+    // Prevent the initial load, background refresh and punch action from
+    // launching competing requests and overwriting one another's anchor.
+    if (_syncPromise) return _syncPromise;
+
+    const fetchWithTimeout = async (url: string, timeout = 5000): Promise<NetworkTimeSample> => {
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), timeout);
       const requestStartedAt = Date.now();
@@ -33,10 +51,10 @@ export const TimeService = {
         try {
             const data = JSON.parse(text);
             // Support multiple API formats
-            const dateTimeStr = data.dateTime || data.datetime || data.utc_datetime || data.iso;
-            if (dateTimeStr) {
-                serverTime = new Date(dateTimeStr).getTime();
-            }
+            const dateTimeValue = data.dateTime || data.datetime || data.utc_datetime ||
+              data.iso || data.iso8601 || data.currentDateTime || data.currentDateTimeUtc;
+            if (dateTimeValue) serverTime = new Date(dateTimeValue).getTime();
+            if (!serverTime && typeof data.unixtime === 'number') serverTime = data.unixtime * 1000;
         } catch (e) {
             // Ignore JSON parse error, try text
         }
@@ -50,54 +68,51 @@ export const TimeService = {
             }
         }
 
-        if (!serverTime) throw new Error('Invalid Data Format');
+        if (!Number.isFinite(serverTime) || serverTime <= 0) throw new Error('Invalid Data Format');
         
         const responseReceivedAt = Date.now();
         const localMidpoint = requestStartedAt + (responseReceivedAt - requestStartedAt) / 2;
-        return serverTime - localMidpoint;
+        const offset = serverTime - localMidpoint;
+        // Reject malformed responses instead of treating them as a valid clock.
+        if (!Number.isFinite(offset) || Math.abs(offset) > 24 * 60 * 60 * 1000) {
+          throw new Error('Invalid time offset');
+        }
+        return { offset, serverTime };
       } catch (e) {
         clearTimeout(id);
         throw e;
       }
     };
 
-    // Helper to simulate Promise.any behavior
-    const promiseAny = <T>(promises: Promise<T>[]): Promise<T> => {
-      return new Promise((resolve, reject) => {
-        let rejectedCount = 0;
-        if (promises.length === 0) {
-          return reject(new Error('No promises passed'));
-        }
-        promises.forEach(p => {
-          Promise.resolve(p).then(resolve).catch(() => {
-            rejectedCount++;
-            if (rejectedCount === promises.length) {
-              reject(new Error('All promises rejected'));
-            }
-          });
-        });
-      });
-    };
+    const syncTask = (async (): Promise<number | null> => {
+      try {
+        // 同時嘗試多個來源；Promise.any 只採用第一個有效回應。
+        const sample = await Promise.any([
+          fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
+          fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601'),
+          fetchWithTimeout('https://timeapi.io/api/time/current/zone?timeZone=Asia%2FTaipei')
+        ]);
 
-    try {
-      // Race 模式：嘗試多個外部來源
-      const offset = await promiseAny([
-        fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
-        fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601')
-      ]);
-
-      // Only the winning request may establish the page clock, and only once.
-      // The old implementation let both racing requests overwrite the shared
-      // anchor every ten seconds, causing visible time jumps.
-      if (_anchorServerTime === null) {
+        const offset = sample.offset;
+        _lastOffset = offset;
+        _lastSyncAt = Date.now();
+        // Re-anchor on every successful sync. This is the missing step that
+        // caused an old tab to keep displaying a stale time indefinitely.
         _anchorServerTime = Date.now() + offset;
-        _anchorPerfTime = performance.now();
+        _anchorPerfTime = getMonotonicTime();
+        return offset;
+      } catch (e) {
+        // 網路時間獲取完全失敗，嚴格禁止使用本機時間進行打卡。
+        console.error('Time sync failed completely. API unavailable.', e);
+        return null;
       }
-      return offset;
-    } catch (e) {
-      // 網路時間獲取完全失敗，嚴格禁止使用本機時間或任何後備方案
-      console.error("Time sync failed completely. API unavailable."); 
-      return null;
+    })();
+
+    _syncPromise = syncTask;
+    try {
+      return await syncTask;
+    } finally {
+      if (_syncPromise === syncTask) _syncPromise = null;
     }
   },
 
@@ -108,15 +123,25 @@ export const TimeService = {
   getCorrectedNow: (offset: number): Date => {
     // 如果曾經成功對時過，使用「單調時鐘」算法
     if (_anchorServerTime !== null) {
-        const elapsed = performance.now() - _anchorPerfTime;
+        const elapsed = getMonotonicTime() - _anchorPerfTime;
         return new Date(_anchorServerTime + elapsed);
     }
     // 降級方案：如果尚未對時成功，只能依賴本地時間 + 偏移量
     // (注意：打卡功能會強制要求 getNetworkTimeOffset() 成功，此處僅供 UI 顯示)
-    return new Date(Date.now() + offset);
+    const safeOffset = Number.isFinite(offset) ? offset : _lastOffset;
+    return new Date(Date.now() + safeOffset);
+  },
+
+  getLastSyncAt: (): number => _lastSyncAt,
+
+  isSyncFresh: (maxAgeMs = 10 * 60 * 1000): boolean => {
+    return _anchorServerTime !== null && _lastSyncAt > 0 && Date.now() - _lastSyncAt <= maxAgeMs;
   },
 
   getAttendanceDate: (record: AttendanceRecord): string => {
+    // Administrator補打卡的 date/time 是指定的實際打卡時間；createdAt
+    // 僅代表管理員執行補登的時間，不能拿來取代打卡日期。
+    if (record.source === 'admin') return TimeService.getTaiwanDate(record.date);
     const timestamp = record.createdAt as any;
     if (timestamp?.toDate instanceof Function) {
       return TimeService.getTaiwanDate(timestamp.toDate());
@@ -125,6 +150,7 @@ export const TimeService = {
   },
 
   getAttendanceTime: (record: AttendanceRecord, withSeconds = true): string => {
+    if (record.source === 'admin') return TimeService.formatTimeOnly(record.time, withSeconds);
     const timestamp = record.createdAt as any;
     if (timestamp?.toDate instanceof Function) {
       return TimeService.getTaiwanTime(timestamp.toDate()).substring(0, withSeconds ? 8 : 5);

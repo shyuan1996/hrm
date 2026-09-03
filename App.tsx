@@ -29,6 +29,34 @@ const App: React.FC = () => {
   // modal accessibility: focus first input
   const oldPwdRef = useRef<HTMLInputElement | null>(null);
 
+  const showNotification = useCallback((message: string, type: 'success' | 'error' = 'success') => {
+    setNotification({ type, message });
+    setTimeout(() => setNotification(null), 3000);
+  }, []);
+
+  /**
+   * Shared time synchronisation entry point for the initial load and the
+   * administrator's manual hard-correction button.
+   */
+  const syncTime = useCallback(async (notifyOnFailure = true): Promise<number | null> => {
+    try {
+      const offset = await TimeService.getNetworkTimeOffset();
+      if (offset === null) {
+        setIsTimeSynced(false);
+        if (notifyOnFailure) showNotification('網路時間校正失敗，為確保數據正確，請檢查網路連線', 'error');
+        return null;
+      }
+      setTimeOffset(offset);
+      setIsTimeSynced(true);
+      return offset;
+    } catch (error) {
+      console.error('TimeService.getNetworkTimeOffset error', error);
+      setIsTimeSynced(false);
+      if (notifyOnFailure) showNotification('網路時間校正失敗，為確保數據正確，請檢查網路連線', 'error');
+      return null;
+    }
+  }, [showNotification]);
+
   const safeLoadData = useCallback(() => {
     try {
       const data = StorageService.loadData();
@@ -55,19 +83,7 @@ const App: React.FC = () => {
     window.addEventListener('storage-update', handleStorageUpdate);
 
     // 3. Time Sync
-    TimeService.getNetworkTimeOffset().then(offset => {
-      if (offset !== null) {
-        setTimeOffset(offset);
-        setIsTimeSynced(true);
-      } else {
-        setIsTimeSynced(false);
-        showNotification('網路時間校正失敗，為確保數據正確，請檢查網路連線', 'error');
-      }
-    }).catch(err => {
-      console.error('TimeService.getNetworkTimeOffset error', err);
-      setIsTimeSynced(false);
-      showNotification('網路時間校正失敗，為確保數據正確，請檢查網路連線', 'error');
-    });
+    void syncTime(true);
 
     // 4. Session & Auth State Listener
     let authCheckVersion = 0;
@@ -133,12 +149,28 @@ const App: React.FC = () => {
       StorageService.stopRealtimeSync();
       unsubscribeAuth();
     };
-  }, [safeLoadData]);
+  }, [safeLoadData, syncTime]);
 
-  const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
-    setNotification({ type, message });
-    setTimeout(() => setNotification(null), 3000);
-  };
+  // Mobile browsers can suspend timers while a tab is backgrounded or the
+  // screen is locked.  Re-sync as soon as the app becomes visible again so an
+  // old tab cannot keep displaying (or accepting) a stale clock anchor.
+  useEffect(() => {
+    let lastVisibilitySync = 0;
+    const refreshOnReturn = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastVisibilitySync < 30 * 1000) return;
+      lastVisibilitySync = now;
+      void syncTime(false);
+    };
+
+    document.addEventListener('visibilitychange', refreshOnReturn);
+    window.addEventListener('focus', refreshOnReturn);
+    return () => {
+      document.removeEventListener('visibilitychange', refreshOnReturn);
+      window.removeEventListener('focus', refreshOnReturn);
+    };
+  }, [syncTime]);
 
   const handleUpdateSelfPwd = async () => {
     if (isProcessing) return; // 防重入
@@ -340,7 +372,7 @@ const App: React.FC = () => {
         {!currentUser ? (
           <Login onLogin={handleLoginSuccess} />
         ) : currentUser.role === 'admin' ? (
-          <AdminDashboard />
+          <AdminDashboard timeOffset={timeOffset} isTimeSynced={isTimeSynced} onTimeSync={() => syncTime(true)} />
         ) : (
           <EmployeeDashboard user={currentUser} settings={appSettings} timeOffset={timeOffset} isTimeSynced={isTimeSynced} />
         )}

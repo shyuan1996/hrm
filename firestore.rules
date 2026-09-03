@@ -69,6 +69,37 @@ service cloud.firestore {
               canUseEmployeeData(request.resource.data.get('userId', ''));
     }
 
+    // Shared structural validation for employee and administrator-created
+    // attendance records. Administrator records add only explicit audit fields
+    // and still have to reference the employee's immutable Auth UID.
+    function isValidAttendanceRecord(record) {
+      return record.keys().hasOnly([
+               'id', 'userId', 'uid', 'userName', 'date', 'time',
+               'type', 'status', 'lat', 'lng', 'dist', 'photo', 'createdAt',
+               'source', 'createdByUid', 'createdByName'
+             ]) &&
+             record.id is int &&
+             record.userId is string &&
+             record.uid is string &&
+             record.userName is string &&
+             record.userName.size() <= 100 &&
+             record.type in ['in', 'out'] &&
+             record.status in ['正常', '地點異常'] &&
+             record.date is string &&
+             record.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+             record.time is string &&
+             record.time.matches('^[0-9]{2}:[0-9]{2}:[0-9]{2}$') &&
+             record.lat is number &&
+             record.lat >= -90 && record.lat <= 90 &&
+             record.lng is number &&
+             record.lng >= -180 && record.lng <= 180 &&
+             record.dist is number &&
+             record.dist >= 0 && record.dist <= 20000000 &&
+             record.get('source', 'employee') in ['employee', 'admin'] &&
+             record.get('createdByUid', '') is string &&
+             record.get('createdByName', '') is string;
+    }
+
     // --- Collection Rules ---
 
     // Security Logs (New)
@@ -113,29 +144,28 @@ service cloud.firestore {
     // Records (Attendance)
     match /records/{recordId} {
       allow read: if isAdmin() || isResourceOwner();
-      // The employee may only create a structurally valid record for themself.
-      allow create: if isCreatingOwnResource() &&
-                       request.resource.data.keys().hasOnly([
-                         'id', 'userId', 'uid', 'userName', 'date', 'time',
-                         'type', 'status', 'lat', 'lng', 'dist', 'photo', 'createdAt'
-                       ]) &&
+      // Employees may only create their own valid records. Administrators may
+      // create a historical補打卡 record only with an explicit audit marker,
+      // and the UID must match the selected employee profile.
+      allow create: if (
+                       isAdmin() &&
+                       isValidAttendanceRecord(request.resource.data) &&
                        request.resource.data.createdAt == request.time &&
-                       request.resource.data.id is int &&
-                       request.resource.data.userId is string &&
+                       request.resource.data.get('source', '') == 'admin' &&
+                       request.resource.data.get('createdByUid', '') == request.auth.uid &&
+                       request.resource.data.get('createdByName', '').size() > 0 &&
+                       exists(/databases/$(database)/documents/users/$(request.resource.data.userId)) &&
+                       get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.get('uid', '') == request.resource.data.uid &&
+                       get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.get('role', '') == 'employee'
+                     ) || (
+                       isCreatingOwnResource() &&
+                       isValidAttendanceRecord(request.resource.data) &&
+                       request.resource.data.createdAt == request.time &&
                        request.resource.data.uid == request.auth.uid &&
-                       request.resource.data.userName is string &&
-                       request.resource.data.type in ['in', 'out'] &&
-                       request.resource.data.status in ['正常', '地點異常'] &&
-                       request.resource.data.date is string &&
-                       request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
-                       request.resource.data.time is string &&
-                       request.resource.data.time.matches('^[0-9]{2}:[0-9]{2}:[0-9]{2}$') &&
-                       request.resource.data.lat is number &&
-                       request.resource.data.lat >= -90 && request.resource.data.lat <= 90 &&
-                       request.resource.data.lng is number &&
-                       request.resource.data.lng >= -180 && request.resource.data.lng <= 180 &&
-                       request.resource.data.dist is number &&
-                       request.resource.data.dist >= 0 && request.resource.data.dist <= 20000000;
+                       request.resource.data.get('source', 'employee') == 'employee' &&
+                       request.resource.data.get('createdByUid', '') == '' &&
+                       request.resource.data.get('createdByName', '') == ''
+                     );
       // 修改/刪除：僅限管理員
       allow update, delete: if isAdmin();
     }

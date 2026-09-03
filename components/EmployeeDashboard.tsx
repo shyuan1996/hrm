@@ -16,6 +16,7 @@ interface EmployeeDashboardProps {
 }
 
 type LocationPermissionState = 'unknown' | 'prompt' | 'granted' | 'denied';
+type TimeSyncState = 'pending' | 'ready' | 'failed';
 
 const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
   const dateStr = TimeService.getAttendanceDate(r);
@@ -47,6 +48,8 @@ const RecordItem: React.FC<{ r: AttendanceRecord }> = ({ r }) => {
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, settings, timeOffset, isTimeSynced }) => {
   // Use a dynamic offset that can be updated frequently by the dashboard itself
   const [dynamicOffset, setDynamicOffset] = useState(timeOffset);
+  const [timeSyncValid, setTimeSyncValid] = useState(isTimeSynced);
+  const [timeSyncState, setTimeSyncState] = useState<TimeSyncState>(isTimeSynced ? 'ready' : 'pending');
   const [now, setNow] = useState(TimeService.getCorrectedNow(timeOffset));
   const [distance, setDistance] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
@@ -113,6 +116,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const watchIdRef = useRef<number | null>(null);
   const initialLocationRequestRef = useRef(false);
+  const hasEverSyncedTimeRef = useRef(isTimeSynced);
   const settingsRef = useRef(settings);
   const lastPositionRef = useRef<{ lat: number; lng: number } | null>(null);
 
@@ -201,6 +205,26 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     setDynamicOffset(timeOffset);
   }, [timeOffset]);
 
+  useEffect(() => {
+    setTimeSyncValid(isTimeSynced);
+    if (isTimeSynced) {
+      hasEverSyncedTimeRef.current = true;
+      setTimeSyncState('ready');
+    } else if (hasEverSyncedTimeRef.current) {
+      setTimeSyncState('failed');
+    }
+  }, [isTimeSynced]);
+
+  // Give the initial sync a bounded waiting window.  If all time providers
+  // fail, show an actionable error instead of leaving a permanent spinner.
+  useEffect(() => {
+    if (isTimeSynced || hasEverSyncedTimeRef.current) return;
+    const timer = setTimeout(() => {
+      if (!hasEverSyncedTimeRef.current) setTimeSyncState('failed');
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [isTimeSynced]);
+
   // Recheck the external source infrequently. TimeService keeps the page clock
   // monotonic and will not re-anchor it while the user is viewing the page.
   useEffect(() => {
@@ -210,9 +234,21 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         const newOffset = await TimeService.getNetworkTimeOffset();
         if (newOffset !== null) {
           setDynamicOffset(newOffset);
+          setTimeSyncValid(true);
+          hasEverSyncedTimeRef.current = true;
+          setTimeSyncState('ready');
+        } else {
+          // Fail closed after a failed refresh. This prevents an old tab from
+          // continuing to accept punches with an expired clock anchor.
+          setTimeSyncValid(false);
+          setTimeSyncState('failed');
         }
       } catch (e) {
-        // Silently fail in background, keep using last known offset
+        // Fail closed if the refresh unexpectedly throws as well as when all
+        // providers return null; the next refresh or a manual punch retry can
+        // re-enable the button after a successful sync.
+        setTimeSyncValid(false);
+        setTimeSyncState('failed');
       }
     }, 5 * 60 * 1000);
 
@@ -389,10 +425,19 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
   const todayStr = TimeService.getTaiwanDate(now);
   const currentTimeStr = TimeService.getTaiwanTime(now);
+  // Treat an old anchor as unavailable.  The punch flow still performs a
+  // fresh network check, while this gate prevents a long-lived tab from
+  // presenting an apparently ready button after its clock has gone stale.
+  const effectiveTimeSynced = timeSyncValid && timeSyncState === 'ready' && TimeService.isSyncFresh();
+  const timeSyncWaiting = !effectiveTimeSynced && timeSyncState === 'pending';
+  const timeSyncFailed = !effectiveTimeSynced && !timeSyncWaiting;
   
   // Punch direction must be derived from today's records only. Previously the
   // final punch from a prior day could make today's first punch an "out".
-  const lastRecord = records.find(record => TimeService.getAttendanceDate(record) === todayStr) || null;
+  const todayRecords = records
+    .filter(record => TimeService.getAttendanceDate(record) === todayStr)
+    .sort((a, b) => TimeService.getAttendanceTime(b, true).localeCompare(TimeService.getAttendanceTime(a, true)));
+  const lastRecord = todayRecords[0] || null;
   const currentPunchType = lastRecord?.type === 'in' ? 'out' : 'in';
   
   const isLocationReady = distance !== null;
@@ -433,22 +478,64 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   };
 
   // 2. [Requirement: Force Sync on Punch]
+  const retryTimeSync = async () => {
+    if (isVerifying) return;
+    setIsVerifying(true);
+    setPunchStep('syncing');
+    setTimeSyncState('pending');
+    try {
+      const newOffset = await TimeService.getNetworkTimeOffset();
+      if (newOffset === null) {
+        setTimeSyncValid(false);
+        setTimeSyncState('failed');
+        setNotification({ type: 'error', message: "無法連接網路時間伺服器，請檢查網路連線後再試。" });
+        return;
+      }
+      if (Math.abs(newOffset) > 60000) {
+        setTimeSyncValid(false);
+        setTimeSyncState('failed');
+        setNotification({ type: 'error', message: "裝置時間與標準時間誤差超過 1 分鐘，請先校準手機時間。" });
+        return;
+      }
+      setDynamicOffset(newOffset);
+      setTimeSyncValid(true);
+      hasEverSyncedTimeRef.current = true;
+      setTimeSyncState('ready');
+      setNotification({ type: 'success', message: "系統時間校正成功，現在可以打卡。" });
+    } catch (error) {
+      console.error('Time sync retry failed', error);
+      setTimeSyncValid(false);
+      setTimeSyncState('failed');
+      setNotification({ type: 'error', message: "時間校正失敗，請稍後再試。" });
+    } finally {
+      setIsVerifying(false);
+      setPunchStep('idle');
+    }
+  };
+
   const initiatePunch = async () => {
     // Basic checks before even starting sync
-    if (!isTimeSynced && dynamicOffset === 0) {
-        setNotification({ type: 'error', message: "系統尚未初始化，請稍候..." });
+    if (!effectiveTimeSynced) {
+        if (timeSyncFailed) {
+          void retryTimeSync();
+        } else {
+          setNotification({ type: 'error', message: "系統尚未完成校時，請稍候..." });
+        }
         return;
     }
 
     // Set UI to "Syncing"
     setIsVerifying(true);
     setPunchStep('syncing');
+    setTimeSyncState('pending');
 
     try {
         // Force a fresh network time check
         const freshOffset = await TimeService.getNetworkTimeOffset();
         
         if (freshOffset === null) {
+            setTimeSyncValid(false);
+            setTimeSyncState('failed');
             setNotification({ type: 'error', message: "無法連接網路時間伺服器，禁止打卡，請檢查網路連線。" });
             setIsVerifying(false);
             setPunchStep('idle');
@@ -457,9 +544,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
         // Update local offset with the fresh one
         setDynamicOffset(freshOffset);
+        setTimeSyncValid(true);
+        hasEverSyncedTimeRef.current = true;
+        setTimeSyncState('ready');
 
         // Sanity Check: if local clock is wildly different (> 1 min)
         if (Math.abs(freshOffset) > 60000) {
+           setTimeSyncValid(false);
+           setTimeSyncState('failed');
            setNotification({ type: 'error', message: "時間錯誤：系統偵測到您的裝置時間與標準時間誤差過大 (>1分鐘)，請校準裝置時間後再進行打卡。" });
            setIsVerifying(false);
            setPunchStep('idle');
@@ -520,6 +612,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
 
     } catch (e) {
         console.error("Punch Init Error", e);
+        setTimeSyncValid(false);
+        setTimeSyncState('failed');
         setNotification({ type: 'error', message: "打卡初始化失敗" });
         setIsVerifying(false);
         setPunchStep('idle');
@@ -717,11 +811,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     const sameDayOTs = localData.overtimes.filter(o => 
         o.userId === user.id && 
         o.status !== 'rejected' && o.status !== 'cancelled' &&
-        o.start.startsWith(otForm.startDate) 
+        o.start && o.end &&
+        o.start < `${otForm.endDate} ${otForm.endTime}` &&
+        o.end > `${otForm.startDate} ${otForm.startTime}`
     ).map(o => ({ start: o.start, end: o.end, hours: o.hours }));
 
-    return calculateOTWithDeduction(s, e, sameDayOTs);
-  }, [otForm, localData.overtimes, user.id]);
+    return calculateOTWithDeduction(s, e, sameDayOTs, holidays.map(h => h.date));
+  }, [otForm, localData.overtimes, user.id, holidays]);
 
   const initiateCancelRequest = (id: number, type: 'leave' | 'ot') => {
     const n1 = Math.floor(Math.random() * 9) + 1;
@@ -847,13 +943,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 <Button 
                   variant="tech-circle" 
                   onClick={initiatePunch}
-                  disabled={!isTimeSynced || isVerifying}
-                  className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!isTimeSynced || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
-                >
-                  {!isTimeSynced ? (
+                   disabled={!effectiveTimeSynced || isVerifying}
+                   className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!effectiveTimeSynced || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
+                 >
+                   {!effectiveTimeSynced ? (
                      <div className="flex flex-col items-center">
-                       <Loader2 size={40} className="animate-spin text-white mb-2" />
-                       <span className="text-xl md:text-2xl font-black text-white">連線中...</span>
+                       {timeSyncWaiting ? <Loader2 size={40} className="animate-spin text-white mb-2" /> : <AlertTriangle size={40} className="text-white mb-2" />}
+                       <span className="text-xl md:text-2xl font-black text-white">{timeSyncWaiting ? '連線中...' : '校時失敗'}</span>
                      </div>
                   ) : punchStep === 'syncing' ? (
                      <div className="flex flex-col items-center">
@@ -882,16 +978,26 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                 
                 <div className={`w-full py-3 md:py-4 px-4 md:px-6 rounded-2xl font-black flex items-center justify-center gap-2 md:gap-3 shadow-md transition-all text-sm md:text-xl ${
                     gpsError ? 'bg-red-100 text-red-600' :
-                    (!isTimeSynced) ? 'bg-orange-100 text-orange-600' :
+                     (!effectiveTimeSynced) ? 'bg-orange-100 text-orange-600' :
                     !isLocationReady ? 'bg-gray-100 text-gray-400' : 
                     settings.companyLat ? (inRange ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700') : 
                     'bg-gray-100 text-gray-400'
                 }`}>
-                   <MapPin size={20} className={`md:w-6 md:h-6 ${(!isTimeSynced || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
-                   {gpsError ? (
+                   <MapPin size={20} className={`md:w-6 md:h-6 ${(timeSyncWaiting || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
+                   {gpsError && effectiveTimeSynced ? (
                      <span>{gpsError}</span>
-                   ) : !isTimeSynced ? (
-                     <span className="animate-pulse">正在校正系統時間...</span>
+                    ) : !effectiveTimeSynced ? (
+                     <div className="flex items-center justify-center gap-2 flex-wrap">
+                       <span className={timeSyncWaiting ? 'animate-pulse' : ''}>{timeSyncWaiting ? '正在校正系統時間...' : '系統時間校正失敗'}</span>
+                       {timeSyncFailed && (
+                         <button
+                           type="button"
+                           onClick={retryTimeSync}
+                           disabled={isVerifying}
+                           className="px-3 py-1 rounded-lg bg-white/70 text-orange-700 text-xs font-black border border-orange-200 hover:bg-white disabled:opacity-50"
+                         >重新校時</button>
+                       )}
+                     </div>
                     ) : !isLocationReady ? (
                       <span className="animate-pulse">
                         {locationPermissionState === 'prompt' ? '按下打卡時取得位置' : '正在獲取位置...'}
@@ -1200,8 +1306,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                                setNotification({ type: 'error', message: "請填寫加班事由" });
                                return;
                              }
-                             if (calculatedOTHours <= 0) {
-                               setNotification({ type: 'error', message: "可申請的加班時數必須大於 0（平日 18:00 前為休息時間）" });
+                              if (calculatedOTHours <= 0) {
+                                setNotification({ type: 'error', message: "可申請的加班時數必須大於 0（已扣除正常上班時段）" });
                                return;
                              }
                              setIsSubmittingOt(true);

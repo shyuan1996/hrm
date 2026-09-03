@@ -52,6 +52,10 @@ export interface AttendanceRecord {
   dist: number;
   photo?: string; // Base64 string of the selfie
   uid?: string; // Added for robust security rules
+  /** Identifies a record entered by an administrator for audit purposes. */
+  source?: 'employee' | 'admin';
+  createdByUid?: string;
+  createdByName?: string;
   createdAt?: { toDate: () => Date } | Date | string; // Trusted Firestore server timestamp for new records
 }
 

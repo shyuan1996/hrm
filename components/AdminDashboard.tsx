@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { User, LeaveRequest, OvertimeRequest, Announcement, Holiday, UserRole, LeaveAttachment } from '../types';
+import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { calculateOTWithDeduction } from '../utils/otCalculator';
@@ -12,7 +12,7 @@ import { Button } from './ui/Button';
 import { 
   LayoutDashboard, CalendarCheck, Settings, 
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
-  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, KeyRound, Filter, Paperclip, X, Plus
+  Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, RefreshCw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, KeyRound, Filter, Paperclip, X, Plus
 } from 'lucide-react';
 
 const ADMIN_PAGE_SIZE = 10;
@@ -62,11 +62,19 @@ const PaginationControls: React.FC<{
   );
 };
 
-export const AdminDashboard: React.FC = () => {
+interface AdminDashboardProps {
+  timeOffset: number;
+  isTimeSynced: boolean;
+  onTimeSync?: () => Promise<number | null>;
+}
+
+export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTimeSynced, onTimeSync }) => {
   const [activeView, setActiveView] = useState<'overview' | 'leaves' | 'ot' | 'news' | 'holiday' | 'system'>('overview');
   const [showArchived, setShowArchived] = useState(false);
   const [data, setData] = useState<AppData>(StorageService.loadData());
-  const [currentTime, setCurrentTime] = useState(new Date());
+  const [dynamicOffset, setDynamicOffset] = useState(timeOffset);
+  const [currentTime, setCurrentTime] = useState(() => TimeService.getCorrectedNow(timeOffset));
+  const [isCorrectingTime, setIsCorrectingTime] = useState(false);
   const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
   
   // Overview Date Filter
@@ -165,6 +173,15 @@ export const AdminDashboard: React.FC = () => {
   // Holiday Filter
   const [holidayFilterMonth, setHolidayFilterMonth] = useState<string>('');
 
+  // Administrator manual punch-in/out
+  const [manualPunchTarget, setManualPunchTarget] = useState<User | null>(null);
+  const [manualPunchForm, setManualPunchForm] = useState<{ date: string; time: string; type: 'in' | 'out' }>({
+    date: '',
+    time: '',
+    type: 'in'
+  });
+  const [isSavingManualPunch, setIsSavingManualPunch] = useState(false);
+
   const pendingLeaves = data.leaves.filter(l => l.status === 'pending').length;
   const pendingOTs = data.overtimes.filter(o => o.status === 'pending').length;
 
@@ -222,8 +239,16 @@ export const AdminDashboard: React.FC = () => {
   }, [holidayFilterMonth]);
 
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-    
+    setDynamicOffset(timeOffset);
+    setCurrentTime(TimeService.getCorrectedNow(timeOffset));
+  }, [timeOffset]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(TimeService.getCorrectedNow(dynamicOffset)), 1000);
+    return () => clearInterval(timer);
+  }, [dynamicOffset]);
+
+  useEffect(() => {
     // Subscribe to storage updates locally to avoid parent remounting us
     const handleDataUpdate = () => {
         // CRITICAL: Spread object to force React re-render
@@ -231,10 +256,7 @@ export const AdminDashboard: React.FC = () => {
     };
     window.addEventListener('storage-update', handleDataUpdate);
 
-    return () => {
-        clearInterval(timer);
-        window.removeEventListener('storage-update', handleDataUpdate);
-    };
+    return () => window.removeEventListener('storage-update', handleDataUpdate);
   }, []);
 
   useEffect(() => {
@@ -261,6 +283,86 @@ export const AdminDashboard: React.FC = () => {
   };
 
   const refreshData = () => setData({ ...StorageService.loadData() });
+
+  const handleManualTimeCorrection = async () => {
+    if (isCorrectingTime) return;
+    setIsCorrectingTime(true);
+    try {
+      const correctedOffset = onTimeSync
+        ? await onTimeSync()
+        : await TimeService.getNetworkTimeOffset();
+      if (correctedOffset === null) {
+        throw new Error('目前無法取得標準時間，請確認網路連線後再試');
+      }
+      setDynamicOffset(correctedOffset);
+      setCurrentTime(TimeService.getCorrectedNow(correctedOffset));
+      showToast('時間已完成硬校正', 'success');
+    } catch (e: any) {
+      showToast(`時間校正失敗：${getErrorMessage(e)}`, 'error');
+    } finally {
+      setIsCorrectingTime(false);
+    }
+  };
+
+  const openManualPunchModal = (employee: User) => {
+    if (!employee.uid) {
+      showToast('此員工尚未綁定 Firebase UID，無法安全補打卡', 'error');
+      return;
+    }
+    const correctedNow = TimeService.getCorrectedNow(dynamicOffset);
+    setManualPunchTarget(employee);
+    setManualPunchForm({
+      date: overviewDate || TimeService.getTaiwanDate(correctedNow),
+      time: TimeService.getTaiwanTime(correctedNow).substring(0, 5),
+      type: 'in'
+    });
+  };
+
+  const handleSaveManualPunch = async () => {
+    if (!manualPunchTarget) return;
+    const { date, time, type } = manualPunchForm;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) {
+      showToast('請輸入有效的日期與時間', 'error');
+      return;
+    }
+    const parsed = new Date(`${date}T${time}:00`);
+    if (!Number.isFinite(parsed.getTime()) ||
+        parsed.getFullYear() !== Number(date.slice(0, 4)) ||
+        parsed.getMonth() + 1 !== Number(date.slice(5, 7)) ||
+        parsed.getDate() !== Number(date.slice(8, 10))) {
+      showToast('日期或時間格式不正確', 'error');
+      return;
+    }
+
+    setIsSavingManualPunch(true);
+    try {
+      const admin = data.users.find(candidate => candidate.role === UserRole.ADMIN);
+      const record: AttendanceRecord = {
+        id: Date.now(),
+        userId: manualPunchTarget.id,
+        uid: manualPunchTarget.uid,
+        userName: manualPunchTarget.name,
+        date,
+        time: `${time}:00`,
+        type,
+        status: '正常',
+        // Manual entries are not GPS observations. Keep neutral coordinates
+        // for the existing schema and rely on source='admin' for display.
+        lat: 0,
+        lng: 0,
+        dist: 0,
+        source: 'admin'
+      };
+      await StorageService.addAdminRecord(record, admin?.name || '管理員');
+      refreshData();
+      showToast(`${manualPunchTarget.name} ${type === 'in' ? '上班' : '下班'}補打卡成功`, 'success');
+      setManualPunchTarget(null);
+    } catch (e: any) {
+      showToast(`補打卡失敗：${getErrorMessage(e)}`, 'error');
+    } finally {
+      setIsSavingManualPunch(false);
+    }
+  };
 
   const handleAction = async (type: 'leave' | 'ot', id: number, status: 'approved' | 'rejected', reason?: string) => {
     try {
@@ -515,6 +617,8 @@ export const AdminDashboard: React.FC = () => {
         dateArray.push(TimeService.getTaiwanDate(currentDate));
         currentDate.setUTCDate(currentDate.getUTCDate() + 1);
     }
+    const todayForExport = TimeService.getTaiwanDate(new Date());
+    const currentTaiwanTimeForExport = TimeService.getTaiwanTime(new Date()).substring(0, 5);
 
     // --- Prepare Attendance Sheet Data ---
     const attendanceData: any[][] = [
@@ -580,13 +684,17 @@ export const AdminDashboard: React.FC = () => {
 
                 if (inRecord) {
                     inTime = TimeService.getAttendanceTime(inRecord, true);
-                    inLoc = Number.isFinite(inRecord.lat) && Number.isFinite(inRecord.lng)
+                    inLoc = inRecord.source === 'admin'
+                      ? '管理員補打卡'
+                      : Number.isFinite(inRecord.lat) && Number.isFinite(inRecord.lng)
                       ? `(${inRecord.lat.toFixed(5)}, ${inRecord.lng.toFixed(5)})`
                       : '--';
                 }
                 if (outRecord) {
                     outTime = TimeService.getAttendanceTime(outRecord, true);
-                    outLoc = Number.isFinite(outRecord.lat) && Number.isFinite(outRecord.lng)
+                    outLoc = outRecord.source === 'admin'
+                      ? '管理員補打卡'
+                      : Number.isFinite(outRecord.lat) && Number.isFinite(outRecord.lng)
                       ? `(${outRecord.lat.toFixed(5)}, ${outRecord.lng.toFixed(5)})`
                       : '--';
                 }
@@ -691,9 +799,13 @@ export const AdminDashboard: React.FC = () => {
                     } else {
                         // NO RECORDS
                         if (hasToWork) {
+                            const isPastWorkday = dateStr < todayForExport ||
+                              (dateStr === todayForExport && currentTaiwanTimeForExport > '08:32');
                             events.push({
                                 start: expectedIn,
-                                text: "曠職/未打卡"
+                                text: dateStr > todayForExport
+                                  ? "尚未到日期"
+                                  : isPastWorkday ? "曠職/未打卡" : "尚未打卡"
                             });
                         }
                     }
@@ -965,7 +1077,9 @@ export const AdminDashboard: React.FC = () => {
 
     userRecords.sort((a,b) => TimeService.getAttendanceTime(a).localeCompare(TimeService.getAttendanceTime(b)));
     const firstInIdx = userRecords.findIndex(r => r.type === 'in');
-    const validRecords = firstInIdx !== -1 ? userRecords.slice(firstInIdx) : [];
+    // Keep an OUT-only day visible so an administrator can see a backfilled
+    // clock-out and the dashboard can correctly identify the missing IN card.
+    const validRecords = firstInIdx !== -1 ? userRecords.slice(firstInIdx) : userRecords;
 
     const sortedIn = validRecords.filter(r => r.type === 'in');
     const sortedOut = validRecords.filter(r => r.type === 'out');
@@ -1021,19 +1135,24 @@ export const AdminDashboard: React.FC = () => {
                     statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
                  }
             }
-        } else {
-            // No out record yet
-            // If it's today and past 18:00
-            const nowH = new Date().getHours();
-            const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
-            
-            if (isToday && nowH >= 18 && !isHoliday && userLeaves.length === 0) {
-                statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
-            }
+         } else {
+             // No out record yet
+             // Historical/current days after the scheduled end must expose a
+             // missing clock-out instead of silently showing only 已上班.
+             const nowTaiwan = TimeService.getTaiwanTime(new Date()).substring(0, 5);
+             const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
+             
+             if (isToday && nowTaiwan >= '18:00' && !isHoliday && userLeaves.length === 0) {
+                 statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
+             } else if ((!isToday || nowTaiwan >= '17:30') && !isHoliday && userLeaves.length === 0) {
+                 statusTags.push({ label: '缺下班卡', color: 'text-orange-600 bg-orange-50 border-orange-200' });
+             }
         }
     } else {
         // No IN record
-        if (!isHoliday && userLeaves.length === 0) {
+        if (lastOut) {
+             statusTags.push({ label: '缺上班卡', color: 'text-orange-600 bg-orange-50 border-orange-200' });
+        } else if (!isHoliday && userLeaves.length === 0) {
              const nowStr = TimeService.getTaiwanTime(new Date());
              const nowSimple = nowStr.substring(0, 5);
              const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
@@ -1052,8 +1171,15 @@ export const AdminDashboard: React.FC = () => {
     const outDisplay = lastOut ? TimeService.getAttendanceTime(lastOut, true) : '--';
     
     // Coordinates & Distance
-    const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist } : null;
-    const outLoc = lastOut ? { lat: lastOut.lat, lng: lastOut.lng, dist: lastOut.dist } : null;
+    const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist, source: firstIn.source } : null;
+    const outLoc = lastOut ? { lat: lastOut.lat, lng: lastOut.lng, dist: lastOut.dist, source: lastOut.source } : null;
+
+    if (firstIn?.source === 'admin') {
+      statusTags.push({ label: '管理員補上班卡', color: 'text-purple-600 bg-purple-50 border-purple-200' });
+    }
+    if (lastOut?.source === 'admin') {
+      statusTags.push({ label: '管理員補下班卡', color: 'text-purple-600 bg-purple-50 border-purple-200' });
+    }
 
     return { 
       tags: statusTags, 
@@ -1073,14 +1199,16 @@ export const AdminDashboard: React.FC = () => {
     const s = new Date(editOtForm.start);
     const e = new Date(editOtForm.end);
 
-    const sameDayOTs = data.overtimes.filter(o => 
+    const editStartKey = editOtForm.start.replace('T', ' ');
+    const editEndKey = editOtForm.end.replace('T', ' ');
+    const overlappingOTs = data.overtimes.filter(o => 
         o.userId === editOtModal.userId && 
         o.id !== editOtModal.id && // Exclude the one being edited
         o.status !== 'rejected' && o.status !== 'cancelled' &&
-        o.start.startsWith(editOtForm.start.substring(0, 10).replace('T', ' ')) 
+        o.start && o.end && o.start < editEndKey && o.end > editStartKey
     ).map(o => ({ start: o.start, end: o.end, hours: o.hours }));
 
-    const h = calculateOTWithDeduction(s, e, sameDayOTs);
+     const h = calculateOTWithDeduction(s, e, overlappingOTs, data.holidays.map(holiday => holiday.date));
 
     try {
         await StorageService.updateOvertime(editOtModal.id, {
@@ -1134,9 +1262,10 @@ export const AdminDashboard: React.FC = () => {
     return alerts;
   }, [data.users]);
 
-  const rocYear = currentTime.getFullYear() - 1911;
-  const dateStr = `${rocYear} 年 ${String(currentTime.getMonth()+1).padStart(2,'0')} 月 ${String(currentTime.getDate()).padStart(2,'0')} 日`;
-  const westernDateStr = currentTime.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-');
+  const dateStr = TimeService.toROCDateString(currentTime);
+  const westernDateStr = TimeService.getTaiwanDate(currentTime);
+  const weekdayStr = currentTime.toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei', weekday: 'long' });
+  const currentTimeStr = TimeService.getTaiwanTime(currentTime);
 
   return (
     <div className="flex flex-col h-full bg-gray-50 overflow-hidden relative">
@@ -1165,11 +1294,20 @@ export const AdminDashboard: React.FC = () => {
                     {westernDateStr}
                   </div>
                   <div className="font-mono text-xl font-black text-brand-700 mt-1">
-                    {currentTime.toLocaleDateString('zh-TW', { weekday: 'long' })}
+                     {weekdayStr}
                   </div>
                   <div className="font-mono text-3xl font-black text-brand-800 mt-1">
-                    {currentTime.toLocaleTimeString('zh-TW', { hour12: false })}
+                     {currentTimeStr}
                   </div>
+                  <button
+                    type="button"
+                    onClick={handleManualTimeCorrection}
+                    disabled={isCorrectingTime}
+                    className="w-full mt-3 px-3 py-2 rounded-xl bg-white border border-brand-200 text-brand-700 text-xs font-black flex items-center justify-center gap-2 hover:bg-brand-100 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    <RefreshCw size={14} className={isCorrectingTime ? 'animate-spin' : ''} />
+                    {isCorrectingTime ? '校正中...' : '立即校正時間'}
+                  </button>
                </div>
             </div>
           </div>
@@ -1213,11 +1351,20 @@ export const AdminDashboard: React.FC = () => {
                    <div className="font-mono text-[10px] font-black text-gray-400">{westernDateStr}</div>
                 </div>
                 <div className="flex flex-col items-end">
-                   <div className="font-mono text-2xl font-black text-brand-800">{currentTime.toLocaleTimeString('zh-TW', { hour12: false })}</div>
-                   <div className="font-mono text-xs font-black text-brand-700">{currentTime.toLocaleDateString('zh-TW', { weekday: 'long' })}</div>
-                </div>
-             </div>
-          </div>
+                    <div className="font-mono text-2xl font-black text-brand-800">{currentTimeStr}</div>
+                    <div className="font-mono text-xs font-black text-brand-700">{weekdayStr}</div>
+                  </div>
+               </div>
+               <button
+                 type="button"
+                 onClick={handleManualTimeCorrection}
+                 disabled={isCorrectingTime}
+                 className="w-full px-3 py-2 rounded-xl bg-white border border-brand-200 text-brand-700 text-xs font-black flex items-center justify-center gap-2 hover:bg-brand-100 disabled:opacity-60 disabled:cursor-not-allowed"
+               >
+                 <RefreshCw size={14} className={isCorrectingTime ? 'animate-spin' : ''} />
+                 {isCorrectingTime ? '校正中...' : '立即校正時間'}
+               </button>
+           </div>
 
           {activeView === 'overview' && (
             <div className="space-y-6 md:space-y-8">
@@ -1287,9 +1434,16 @@ export const AdminDashboard: React.FC = () => {
                             const status = getEmployeeStatus(u.id, overviewDate);
                             
                             // Helper to render Location info
-                            const renderLocInfo = (info: {lat: number, lng: number, dist: number} | null) => {
-                                if(!info) return null;
-                                const allowed = data.settings.allowedRadius;
+                             const renderLocInfo = (info: {lat: number, lng: number, dist: number, source?: AttendanceRecord['source']} | null) => {
+                                 if(!info) return null;
+                                 if (info.source === 'admin') {
+                                   return (
+                                     <div className="mt-1 text-[10px] text-purple-600 font-black flex items-center gap-1">
+                                       <Clock size={10} /> 管理員補打卡
+                                     </div>
+                                   );
+                                 }
+                                 const allowed = data.settings.allowedRadius;
                                 const isFar = info.dist > (allowed + 50); // Specifically highlight if > 50m over
                                 return (
                                     <div className="mt-1 space-y-0.5">
@@ -1334,9 +1488,10 @@ export const AdminDashboard: React.FC = () => {
                                  <td className="p-4 md:p-6 text-right flex justify-end gap-2">
                                     {!showArchived ? (
                                       <>
-                                        <button onClick={() => openSettingsModal(u)} className="text-gray-600 hover:bg-gray-100 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-gray-200 transition-all flex items-center gap-1"><Sliders size={14}/> <span className="hidden md:inline">設定</span></button>
-                                        <button onClick={() => openEditUserModal(u)} className="text-brand-600 hover:bg-brand-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-brand-100 transition-all flex items-center gap-1"><UserCog size={14}/> <span className="hidden md:inline">編輯</span></button>
-                                        <button onClick={async () => { try { await StorageService.archiveUser(u.id); refreshData(); showToast("已將員工移至封存區", 'success'); } catch(e) { showToast("封存失敗", 'error'); } }} className="text-red-500 hover:bg-red-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-red-100 flex items-center gap-1 transition-all"><UserMinus size={14}/> <span className="hidden md:inline">封存</span></button>
+                                         <button onClick={() => openSettingsModal(u)} className="text-gray-600 hover:bg-gray-100 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-gray-200 transition-all flex items-center gap-1"><Sliders size={14}/> <span className="hidden md:inline">設定</span></button>
+                                         <button onClick={() => openEditUserModal(u)} className="text-brand-600 hover:bg-brand-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-brand-100 transition-all flex items-center gap-1"><UserCog size={14}/> <span className="hidden md:inline">編輯</span></button>
+                                         <button onClick={() => openManualPunchModal(u)} className="text-purple-600 hover:bg-purple-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-purple-100 transition-all flex items-center gap-1"><Clock size={14}/> <span className="hidden md:inline">補打卡</span></button>
+                                         <button onClick={async () => { try { await StorageService.archiveUser(u.id); refreshData(); showToast("已將員工移至封存區", 'success'); } catch(e) { showToast("封存失敗", 'error'); } }} className="text-red-500 hover:bg-red-50 p-2 md:px-4 md:py-2 rounded-xl text-xs font-black border border-red-100 flex items-center gap-1 transition-all"><UserMinus size={14}/> <span className="hidden md:inline">封存</span></button>
                                       </>
                                     ) : (
                                       <>
@@ -1877,7 +2032,7 @@ export const AdminDashboard: React.FC = () => {
                                   for (const ot of userOts) {
                                       const s = new Date(ot.start.replace(' ', 'T'));
                                       const e = new Date(ot.end.replace(' ', 'T'));
-                                      const newHours = calculateOTWithDeduction(s, e, [...existing]);
+                                       const newHours = calculateOTWithDeduction(s, e, [...existing], data.holidays.map(holiday => holiday.date));
                                       
                                       if (newHours !== ot.hours) {
                                           await StorageService.updateOvertime(ot.id, { hours: newHours });
@@ -2059,6 +2214,55 @@ export const AdminDashboard: React.FC = () => {
                  <Button className="flex-1 rounded-2xl bg-brand-600 font-black text-white" onClick={handleSaveSettings}>儲存設定</Button>
               </div>
            </div>
+         </div>
+      )}
+
+      {/* Administrator manual attendance entry */}
+      {manualPunchTarget && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+          <div className="bg-white rounded-[32px] md:rounded-[40px] p-8 md:p-10 w-full max-w-md shadow-2xl font-bold">
+            <h3 className="text-xl md:text-2xl font-black mb-2 flex items-center gap-2 text-purple-700"><Clock className="text-purple-500"/> 管理員補打卡</h3>
+            <div className="text-sm text-gray-500 mb-6">{manualPunchTarget.name}（{manualPunchTarget.id}）</div>
+            <div className="space-y-5">
+              <div className="space-y-2">
+                <label className="text-xs text-gray-400 ml-1">打卡類型</label>
+                <select
+                  value={manualPunchForm.type}
+                  onChange={e => setManualPunchForm({ ...manualPunchForm, type: e.target.value as 'in' | 'out' })}
+                  className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-purple-400"
+                >
+                  <option value="in">上班打卡</option>
+                  <option value="out">下班打卡</option>
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs text-gray-400 ml-1">打卡日期</label>
+                <input
+                  type="date"
+                  value={manualPunchForm.date}
+                  onChange={e => setManualPunchForm({ ...manualPunchForm, date: e.target.value })}
+                  className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-purple-400 [color-scheme:light]"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs text-gray-400 ml-1">打卡時間（可設定到分鐘）</label>
+                <input
+                  type="time"
+                  step="60"
+                  value={manualPunchForm.time}
+                  onChange={e => setManualPunchForm({ ...manualPunchForm, time: e.target.value })}
+                  className="w-full p-4 bg-white text-black border-2 border-gray-100 rounded-2xl font-black outline-none focus:border-purple-400 [color-scheme:light]"
+                />
+              </div>
+              <div className="p-4 bg-purple-50 border border-purple-100 rounded-2xl text-xs text-purple-700 leading-relaxed">
+                此筆資料會保留管理員補登標記與操作時間；員工端會以一般打卡紀錄顯示。
+              </div>
+              <div className="flex gap-4 pt-2">
+                <Button type="button" variant="secondary" className="flex-1 rounded-2xl" onClick={() => setManualPunchTarget(null)}>取消</Button>
+                <Button type="button" className="flex-1 rounded-2xl bg-purple-600 hover:bg-purple-700 font-black text-white" onClick={handleSaveManualPunch} disabled={isSavingManualPunch} isLoading={isSavingManualPunch}>確認補打卡</Button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

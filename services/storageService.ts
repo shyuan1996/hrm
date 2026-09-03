@@ -487,6 +487,30 @@ export const StorageService = {
     }
   },
 
+  /**
+   * Create an attendance record on behalf of an employee. Firestore Rules
+   * require the authenticated administrator UID and the employee's immutable
+   * Firebase UID; the audit fields make the source visible to administrators
+   * without changing what the employee sees.
+   */
+  addAdminRecord: async (record: AttendanceRecord, adminName: string) => {
+    const adminUid = auth.currentUser?.uid;
+    if (!adminUid) throw new Error('管理員登入狀態已失效，請重新登入');
+    if (!record.uid || !record.userId) throw new Error('員工資料不完整，無法補打卡');
+
+    await StorageService.addRecord({
+      ...record,
+      source: 'admin',
+      createdByUid: adminUid,
+      createdByName: String(adminName || '管理員').slice(0, 100)
+    });
+
+    await StorageService.logSecurityEvent(
+      'ADMIN_MANUAL_ATTENDANCE',
+      `Admin manually added ${record.type} attendance for ${record.userId} at ${record.date} ${record.time}`
+    );
+  },
+
   fetchAttendanceRecords: async (startDate: string, endDate: string): Promise<AttendanceRecord[]> => {
     const recordsQ = query(
       collection(db, 'records'),
