@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { User, Announcement } from '../types';
 import { StorageService } from '../services/storageService';
-import { auth } from '../services/firebase';
+import { auth, authPersistenceReady } from '../services/firebase';
 import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import { Button } from './ui/Button';
 import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
@@ -80,6 +80,12 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     const email = isFullEmail ? normalizedInput : `${normalizedInput}@shyuan-hrm.com`;
 
     try {
+        // Keep the Firebase session across browser restarts. This is awaited
+        // before sign-in so a storage-restricted/private browser is reported
+        // clearly instead of silently falling back to a tab-only session.
+        const persistenceReady = await authPersistenceReady;
+        if (!persistenceReady) throw new Error('AUTH_PERSISTENCE_UNAVAILABLE');
+
         // 1. Firebase Auth Login
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
         const firebaseUser = userCredential.user;
@@ -134,6 +140,8 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
             setError('此登入帳號對應到多份員工資料，為保護資料已停止登入，請聯繫管理員處理。');
         } else if (errMessage === 'PROFILE_UID_MISMATCH') {
             setError('帳號與員工資料的安全識別不一致，請聯繫管理員。');
+        } else if (errMessage === 'AUTH_PERSISTENCE_UNAVAILABLE') {
+            setError('此瀏覽器無法保存登入狀態，請關閉無痕模式並允許網站儲存資料後再試。');
         } else if (errCode === 'permission-denied' || errMessage === 'PERMISSION_DENIED_USER') {
             setError('權限不足：無法讀取使用者資料。請聯繫管理員確認資料庫規則。');
         } else {

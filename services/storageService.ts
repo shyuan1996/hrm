@@ -736,7 +736,15 @@ export const StorageService = {
   // Cancel/Delete operations now support userId for restrictive filtering
   cancelLeave: async (id: number, userId?: string) => {
     let constraints = [where('id', '==', id)];
-    if (userId) constraints.push(where('userId', '==', userId));
+    if (userId) {
+      // Employee reads are authorized by the immutable Firebase UID. Include
+      // the same UID constraint in this lookup; querying only by the legacy
+      // account ID cannot be proven safe by restrictive Firestore Rules.
+      const authenticatedUid = auth.currentUser?.uid;
+      if (!authenticatedUid) throw new Error('登入狀態已失效，請重新登入');
+      constraints.push(where('userId', '==', userId));
+      constraints.push(where('uid', '==', authenticatedUid));
+    }
 
     const q = query(collection(db, 'leaves'), ...constraints);
     const snapshot = await getDocs(q);
@@ -883,7 +891,15 @@ export const StorageService = {
 
   cancelOvertime: async (id: number, userId?: string) => {
     let constraints = [where('id', '==', id)];
-    if (userId) constraints.push(where('userId', '==', userId));
+    if (userId) {
+      // Match the employee realtime query and the Rules ownership predicate.
+      // Without the immutable UID filter, Firestore rejects this collection
+      // query before the status update is attempted.
+      const authenticatedUid = auth.currentUser?.uid;
+      if (!authenticatedUid) throw new Error('登入狀態已失效，請重新登入');
+      constraints.push(where('userId', '==', userId));
+      constraints.push(where('uid', '==', authenticatedUid));
+    }
 
     const q = query(collection(db, 'overtimes'), ...constraints);
     const snapshot = await getDocs(q);

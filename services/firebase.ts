@@ -1,6 +1,12 @@
 
 import { initializeApp, getApp, getApps } from "firebase/app";
-import { getAuth, createUserWithEmailAndPassword, signOut } from "firebase/auth";
+import {
+  getAuth,
+  createUserWithEmailAndPassword,
+  signOut,
+  browserLocalPersistence,
+  setPersistence
+} from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
 import { getFunctions } from "firebase/functions";
@@ -22,6 +28,18 @@ export const db = getFirestore(app);
 export const storage = getStorage(app); // Standard initialization
 // The callable password-reset function is deployed in the Taiwan region.
 export const functions = getFunctions(app, 'asia-east1');
+
+// Firebase normally defaults to local persistence in a browser, but making it
+// explicit avoids browser/version differences that otherwise leave some users
+// signed in only for the current tab. Login waits for this promise before
+// authenticating. Browsers that block site storage (for example private mode)
+// are reported to the user instead of pretending that auto-login is enabled.
+export const authPersistenceReady: Promise<boolean> = setPersistence(auth, browserLocalPersistence)
+  .then(() => true)
+  .catch((error) => {
+    console.warn('Firebase local auth persistence unavailable:', error);
+    return false;
+  });
 
 // 2. 次要 App (專門用來讓管理員建立新員工帳號)
 // 這是因為 Firebase Client SDK 只要一呼叫 createUserWithEmailAndPassword 就會自動把當前使用者登出並登入新帳號
