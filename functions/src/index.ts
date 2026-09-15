@@ -1,11 +1,12 @@
 import { randomInt } from 'node:crypto';
-import { initializeApp } from 'firebase-admin/app';
+import { initializeApp, getApps } from 'firebase-admin/app';
+import { acquirePasswordLock, releasePasswordLock } from './secureOperations';
 import { getAuth } from 'firebase-admin/auth';
 import { FieldValue, getFirestore, Timestamp } from 'firebase-admin/firestore';
 import { HttpsError, onCall } from 'firebase-functions/v2/https';
 import { setGlobalOptions } from 'firebase-functions/v2/options';
 
-initializeApp();
+if (!getApps().length) initializeApp();
 
 // Keep the callable close to the Taiwan deployment and limit accidental scaling.
 setGlobalOptions({ region: 'asia-east1', maxInstances: 5 });
@@ -40,8 +41,7 @@ async function requireAdmin(uid: string): Promise<void> {
     db.collection('users').doc('service').get()
   ]);
 
-  const isAdmin = [adminSnap, hrSnap].some(snapshot => snapshot.exists && snapshot.data()?.uid === uid && snapshot.data()?.role === 'admin') ||
-    (serviceSnap.exists && serviceSnap.data()?.uid === uid && serviceSnap.data()?.role === 'admin');
+  const isAdmin = [adminSnap, hrSnap, serviceSnap].some(snapshot => snapshot.exists && snapshot.data()?.uid === uid && snapshot.data()?.role === 'admin' && snapshot.data()?.deleted !== true && snapshot.data()?.mustChangePassword !== true);
   if (!isAdmin) throw new HttpsError('permission-denied', '只有管理員可以執行此操作。');
 }
 
@@ -69,6 +69,8 @@ function getTargetUserId(data: unknown): string {
 export const resetEmployeePassword = onCall(async request => {
   const callerUid = request.auth?.uid;
   if (!callerUid) throw new HttpsError('unauthenticated', '請先登入。');
+  const caller = await auth.getUser(callerUid);
+  if (caller.disabled || Number(request.auth?.token.auth_time) * 1000 < Date.parse(caller.tokensValidAfterTime || '1970-01-01')) throw new HttpsError('unauthenticated', '登入已失效，請重新登入。');
 
   await requireAdmin(callerUid);
 
@@ -91,16 +93,16 @@ export const resetEmployeePassword = onCall(async request => {
 
   const temporaryPassword = randomPassword();
   const resetAt = Timestamp.now();
+  const operation = await acquirePasswordLock(targetRef);
 
-  // Mark the profile first. If Auth fails, clear the marker so the account is
-  // not left in a misleading forced-change state.
-  await targetRef.update({
-    mustChangePassword: true,
-    passwordResetAt: resetAt,
-    passwordResetBy: callerUid
-  });
-
+  // Mark first and preserve the restriction on any uncertain Auth failure.
   try {
+    await targetRef.update({
+      mustChangePassword: true,
+      passwordResetAt: resetAt,
+      passwordResetBy: callerUid
+    });
+
     await auth.updateUser(target.uid, { password: temporaryPassword });
     try {
       await auth.revokeRefreshTokens(target.uid);
@@ -109,13 +111,11 @@ export const resetEmployeePassword = onCall(async request => {
       // revocation is temporarily unavailable.
       console.error('Existing session revocation failed', revokeError);
     }
+    await releasePasswordLock(targetRef, operation);
   } catch (error) {
     try {
-      await targetRef.update({
-        mustChangePassword: false,
-        passwordResetAt: FieldValue.delete(),
-        passwordResetBy: FieldValue.delete()
-      });
+      // Preserve the security marker on an uncertain partial failure.
+      await releasePasswordLock(targetRef, operation);
     } catch (rollbackError) {
       console.error('Password reset marker rollback failed', rollbackError);
     }
@@ -143,3 +143,5 @@ export const resetEmployeePassword = onCall(async request => {
     temporaryPassword
   };
 });
+
+export { secureAttendance, completePasswordChange } from './secureOperations';

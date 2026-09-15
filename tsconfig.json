@@ -30,6 +30,8 @@
     "node_modules",
     "dist",
     "functions",
+    ".verification",
+    "tests",
     "github-upload-ready"
   ]
 }

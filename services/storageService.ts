@@ -1,15 +1,51 @@
 
-import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, LeaveAttachment, QuotaBucket, LeaveChangeHistory } from '../types';
+import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, AppSettings, LeaveAttachment } from '../types';
 import { STORAGE_KEY, DEFAULT_SETTINGS } from '../constants';
 import { TimeService } from './timeService';
-import { db, auth, createAuthUser, storage } from './firebase'; // Import storage
+import { db, auth, createAuthUser, storage, functions } from './firebase'; // Import storage
 import { 
   collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, 
-  onSnapshot, query, orderBy, where, limit, serverTimestamp, writeBatch
+  onSnapshot, query, orderBy, where, limit, serverTimestamp, Timestamp, getDocsFromServer, runTransaction, Query
 } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
+import { safeAttachments } from '../functions/src/domain';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 
+
+type RequestId = number | string;
+const invoke = async (action: string, data: Record<string, unknown>) => {
+  try {
+    const result = await httpsCallable(functions, 'secureAttendance')({action, ...data});
+    return result.data as any;
+  } catch (error: any) {
+    if(error?.code==='functions/not-found')throw new Error('伺服器尚未部署新版功能，請聯絡管理員；未送出本次操作');
+    throw error;
+  }
+};
+// New reads carry actual document IDs. Ambiguous legacy IDs fail closed.
+async function resolveRequest(collectionName: string, id: RequestId, userId?: string) {
+  if (typeof id === 'string') {
+    if (!id || id.includes('/')) throw new Error('文件識別碼不正確');
+    return doc(db, collectionName, id);
+  }
+  const constraints = [where('id','==',id)];
+  if (userId) {
+    if (!auth.currentUser) throw new Error('請重新登入');
+    constraints.push(where('userId','==',userId), where('uid','==',auth.currentUser.uid));
+  }
+  const snapshot = await getDocs(query(collection(db,collectionName),...constraints,limit(2)));
+  if (snapshot.size !== 1) throw new Error('資料不存在或識別碼重複，請重新整理後再操作');
+  return snapshot.docs[0].ref;
+}
+function cleanLeave(data: any): LeaveRequest {
+  let attachments: LeaveAttachment[] = [];
+  try { attachments = safeAttachments(data.attachments, data.uid, data.userId); } catch { attachments=[]; }
+  return {...data,attachments};
+}
+const requestTime = (r: any) => r.createdAt?.toMillis?.() ?? (Number(r.legacyId ?? r.id) || 0);
+
 export interface AppData {
+  syncReady: {users:boolean; leaves:boolean; holidays:boolean; settings:boolean};
   users: User[];
   records: AttendanceRecord[];
   leaves: LeaveRequest[];
@@ -20,6 +56,7 @@ export interface AppData {
 }
 
 const getInitialData = (): AppData => ({
+  syncReady: {users:false,leaves:false,holidays:false,settings:false},
   users: [],
   records: [],
   leaves: [],
@@ -120,6 +157,7 @@ export const StorageService = {
   initRealtimeSync: (userId?: string, role?: string) => {
     // Clear existing listeners
     StorageService.stopRealtimeSync();
+    _memoryCache.syncReady={users:false,leaves:false,holidays:false,settings:false};
 
     // Never expose the previous account's protected cache while listeners for
     // another account are still loading (especially on shared browsers).
@@ -141,10 +179,13 @@ export const StorageService = {
 
     // Holidays Sync
     const holQ = query(collection(db, 'holidays'));
-    _listeners.push(onSnapshot(holQ, (snapshot) => {
+    _listeners.push(onSnapshot(holQ, {includeMetadataChanges:true}, (snapshot) => {
+        _memoryCache.syncReady.holidays=!snapshot.metadata.fromCache;
         _memoryCache.holidays = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as any));
         StorageService._saveToLocal();
     }, (error) => {
+        _memoryCache.syncReady.holidays=false;
+        StorageService._saveToLocal();
         console.warn("Holidays sync paused:", error.code);
     }));
 
@@ -155,23 +196,29 @@ export const StorageService = {
         // Admin gets all users; Employee gets only self.
         if (role === 'admin') {
             const usersQ = query(collection(db, 'users'));
-            _listeners.push(onSnapshot(usersQ, (snapshot) => {
+            _listeners.push(onSnapshot(usersQ, {includeMetadataChanges:true}, (snapshot) => {
+                _memoryCache.syncReady.users=!snapshot.metadata.fromCache;
                 _memoryCache.users = snapshot.docs.map(d => ({ ...d.data(), id: d.id } as User));
                 StorageService._saveToLocal();
-            }, (error) => console.error("Users sync error (Admin):", error.message)));
+            }, (error) => { _memoryCache.syncReady.users=false; StorageService._saveToLocal(); console.error("Users sync error (Admin):", error.message); }));
         } else {
-            _listeners.push(onSnapshot(doc(db, 'users', userId), (docSnap) => {
+            _listeners.push(onSnapshot(doc(db, 'users', userId), {includeMetadataChanges:true}, (docSnap) => {
+                _memoryCache.syncReady.users=!docSnap.metadata.fromCache && docSnap.exists();
                 if (docSnap.exists()) {
                     const u = { ...docSnap.data(), id: docSnap.id } as User;
                     // Replace/Set users array to contain only self
                     _memoryCache.users = [u];
-                    StorageService._saveToLocal();
+                } else {
+                    _memoryCache.users=[];
                 }
-            }, (error) => console.error("User sync error (Self):", error.message)));
+                window.dispatchEvent(new CustomEvent('profile-update',{detail:docSnap.exists()?{...docSnap.data(),id:docSnap.id}:null}));
+                StorageService._saveToLocal();
+            }, (error) => { console.error('User sync error (Self):',error.code); window.dispatchEvent(new CustomEvent('profile-update',{detail:null})); }));
         }
 
         // Settings Sync
-        _listeners.push(onSnapshot(doc(db, 'system', 'settings'), (docSnap) => {
+        _listeners.push(onSnapshot(doc(db, 'system', 'settings'), {includeMetadataChanges:true}, (docSnap) => {
+            _memoryCache.syncReady.settings=!docSnap.metadata.fromCache && docSnap.exists();
             if (docSnap.exists()) {
                 _memoryCache.settings = { ...DEFAULT_SETTINGS, ...docSnap.data() };
             } else {
@@ -180,10 +227,10 @@ export const StorageService = {
                 // Only admin usually writes this, but safe to set default in memory
             }
             StorageService._saveToLocal();
-        }, (error) => console.error("Settings sync error:", error.message)));
+        }, (error) => { _memoryCache.syncReady.settings=false; StorageService._saveToLocal(); console.error("Settings sync error:", error.message); }));
 
         // Personal Data or Admin Data
-        let recordsQ, leavesQ, overtimesQ;
+        let recordsQ: Query, leavesQ: Query, overtimesQ: Query;
 
         if (role === 'admin') {
             // Admin sees all (Admin query does not use 'where', so orderBy is safe without composite index)
@@ -223,34 +270,35 @@ export const StorageService = {
 
         _listeners.push(onSnapshot(recordsQ, (snapshot) => {
             const list = snapshot.docs
-                .map(d => ({ ...d.data() } as AttendanceRecord))
+                .map(d => ({ ...d.data(), firestoreId:d.id } as AttendanceRecord))
                 // Keep the account ID check as defence in depth for profiles
                 // whose Auth UID was accidentally reused in old data.
                 .filter(record => role === 'admin' || record.userId === userId);
             if (role !== 'admin') {
-                list.sort((a, b) => b.id - a.id); // In-memory sort for employees
+                list.sort((a, b) => requestTime(b) - requestTime(a)); // In-memory sort for employees
             }
             _memoryCache.records = list;
             StorageService._saveToLocal();
         }, (e) => console.warn("Records sync error:", e.code)));
 
-        _listeners.push(onSnapshot(leavesQ, (snapshot) => {
+        _listeners.push(onSnapshot(leavesQ, {includeMetadataChanges:true}, (snapshot) => {
+            _memoryCache.syncReady.leaves=!snapshot.metadata.fromCache;
             const list = snapshot.docs
-                .map(d => ({ ...d.data() } as LeaveRequest))
+                .map(d => cleanLeave({ ...d.data(), legacyId:d.data().id, id:d.id }))
                 .filter(leave => role === 'admin' || leave.userId === userId);
             if (role !== 'admin') {
-                list.sort((a, b) => b.id - a.id);
+                list.sort((a, b) => requestTime(b) - requestTime(a));
             }
             _memoryCache.leaves = list;
             StorageService._saveToLocal();
-        }, (e) => console.warn("Leaves sync error:", e.code)));
+        }, (e) => { _memoryCache.syncReady.leaves=false; StorageService._saveToLocal(); console.warn("Leaves sync error:", e.code); }));
 
         _listeners.push(onSnapshot(overtimesQ, (snapshot) => {
             const list = snapshot.docs
-                .map(d => ({ ...d.data() } as OvertimeRequest))
+                .map(d => ({ ...d.data(), legacyId:d.data().id, id:d.id } as OvertimeRequest))
                 .filter(overtime => role === 'admin' || overtime.userId === userId);
             if (role !== 'admin') {
-                list.sort((a, b) => b.id - a.id);
+                list.sort((a, b) => requestTime(b) - requestTime(a));
             }
             _memoryCache.overtimes = list;
             StorageService._saveToLocal();
@@ -277,18 +325,7 @@ export const StorageService = {
     window.dispatchEvent(new Event('storage-update'));
   },
 
-  loadData: (): AppData => {
-    // Return memory cache if populated, otherwise try local storage
-    if (_memoryCache.users.length > 0) return _memoryCache;
-    
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-        try {
-            _memoryCache = { ...getInitialData(), ...JSON.parse(stored) };
-        } catch { }
-    }
-    return _memoryCache;
-  },
+  loadData: (): AppData => _memoryCache,
 
   // --- Security Logger ---
   logSecurityEvent: async (action: string, details: string) => {
@@ -316,6 +353,11 @@ export const StorageService = {
     if (!files || files.length === 0) return [];
 
     const uploaded: LeaveAttachment[] = [];
+    if(files.length>3)throw new Error('附件最多三份');
+    // Validate the complete selection before uploading the first file.
+    for(const file of files) {
+      if(file.size>5*1024*1024 || !(file.type.startsWith('image/') || file.type==='application/pdf'))throw new Error('附件須為每份 5MB 以內的圖片或 PDF');
+    }
 
     for (const file of files) {
         if (file.size > 5 * 1024 * 1024) {
@@ -327,7 +369,7 @@ export const StorageService = {
 
         // Store new files under the immutable Firebase Auth UID. Legacy files
         // may still use the account ID; the Storage Rules support both paths.
-        const timestamp = Date.now();
+        const timestamp = crypto.randomUUID();
         const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_'); // Sanitize filename
         const authenticatedUid = auth.currentUser?.uid;
         if (!authenticatedUid) {
@@ -343,7 +385,7 @@ export const StorageService = {
             // Set metadata explicitly. Some mobile browsers provide an empty
             // File.type even for a valid image, which can make a Storage rule
             // that checks request.resource.contentType reject the upload.
-            const snapshot = await uploadBytes(storageRef, file, { contentType });
+            const snapshot = await uploadBytes(storageRef, file, { contentType, customMetadata:{userId} });
             const url = await getDownloadURL(snapshot.ref);
             uploaded.push({
                 name: file.name,
@@ -351,6 +393,9 @@ export const StorageService = {
                 path: storagePath
             });
         } catch (e: any) {
+            // These paths were generated for this attempt; never delete a
+            // client-provided path or an attachment from an existing leave.
+            await Promise.all([...uploaded.map(a=>a.path),storagePath].map(path=>deleteObject(ref(storage,path)).catch(()=>{})));
             console.error("Upload failed for " + file.name, {
               code: e?.code,
               message: e?.message,
@@ -366,41 +411,9 @@ export const StorageService = {
     return uploaded;
   },
 
-  deleteLeaveAttachment: async (leaveId: number, attachment: LeaveAttachment) => {
-    if (!storage) throw new Error("Storage unavailable");
-
-    // 1. Delete physical file from Storage
-    if (attachment.path) {
-        try {
-            const fileRef = ref(storage, attachment.path);
-            await deleteObject(fileRef);
-        } catch (e: any) {
-            // Ignore if file not found (already deleted), but warn on other errors
-            if (e.code !== 'storage/object-not-found') {
-                 console.warn("Storage file deletion failed:", e);
-            }
-        }
-    }
-
-    // 2. Update Firestore Document
-    try {
-        const q = query(collection(db, 'leaves'), where('id', '==', leaveId));
-        const snapshot = await getDocs(q);
-        if (!snapshot.empty) {
-            const docRef = snapshot.docs[0].ref;
-            const currentData = snapshot.docs[0].data();
-            const currentAttachments = currentData.attachments || [];
-            // Remove the specific attachment by path
-            const updatedAttachments = currentAttachments.filter((a: any) => a.path !== attachment.path);
-            
-            await updateDoc(docRef, { attachments: updatedAttachments });
-        }
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_ATTACHMENT', `Attempted to delete attachment for leave ${leaveId}`);
-        }
-        throw e;
-    }
+  deleteLeaveAttachment: async (leaveId: RequestId, attachment: LeaveAttachment) => {
+    const target = await resolveRequest('leaves',leaveId);
+    await invoke('leaveAction',{id:target.id,operation:'removeAttachment',path:attachment.path});
   },
 
   // --- Write Operations (Direct to Firestore) ---
@@ -413,7 +426,7 @@ export const StorageService = {
 
     // 2. 建立成功後，將使用者資料寫入 Firestore
     // 這裡同樣確保寫入 Firestore 的 ID 是小寫
-    const userIdLower = user.id.toLowerCase();
+    const userIdLower = user.id.trim().toLowerCase();
     await setDoc(doc(db, 'users', userIdLower), {
         ...profile,
         id: userIdLower,
@@ -422,9 +435,21 @@ export const StorageService = {
     });
   },
 
-  updateUser: async (userId: string, updates: Partial<User>) => {
+  updateUser: async (userId: string, updates: Partial<User>, expectedUser?: User) => {
     try {
-        await updateDoc(doc(db, 'users', userId), updates);
+        const target=doc(db,'users',userId);
+        if (updates.quotas !== undefined) {
+          if(!expectedUser)throw new Error('請重新開啟員工設定後再調整額度');
+          await runTransaction(db,async tx=>{
+            const snapshot=await tx.get(target);
+            if(!snapshot.exists())throw new Error('員工不存在');
+            const fresh=snapshot.data();
+            for(const key of ['quotas','quota_annual','quota_comp','quota_birthday'] as const) {
+              if(JSON.stringify(fresh[key]??(key==='quotas'?[]:0))!==JSON.stringify(expectedUser[key]??(key==='quotas'?[]:0)))throw new Error('額度已被其他操作更新，請重新開啟員工設定，未覆蓋最新額度');
+            }
+            tx.update(target,updates);
+          });
+        } else await updateDoc(target,updates);
     } catch (e: any) {
         // 如果非管理員嘗試更新他人資料或鎖定欄位
         if (e.code === 'permission-denied') {
@@ -436,7 +461,7 @@ export const StorageService = {
 
   archiveUser: async (userId: string) => {
     try {
-        await updateDoc(doc(db, 'users', userId), { deleted: true });
+        await invoke('archiveEmployee',{userId});
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_ARCHIVE_USER', `Attempted to archive user ${userId}`);
@@ -447,7 +472,7 @@ export const StorageService = {
 
   restoreUser: async (userId: string) => {
     try {
-        await updateDoc(doc(db, 'users', userId), { deleted: false });
+        await invoke('restoreEmployee',{userId});
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_RESTORE_USER', `Attempted to restore user ${userId}`);
@@ -458,7 +483,7 @@ export const StorageService = {
 
   permanentDeleteUser: async (userId: string) => {
     try {
-        await deleteDoc(doc(db, 'users', userId));
+        throw new Error('為保留歷史打卡與請假資料，請改用封存員工；永久刪除暫停使用');
     } catch (e: any) {
         if (e.code === 'permission-denied') {
             StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_USER', `Attempted to permanently delete user ${userId}`);
@@ -468,47 +493,15 @@ export const StorageService = {
   },
 
   addRecord: async (record: AttendanceRecord) => {
-    // Optimistic Update: Update local cache immediately for instant UI feedback
-    // Creating a new array reference ensures React detects the change
-    _memoryCache.records = [record, ..._memoryCache.records];
+    const result = await invoke('punch',{requestId:String(record.id),type:record.type,lat:record.lat,lng:record.lng});
+    _memoryCache.records=[{...result.record,firestoreId:result.id},..._memoryCache.records.filter(r=>r.firestoreId!==result.id)];
     StorageService._saveToLocal();
-
-    try {
-        await addDoc(collection(db, 'records'), {
-          ...record,
-          createdAt: serverTimestamp()
-        });
-    } catch (e) {
-        // Rollback on failure
-        console.error("Add Record Failed, rolling back optimistic update", e);
-        _memoryCache.records = _memoryCache.records.filter(r => r.id !== record.id);
-        StorageService._saveToLocal();
-        throw e;
-    }
   },
 
-  /**
-   * Create an attendance record on behalf of an employee. Firestore Rules
-   * require the authenticated administrator UID and the employee's immutable
-   * Firebase UID; the audit fields make the source visible to administrators
-   * without changing what the employee sees.
-   */
-  addAdminRecord: async (record: AttendanceRecord, adminName: string) => {
-    const adminUid = auth.currentUser?.uid;
-    if (!adminUid) throw new Error('管理員登入狀態已失效，請重新登入');
-    if (!record.uid || !record.userId) throw new Error('員工資料不完整，無法補打卡');
-
-    await StorageService.addRecord({
-      ...record,
-      source: 'admin',
-      createdByUid: adminUid,
-      createdByName: String(adminName || '管理員').slice(0, 100)
-    });
-
-    await StorageService.logSecurityEvent(
-      'ADMIN_MANUAL_ATTENDANCE',
-      `Admin manually added ${record.type} attendance for ${record.userId} at ${record.date} ${record.time}`
-    );
+  addAdminRecord: async (record: AttendanceRecord, _adminName: string) => {
+    const result = await invoke('manualPunch',{requestId:String(record.id),userId:record.userId,type:record.type,date:record.date,time:record.time});
+    _memoryCache.records=[{...result.record,firestoreId:result.id},..._memoryCache.records.filter(r=>r.firestoreId!==result.id)];
+    StorageService._saveToLocal();
   },
 
   fetchAttendanceRecords: async (startDate: string, endDate: string): Promise<AttendanceRecord[]> => {
@@ -517,476 +510,81 @@ export const StorageService = {
       where('date', '>=', startDate),
       where('date', '<=', endDate)
     );
-    const snapshot = await getDocs(recordsQ);
-    return snapshot.docs.map(recordDoc => ({
-      ...recordDoc.data(),
-      firestoreId: recordDoc.id
-    } as AttendanceRecord));
+    const timestampQuery=query(collection(db,'records'),where('createdAt','>=',Timestamp.fromDate(new Date(startDate+'T00:00:00+08:00'))),where('createdAt','<=',Timestamp.fromDate(new Date(endDate+'T23:59:59.999+08:00'))));
+    const snapshots=await Promise.all([getDocsFromServer(recordsQ),getDocsFromServer(timestampQuery)]);
+    const records=new Map<string,AttendanceRecord>();
+    for(const snapshot of snapshots)for(const d of snapshot.docs)records.set(d.id,{...d.data(),firestoreId:d.id} as AttendanceRecord);
+    return [...records.values()].filter(r=>TimeService.getAttendanceDate(r)>=startDate && TimeService.getAttendanceDate(r)<=endDate);
+  },
+
+  watchAttendanceDate: (date: string, onData: (records: AttendanceRecord[])=>void, onError: ()=>void) => {
+    const queries=[query(collection(db,'records'),where('date','==',date)),query(collection(db,'records'),where('createdAt','>=',Timestamp.fromDate(new Date(date+'T00:00:00+08:00'))),where('createdAt','<=',Timestamp.fromDate(new Date(date+'T23:59:59.999+08:00'))))];
+    const parts: (AttendanceRecord[]|null)[]=[null,null];
+    let active=true,failed=false;
+    const listeners=queries.map((q,i)=>onSnapshot(q,{includeMetadataChanges:true},snapshot=>{
+      if(!active||failed||snapshot.metadata.fromCache)return;
+      parts[i]=snapshot.docs.map(d=>({...d.data(),firestoreId:d.id} as AttendanceRecord));
+      if(parts.every(Boolean)) {
+        const all=new Map<string,AttendanceRecord>();
+        parts.flat().forEach(r=>{if(r && TimeService.getAttendanceDate(r)===date)all.set(r.firestoreId!,r);});
+        onData([...all.values()]);
+      }
+    },()=>{failed=true;if(active)onError();}));
+    return ()=>{active=false;listeners.forEach(stop=>stop());};
   },
 
   addLeave: async (leave: LeaveRequest) => {
-    await addDoc(collection(db, 'leaves'), {
-      ...leave,
-      createdAt: serverTimestamp()
-    });
+    await invoke('submitLeave',{...leave,requestId:String(leave.id)});
   },
-
-  updateLeaveStatus: async (id: number, status: LeaveRequest['status'], rejectReason?: string) => {
-    try {
-        const q = query(collection(db, 'leaves'), where('id', '==', id));
-        const snapshot = await getDocs(q);
-        
-        if (status === 'approved' && snapshot.docs.length > 0) {
-            const leaveDoc = snapshot.docs[0];
-            const leaveData = leaveDoc.data() as LeaveRequest;
-            if (leaveData.status !== 'approved' && ['特休', '補休', '生日假'].includes(leaveData.type)) {
-                const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
-                const userSnapshot = await getDocs(userQ);
-                if (userSnapshot.docs.length > 0) {
-                    const userDoc = userSnapshot.docs[0];
-                    const userData = userDoc.data() as User;
-                    let updateData: any = {};
-                    
-                    // Legacy update just in case
-                    if (leaveData.type === '特休') updateData.quota_annual = Math.max(0, (userData.quota_annual || 0) - leaveData.hours);
-                    else if (leaveData.type === '補休') updateData.quota_comp = Math.max(0, (userData.quota_comp || 0) - leaveData.hours);
-                    else if (leaveData.type === '生日假') updateData.quota_birthday = Math.max(0, (userData.quota_birthday || 0) - leaveData.hours);
-                    
-                    // Bucket deduplication
-                    let usedBuckets = leaveData.usedBuckets || [];
-                    if ((userData.quotas || []).length > 0) {
-                        try {
-                            const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
-                            let remaining = leaveData.hours;
-                            usedBuckets = [];
-                            const today = TimeService.getTaiwanDate(new Date());
-                            const validBuckets = newQuotas
-                                .filter(q => q.type === leaveData.type && q.expireDate >= today && q.remainingHours > 0)
-                                .sort((a,b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
-
-                            for (const b of validBuckets) {
-                                if (remaining <= 0) break;
-                                const deductAmt = Math.min(b.remainingHours, remaining);
-                                b.remainingHours -= deductAmt;
-                                remaining -= deductAmt;
-                                usedBuckets.push({ bucketId: b.id, hours: deductAmt });
-                            }
-                            // Store updated quotas back
-                            updateData.quotas = newQuotas;
-                        } catch(e) {
-                            console.error("Bucket deduction failed", e);
-                        }
-                    }
-
-                    if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
-                    
-                    // Also save usedBuckets to leave
-                    await updateDoc(doc(db, 'leaves', leaveDoc.id), { status, rejectReason: rejectReason || null, usedBuckets });
-                    return; // Skip the generic update
-                }
-            }
-        }
-
-        const promises = snapshot.docs.map(d => 
-            updateDoc(doc(db, 'leaves', d.id), { status, rejectReason: rejectReason || null })
-        );
-        await Promise.all(promises);
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_LEAVE_STATUS', `Attempted to set leave ${id} to ${status}`);
-        }
-        throw e;
-    }
+  updateLeaveStatus: async (id: RequestId, status: LeaveRequest['status'], rejectReason?: string) => {
+    const target=await resolveRequest('leaves',id);
+    const operation=status==='approved'?'approve':status==='rejected'?'reject':status==='cancelled'?'cancel':'';
+    if(!operation)throw new Error('不支援此狀態');
+    await invoke('leaveAction',{id:target.id,operation,reason:rejectReason||''});
   },
-
-  updateApprovedLeaveType: async (leaveId: number, adminName: string, newType: string, newHours: number) => {
-    const normalizedHours = Number(newHours);
-    if (!Number.isFinite(normalizedHours) || normalizedHours <= 0 || normalizedHours > 744) {
-      throw new Error('休假時數必須介於 0.5 至 744 小時');
-    }
-
-    const q = query(collection(db, 'leaves'), where('id', '==', leaveId));
-    const snapshot = await getDocs(q);
-    if (snapshot.docs.length === 0) throw new Error("Leave not found");
-    const leaveDoc = snapshot.docs[0];
-    const leaveData = leaveDoc.data() as LeaveRequest;
-
-    if (leaveData.status !== 'approved' && leaveData.status !== 'pending') {
-      throw new Error("只有待審核或已核准的假單可以修改");
-    }
-    if (leaveData.type === newType && Number(leaveData.hours) === normalizedHours) {
-      throw new Error('未更改假別或時數');
-    }
-
-    const oldType = leaveData.type;
-    const oldHours = Number(leaveData.hours) || 0;
-    const specialTypes = ['特休', '補休', '生日假'];
-    const isSpecial = (type: string) => specialTypes.includes(type);
-    const legacyField = (type: string): 'quota_annual' | 'quota_comp' | 'quota_birthday' | null => {
-      if (type === '特休') return 'quota_annual';
-      if (type === '補休') return 'quota_comp';
-      if (type === '生日假') return 'quota_birthday';
-      return null;
-    };
-
-    let userUpdateData: Record<string, any> = {};
-    let newBucketsToDeduct: { bucketId: string, hours: number }[] = [];
-
-    if (leaveData.status === 'approved') {
-      const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
-      const userSnapshot = await getDocs(userQ);
-      if (userSnapshot.docs.length === 0) throw new Error("User not found");
-      const userDoc = userSnapshot.docs[0];
-      const userData = userDoc.data() as User;
-      const newQuotas = JSON.parse(JSON.stringify(userData.quotas || [])) as QuotaBucket[];
-
-      // Refund the allocation used by the old approved request before
-      // checking/deducting the replacement. This also handles changing only
-      // the number of hours and prevents a same-type edit from double charging.
-      if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0) {
-        for (const usedBucket of leaveData.usedBuckets) {
-          const bucket = newQuotas.find(qb => qb.id === usedBucket.bucketId);
-          if (!bucket) continue;
-          bucket.remainingHours = Math.min(
-            bucket.originalHours,
-            bucket.remainingHours + Math.max(0, Number(usedBucket.hours) || 0)
-          );
-        }
-      }
-
-      const newTypeBuckets = newQuotas
-        .filter(bucket => bucket.type === newType && bucket.remainingHours > 0 && bucket.expireDate >= TimeService.getTaiwanDate(new Date()))
-        .sort((a, b) => a.expireDate.localeCompare(b.expireDate) || a.addedDate.localeCompare(b.addedDate));
-      const hasNewTypeBuckets = newQuotas.some(bucket => bucket.type === newType);
-
-      if (isSpecial(newType) && hasNewTypeBuckets) {
-        const bucketHours = newTypeBuckets.reduce((sum, bucket) => sum + Math.max(0, bucket.remainingHours), 0);
-        if (bucketHours < normalizedHours) {
-          throw new Error(`新假別可用額度不足，目前最多 ${bucketHours} 小時`);
-        }
-        let remaining = normalizedHours;
-        for (const bucket of newTypeBuckets) {
-          if (remaining <= 0) break;
-          const deductAmount = Math.min(bucket.remainingHours, remaining);
-          bucket.remainingHours -= deductAmount;
-          remaining -= deductAmount;
-          newBucketsToDeduct.push({ bucketId: bucket.id, hours: deductAmount });
-        }
-      } else if (isSpecial(newType)) {
-        const field = legacyField(newType)!;
-        const availableLegacy = (Number(userData[field]) || 0) + (oldType === newType ? oldHours : 0);
-        if (availableLegacy < normalizedHours) {
-          throw new Error(`新假別可用額度不足，目前最多 ${availableLegacy} 小時`);
-        }
-      }
-
-      // Keep legacy counters in sync for older profiles. Newer profiles use
-      // quota buckets for display, while old profiles only have these fields.
-      const oldField = legacyField(oldType);
-      const newField = legacyField(newType);
-      if (oldField) userUpdateData[oldField] = (Number(userData[oldField]) || 0) + oldHours;
-      if (newField) {
-        const base = userUpdateData[newField] !== undefined
-          ? userUpdateData[newField]
-          : (Number(userData[newField]) || 0);
-        userUpdateData[newField] = Math.max(0, base - normalizedHours);
-      }
-      if (newQuotas.length > 0) userUpdateData.quotas = newQuotas;
-
-      const changeUserRef = doc(db, 'users', userDoc.id);
-      const changeEntry: LeaveChangeHistory = {
-        date: TimeService.getTaiwanDate(new Date()) + ' ' + TimeService.getTaiwanTime(new Date()),
-        adminName,
-        oldType,
-        newType,
-        oldHours,
-        newHours: normalizedHours
-      };
-      const newChangeHistory = [...(leaveData.changeHistory || []), changeEntry];
-      const leaveUpdateData: Record<string, any> = {
-        type: newType,
-        hours: normalizedHours,
-        changeHistory: newChangeHistory,
-        usedBuckets: newBucketsToDeduct
-      };
-
-      // Keep the user quota and leave record consistent if either write fails.
-      const batch = writeBatch(db);
-      if (Object.keys(userUpdateData).length > 0) batch.update(changeUserRef, userUpdateData);
-      batch.update(doc(db, 'leaves', leaveDoc.id), leaveUpdateData);
-      await batch.commit();
-      return;
-    }
-
-    const changeEntry: LeaveChangeHistory = {
-      date: TimeService.getTaiwanDate(new Date()) + ' ' + TimeService.getTaiwanTime(new Date()),
-      adminName,
-      oldType,
-      newType,
-      oldHours,
-      newHours: normalizedHours
-    };
-    await updateDoc(doc(db, 'leaves', leaveDoc.id), {
-      type: newType,
-      hours: normalizedHours,
-      changeHistory: [...(leaveData.changeHistory || []), changeEntry]
-    });
+  updateApprovedLeaveType: async (id: RequestId, _adminName: string, newType: string, newHours: number) => {
+    const target=await resolveRequest('leaves',id);
+    await invoke('leaveAction',{id:target.id,operation:'edit',type:newType,hours:newHours});
   },
-
-  // Cancel/Delete operations now support userId for restrictive filtering
-  cancelLeave: async (id: number, userId?: string) => {
-    let constraints = [where('id', '==', id)];
-    if (userId) {
-      // Employee reads are authorized by the immutable Firebase UID. Include
-      // the same UID constraint in this lookup; querying only by the legacy
-      // account ID cannot be proven safe by restrictive Firestore Rules.
-      const authenticatedUid = auth.currentUser?.uid;
-      if (!authenticatedUid) throw new Error('登入狀態已失效，請重新登入');
-      constraints.push(where('userId', '==', userId));
-      constraints.push(where('uid', '==', authenticatedUid));
-    }
-
-    const q = query(collection(db, 'leaves'), ...constraints);
-    const snapshot = await getDocs(q);
-    
-    if (snapshot.docs.length > 0) {
-        const leaveData = snapshot.docs[0].data() as LeaveRequest;
-        if (leaveData.status === 'approved' && ['特休', '補休', '生日假'].includes(leaveData.type)) {
-             const userQ = query(collection(db, 'users'), where('id', '==', leaveData.userId));
-             const userSnapshot = await getDocs(userQ);
-             if (userSnapshot.docs.length > 0) {
-                 const userDoc = userSnapshot.docs[0];
-                 const userData = userDoc.data() as User;
-                 let updateData: any = {};
-                 
-                 // Legacy refund
-                 if (leaveData.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + leaveData.hours;
-                 else if (leaveData.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + leaveData.hours;
-                 else if (leaveData.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + leaveData.hours;
-                 
-                 // Bucket refund
-                 if (leaveData.usedBuckets && leaveData.usedBuckets.length > 0 && userData.quotas) {
-                     const newQuotas = JSON.parse(JSON.stringify(userData.quotas)) as QuotaBucket[];
-                     for (const ub of leaveData.usedBuckets) {
-                         const b = newQuotas.find(q => q.id === ub.bucketId);
-                         if (b) {
-                             b.remainingHours += ub.hours;
-                             if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
-                         }
-                     }
-                     updateData.quotas = newQuotas;
-                 }
-
-                 if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
-             }
-        }
-    }
-
-    const promises = snapshot.docs.map(d => 
-        updateDoc(doc(db, 'leaves', d.id), { status: 'cancelled' })
-    );
-    await Promise.all(promises);
+  cancelLeave: async (id: RequestId, userId?: string) => {
+    const target=await resolveRequest('leaves',id,userId);
+    await invoke('leaveAction',{id:target.id,operation:'cancel'});
   },
-
-  deleteLeave: async (id: number, userId?: string) => {
-    try {
-        let constraints = [where('id', '==', id)];
-        if (userId) constraints.push(where('userId', '==', userId));
-
-        const q = query(collection(db, 'leaves'), ...constraints);
-        const snapshot = await getDocs(q);
-        
-        const deleteOperations = snapshot.docs.map(async (docSnap) => {
-            const data = docSnap.data() as LeaveRequest;
-            
-            if (data.status === 'approved' && ['特休', '補休', '生日假'].includes(data.type)) {
-                 const userQ = query(collection(db, 'users'), where('id', '==', data.userId));
-                 const userSnapshot = await getDocs(userQ);
-                 if (userSnapshot.docs.length > 0) {
-                     const userDoc = userSnapshot.docs[0];
-                     const userData = userDoc.data() as User;
-                     let updateData: any = {};
-                     
-                     // Legacy
-                     if (data.type === '特休') updateData.quota_annual = (userData.quota_annual || 0) + data.hours;
-                     else if (data.type === '補休') updateData.quota_comp = (userData.quota_comp || 0) + data.hours;
-                     else if (data.type === '生日假') updateData.quota_birthday = (userData.quota_birthday || 0) + data.hours;
-                     
-                     // Bucket refund
-                     if (data.usedBuckets && data.usedBuckets.length > 0 && userData.quotas) {
-                         const newQuotas = JSON.parse(JSON.stringify(userData.quotas)) as QuotaBucket[];
-                         for (const ub of data.usedBuckets) {
-                             const b = newQuotas.find(q => q.id === ub.bucketId);
-                             if (b) {
-                                 b.remainingHours += ub.hours;
-                                 if (b.remainingHours > b.originalHours) b.remainingHours = b.originalHours;
-                             }
-                         }
-                         updateData.quotas = newQuotas;
-                     }
-
-                     if (Object.keys(updateData).length > 0) await updateDoc(doc(db, 'users', userDoc.id), updateData);
-                 }
-            }
-
-            if (data.attachments && Array.isArray(data.attachments)) {
-                const attachmentDeletions = data.attachments.map((att: LeaveAttachment) => {
-                    if (att.path && storage) {
-                        const fileRef = ref(storage, att.path);
-                        return deleteObject(fileRef).catch(err => {
-                             // Suppress 'not found' errors to allow partial cleanup
-                             if (err.code !== 'storage/object-not-found') {
-                                 console.warn(`Failed to delete attached file ${att.path}`, err);
-                             }
-                        });
-                    }
-                    return Promise.resolve();
-                });
-                await Promise.all(attachmentDeletions);
-            }
-
-            // 2. Delete the Firestore document
-            return deleteDoc(doc(db, 'leaves', docSnap.id));
-        });
-
-        await Promise.all(deleteOperations);
-
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_LEAVE', `Attempted to delete leave ${id}`);
-        }
-        throw e;
-    }
+  deleteLeave: async (id: RequestId, userId?: string) => {
+    const target=await resolveRequest('leaves',id,userId);
+    await invoke('leaveAction',{id:target.id,operation:'delete'});
   },
-
   addOvertime: async (ot: OvertimeRequest) => {
-    await addDoc(collection(db, 'overtimes'), {
-      ...ot,
-      createdAt: serverTimestamp()
-    });
+    await invoke('submitOvertime',{...ot,requestId:String(ot.id)});
   },
-
-  updateOvertime: async (id: number, updates: Partial<OvertimeRequest>) => {
-    const q = query(collection(db, 'overtimes'), where('id', '==', id));
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => updateDoc(doc(db, 'overtimes', d.id), updates));
-    await Promise.all(promises);
+  updateOvertime: async (id: RequestId, updates: Partial<OvertimeRequest>) => {
+    const target=await resolveRequest('overtimes',id);
+    await invoke('overtimeAction',{id:target.id,operation:'edit',updates});
   },
-
-  updateOvertimeStatus: async (id: number, status: OvertimeRequest['status'], rejectReason?: string) => {
-    try {
-        const q = query(collection(db, 'overtimes'), where('id', '==', id));
-        const snapshot = await getDocs(q);
-        const promises = snapshot.docs.map(d => 
-            updateDoc(doc(db, 'overtimes', d.id), { status, rejectReason: rejectReason || null })
-        );
-        await Promise.all(promises);
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_OT_STATUS', `Attempted to set overtime ${id} to ${status}`);
-        }
-        throw e;
-    }
+  updateOvertimeStatus: async (id: RequestId, status: OvertimeRequest['status'], rejectReason?: string) => {
+    const target=await resolveRequest('overtimes',id);
+    const operation=status==='approved'?'approve':status==='rejected'?'reject':status==='cancelled'?'cancel':'';
+    if(!operation)throw new Error('不支援此狀態');
+    await invoke('overtimeAction',{id:target.id,operation,reason:rejectReason||''});
   },
-
-  cancelOvertime: async (id: number, userId?: string) => {
-    let constraints = [where('id', '==', id)];
-    if (userId) {
-      // Match the employee realtime query and the Rules ownership predicate.
-      // Without the immutable UID filter, Firestore rejects this collection
-      // query before the status update is attempted.
-      const authenticatedUid = auth.currentUser?.uid;
-      if (!authenticatedUid) throw new Error('登入狀態已失效，請重新登入');
-      constraints.push(where('userId', '==', userId));
-      constraints.push(where('uid', '==', authenticatedUid));
-    }
-
-    const q = query(collection(db, 'overtimes'), ...constraints);
-    const snapshot = await getDocs(q);
-    const promises = snapshot.docs.map(d => 
-        updateDoc(doc(db, 'overtimes', d.id), { status: 'cancelled' })
-    );
-    await Promise.all(promises);
+  cancelOvertime: async (id: RequestId, userId?: string) => {
+    const target=await resolveRequest('overtimes',id,userId);
+    await invoke('overtimeAction',{id:target.id,operation:'cancel'});
   },
-
-  deleteOvertime: async (id: number, userId?: string) => {
-    try {
-        let constraints = [where('id', '==', id)];
-        if (userId) constraints.push(where('userId', '==', userId));
-
-        const q = query(collection(db, 'overtimes'), ...constraints);
-        const snapshot = await getDocs(q);
-        
-        const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'overtimes', d.id)));
-        await Promise.all(promises);
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_DELETE_OT', `Attempted to delete overtime ${id}`);
-        }
-        throw e;
-    }
+  deleteOvertime: async (id: RequestId, userId?: string) => {
+    const target=await resolveRequest('overtimes',id,userId);
+    await invoke('overtimeAction',{id:target.id,operation:'delete'});
   },
 
   addAnnouncement: async (ann: Announcement) => {
-    try {
-        if (ann.id) {
-            if (typeof ann.id === 'string') {
-                const docRef = doc(db, 'announcements', ann.id);
-                // Check if doc actually exists just in case
-                await updateDoc(docRef, ann as any);
-                return;
-            } else {
-                const q = query(collection(db, 'announcements'), where('id', '==', ann.id));
-                const snapshot = await getDocs(q);
-                if (!snapshot.empty) {
-                    const promises = snapshot.docs.map(d => updateDoc(doc(db, 'announcements', d.id), ann as any));
-                    await Promise.all(promises);
-                    return;
-                }
-            }
-        }
-        await addDoc(collection(db, 'announcements'), {
-          ...ann,
-          createdAt: serverTimestamp()
-        });
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_WRITE', `Attempted to write announcement`);
-        }
-        throw e;
+    if(typeof ann.id==='string') {
+      await updateDoc(await resolveRequest('announcements',ann.id),{title:ann.title,content:ann.content,category:ann.category,author:ann.author,date:ann.date});
+    } else {
+      await addDoc(collection(db,'announcements'),{...ann,createdAt:serverTimestamp()});
     }
   },
-
-  removeAnnouncement: async (id: number | string) => {
-    try {
-        if (typeof id === 'string') {
-            try {
-                await deleteDoc(doc(db, 'announcements', id));
-            } catch (e) {
-                // Ignore and fallback
-            }
-        }
-        const numericId = Number(id);
-        const q = query(collection(db, 'announcements'), where('id', '==', isNaN(numericId) ? id : numericId));
-        const snapshot = await getDocs(q);
-        if (!snapshot.empty) {
-            const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
-            await Promise.all(promises);
-        }
-        if (typeof id === 'string') {
-            const qs = query(collection(db, 'announcements'), where('id', '==', id));
-            const snapshots = await getDocs(qs);
-            if (!snapshots.empty) {
-                const promises = snapshots.docs.map(d => deleteDoc(doc(db, 'announcements', d.id)));
-                await Promise.all(promises);
-            }
-        }
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_ANNOUNCEMENT_DELETE', `Attempted to delete announcement ${id}`);
-        }
-        throw e;
-    }
+  removeAnnouncement: async (id: RequestId) => {
+    await deleteDoc(await resolveRequest('announcements',id));
   },
 
   addHoliday: async (h: Holiday) => {
@@ -1003,41 +601,8 @@ export const StorageService = {
     }
   },
 
-  removeHoliday: async (id: number | string) => {
-    try {
-        // First try to delete by document ID if it's a string
-        if (typeof id === 'string') {
-            try {
-                await deleteDoc(doc(db, 'holidays', id));
-            } catch (e) {
-                // Ignore and fallback
-            }
-        }
-        
-        // Always try to query by id field as well, in case id refers to the Date.now() timestamp
-        const numericId = Number(id);
-        const q = query(collection(db, 'holidays'), where('id', '==', isNaN(numericId) ? id : numericId));
-        const snapshot = await getDocs(q);
-        if (!snapshot.empty) {
-            const promises = snapshot.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
-            await Promise.all(promises);
-        }
-        
-        // Also query by string id if needed
-        if (typeof id === 'string') {
-            const qs = query(collection(db, 'holidays'), where('id', '==', id));
-            const snapshots = await getDocs(qs);
-            if (!snapshots.empty) {
-                const promises = snapshots.docs.map(d => deleteDoc(doc(db, 'holidays', d.id)));
-                await Promise.all(promises);
-            }
-        }
-    } catch (e: any) {
-        if (e.code === 'permission-denied') {
-            StorageService.logSecurityEvent('UNAUTHORIZED_HOLIDAY_DELETE', `Attempted to delete holiday ${id}`);
-        }
-        throw e;
-    }
+  removeHoliday: async (id: RequestId) => {
+    await deleteDoc(await resolveRequest('holidays',id));
   },
 
   updateSettings: async (settings: AppSettings) => {

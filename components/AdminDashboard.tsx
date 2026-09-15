@@ -1,10 +1,10 @@
+import { creationTime } from '../utils/creationTime';
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { User, AttendanceRecord, LeaveRequest, OvertimeRequest, Announcement, Holiday, UserRole, LeaveAttachment } from '../types';
 import { StorageService, AppData } from '../services/storageService';
 import { TimeService } from '../services/timeService';
 import { calculateOTWithDeduction } from '../utils/otCalculator';
-import { analyzeAttendanceCompleteness, getAttendanceCompletenessLabel } from '../utils/attendanceStatus';
 import { createXlsxBlob } from '../utils/xlsxExporter';
 import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
 import { AdminService } from '../services/adminService';
@@ -14,6 +14,9 @@ import {
   CheckCircle, XCircle, Megaphone, Palmtree, Database, 
   Trash2, Clock, Globe, Bold, Italic, Underline, Edit3, UserMinus, Archive, RotateCcw, RefreshCw, UserPlus, Palette, UserCog, Calendar as CalendarIcon, Info, Download, FileText, AlertTriangle, Sliders, Calculator, MapPin, KeyRound, Filter, Paperclip, X, Plus
 } from 'lucide-react';
+
+import { csvRow } from '../utils/csv';
+import { dailyAttendance } from '../utils/dailyAttendance';
 
 const ADMIN_PAGE_SIZE = 10;
 
@@ -31,7 +34,7 @@ const getCreationTime = (item: any): number => {
     const timestamp = new Date(String(raw).replace(' ', 'T')).getTime();
     if (Number.isFinite(timestamp)) return timestamp;
   }
-  return Number(item?.id) || 0;
+  return Number(item?.legacyId ?? item?.id) || 0;
 };
 
 const sortNewest = <T,>(items: T[]): T[] =>
@@ -79,6 +82,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
   
   // Overview Date Filter
   const [overviewDate, setOverviewDate] = useState(TimeService.getTaiwanDate(new Date()));
+
+  const [overviewRecords,setOverviewRecords]=useState<AppData['records']>([]);
+  const [overviewReady,setOverviewReady]=useState(false);
+  const [overviewError,setOverviewError]=useState(false);
+  useEffect(()=>{
+    setOverviewReady(false);setOverviewError(false);setOverviewRecords([]);
+    if(!overviewDate)return;
+    return StorageService.watchAttendanceDate(overviewDate,records=>{setOverviewRecords(records);setOverviewReady(true);},()=>{setOverviewReady(false);setOverviewError(true);});
+  },[overviewDate]);
 
   // Modals & Forms
   const [isEditUserModalOpen, setIsEditUserModalOpen] = useState(false);
@@ -138,7 +150,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
   const [editOtForm, setEditOtForm] = useState({ start: '', end: '', reason: '', hours: 0 });
 
   // Rejection Modal
-  const [rejectModal, setRejectModal] = useState<{ id: number, type: 'leave' | 'ot' } | null>(null);
+  const [rejectModal, setRejectModal] = useState<{ id: number | string, type: 'leave' | 'ot' } | null>(null);
   const [rejectReason, setRejectReason] = useState('');
 
   // Permanent Delete Modal
@@ -364,7 +376,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
     }
   };
 
-  const handleAction = async (type: 'leave' | 'ot', id: number, status: 'approved' | 'rejected', reason?: string) => {
+  const handleAction = async (type: 'leave' | 'ot', id: number | string, status: 'approved' | 'rejected', reason?: string) => {
     try {
         if (type === 'leave') await StorageService.updateLeaveStatus(id, status, reason);
         else await StorageService.updateOvertimeStatus(id, status, reason);
@@ -377,7 +389,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
     }
   };
 
-  const deleteAttachment = async (leaveId: number, attachment: LeaveAttachment) => {
+  const deleteAttachment = async (leaveId: number | string, attachment: LeaveAttachment) => {
       if(!window.confirm(`確認刪除附件 "${attachment.name}"？此操作無法復原。`)) return;
       try {
           await StorageService.deleteLeaveAttachment(leaveId, attachment);
@@ -512,7 +524,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
         await StorageService.updateUser(targetUser.id, {
              quotas: updatedQuotas,
              ...legacyUpdates
-        });
+        }, targetUser);
         showToast("已新增額度", "success");
         setQuotaForm({...quotaForm, hours: 0});
         refreshData();
@@ -540,7 +552,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
         await StorageService.updateUser(targetUser.id, {
              quotas: updatedQuotas,
              ...legacyUpdates
-        });
+        }, targetUser);
         showToast("額度已刪除", "success");
         refreshData();
         setTargetUser({...targetUser, quotas: updatedQuotas, ...legacyUpdates});
@@ -571,7 +583,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
     userLeaves.forEach(l => {
        const statusMap: any = { pending: '審核中', approved: '已核准', rejected: '已拒絕', cancelled: '已取消' };
        const reason = l.reason ? String(l.reason) : '';
-       csv += `${l.type},${TimeService.formatDateTime(l.start, true)},${TimeService.formatDateTime(l.end, true)},${l.hours},${statusMap[l.status]},${reason.replace(/,/g, ' ')}\n`;
+       csv += csvRow([l.type,TimeService.formatDateTime(l.start,true),TimeService.formatDateTime(l.end,true),l.hours,statusMap[l.status],reason]);
     });
 
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -583,6 +595,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
 
   const handleExportAllAttendance = async () => {
     if (!attExportStart || !attExportEnd) return showToast("請選擇匯出日期區間", "error");
+    if(!data.syncReady?.users || !data.syncReady?.leaves || !data.syncReady?.holidays || !data.syncReady?.settings) return showToast('員工、請假或假日資料尚未完整載入，請確認網路後再匯出','error');
 
     let attendanceRecords: AppData['records'];
     try {
@@ -617,8 +630,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
         dateArray.push(TimeService.getTaiwanDate(currentDate));
         currentDate.setUTCDate(currentDate.getUTCDate() + 1);
     }
-    const todayForExport = TimeService.getTaiwanDate(new Date());
-    const currentTaiwanTimeForExport = TimeService.getTaiwanTime(new Date()).substring(0, 5);
 
     // --- Prepare Attendance Sheet Data ---
     const attendanceData: any[][] = [
@@ -634,21 +645,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
             const dayRecords = attendanceRecords.filter(r => 
                 r.userId === user.id && TimeService.getAttendanceDate(r) === dateStr
             );
-
-            // Find Approved Leaves for this User & Date
-            const userLeaves = data.leaves.filter(l => 
-                l.userId === user.id && 
-                l.status === 'approved' && 
-                l.start.substring(0, 10) <= dateStr && 
-                l.end.substring(0, 10) >= dateStr
-            );
-
-            // Determine Holiday / Weekend
-            const targetDate = new Date(`${dateStr}T12:00:00+08:00`);
-            const dayOfWeek = targetDate.getUTCDay();
-            const holidayInfo = data.holidays.find(h => TimeService.getTaiwanDate(h.date) === dateStr);
-            const isHoliday = !!holidayInfo;
-            const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
 
             let inTime = '--';
             let outTime = '--';
@@ -668,7 +664,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
                 const right = `${TimeService.getAttendanceDate(b)} ${TimeService.getAttendanceTime(b)}`;
                 return left.localeCompare(right);
             });
-            const completeness = analyzeAttendanceCompleteness(orderedDayRecords);
             const inRecords = orderedDayRecords.filter(r => r.type === 'in');
             const outRecords = orderedDayRecords.filter(r => r.type === 'out');
             if (dayRecords.length > 0) {
@@ -700,121 +695,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
                 }
             }
 
-            if (isHoliday) {
-                if (dayRecords.length > 0) {
-                    const issue = getAttendanceCompletenessLabel(completeness);
-                    statusParts.push(issue === '正常' ? "假日出勤" : `假日出勤 / ${issue}`);
-                }
-                else statusParts.push(`國定假日(${holidayInfo?.note})`);
-            } else if (isWeekend) {
-                if (dayRecords.length > 0) {
-                    const issue = getAttendanceCompletenessLabel(completeness);
-                    statusParts.push(issue === '正常' ? "週末加班" : `週末加班 / ${issue}`);
-                }
-                else statusParts.push("例假日");
-            } else {
-                // Normal Day Logic
-                if (user.onboard_date && dateStr < user.onboard_date) {
-                    statusParts.push("尚未到職");
-                } else {
-                    let expectedIn = "08:30:00";
-                    let expectedOut = "17:30:00";
-                    const lunchStart = "12:00:00";
-                    const lunchEnd = "13:30:00";
-
-                    let dayLeaves = userLeaves.map(l => ({
-                        type: l.type,
-                        hours: l.hours,
-                        start: TimeService.formatTimeOnly(l.start, true),
-                        end: TimeService.formatTimeOnly(l.end, true),
-                    })).sort((a,b) => a.start.localeCompare(b.start));
-
-                    // Adjust expectedIn based on morning leaves
-                    for (const l of dayLeaves) {
-                        if (l.start <= expectedIn && l.end > expectedIn) {
-                            expectedIn = l.end;
-                        }
-                    }
-                    if (expectedIn >= lunchStart && expectedIn < lunchEnd) expectedIn = lunchEnd;
-
-                    // Adjust expectedOut based on afternoon leaves
-                    for (const l of [...dayLeaves].sort((a,b) => b.end.localeCompare(a.end))) {
-                        if (l.end >= expectedOut && l.start < expectedOut) {
-                            expectedOut = l.start;
-                        }
-                    }
-                    if (expectedOut > lunchStart && expectedOut <= lunchEnd) expectedOut = lunchStart;
-
-                    const events: {start: string, text: string}[] = [];
-                    
-                    // 1. Add leaves to events timeline
-                    dayLeaves.forEach(l => {
-                        events.push({
-                            start: l.start,
-                            text: `請假(${l.type} ${l.hours}hr)`
-                        });
-                    });
-
-                    const hasToWork = expectedIn < expectedOut;
-                    
-                    // Lateness threshold is 08:32 => anything > 08:32:00 is late
-                    const expectedInThreshold = expectedIn === "08:30:00" ? "08:32:00" : expectedIn;
-
-                    // 2. Add work tracking to events timeline
-                    if (dayRecords.length > 0) {
-                        let workParts: string[] = [];
-                        if (completeness === 'invalid') workParts.push('無法辨識的打卡紀錄');
-                        if (completeness === 'invalid-sequence') workParts.push('打卡順序異常');
-                        if (inRecord) {
-                            if (inTime <= "08:00:00") workParts.push("提早打卡");
-                            if (inTime > expectedInThreshold) workParts.push("遲到");
-                            if (inRecord.status.includes('異常') || inRecord.dist > data.settings.allowedRadius) {
-                                workParts.push("上班地點異常");
-                            }
-                        }
-                        if (outRecord) {
-                            // Without an IN punch there is no reliable working
-                            // interval, so report only 缺上班卡 instead of
-                            // guessing that the OUT punch was an early leave.
-                            if (inRecord && outTime < expectedOut) workParts.push("早退");
-                            if (inRecord && outTime >= "18:00:00") workParts.push("晚退");
-                            if (outRecord.status.includes('異常') || outRecord.dist > data.settings.allowedRadius) {
-                                workParts.push("下班地點異常");
-                            }
-                        }
-
-                        if (completeness === 'missing-out') workParts.push("缺下班卡");
-                        if (completeness === 'missing-in') workParts.push("缺上班卡");
-
-                        if (workParts.length === 0 && completeness === 'complete') {
-                            workParts.push("正常");
-                        } else if (workParts.length === 0) {
-                            workParts.push("打卡資料異常");
-                        }
-
-                        events.push({
-                            start: inTime !== '--' ? inTime : expectedIn,
-                            text: workParts.join(", ")
-                        });
-                    } else {
-                        // NO RECORDS
-                        if (hasToWork) {
-                            const isPastWorkday = dateStr < todayForExport ||
-                              (dateStr === todayForExport && currentTaiwanTimeForExport > '08:32');
-                            events.push({
-                                start: expectedIn,
-                                text: dateStr > todayForExport
-                                  ? "尚未到日期"
-                                  : isPastWorkday ? "曠職/未打卡" : "尚未打卡"
-                            });
-                        }
-                    }
-
-                    // Sort events by time
-                    events.sort((a,b) => a.start.localeCompare(b.start));
-                    events.forEach(e => statusParts.push(e.text));
-                }
-            }
+            statusParts = dailyAttendance(user,dateStr,orderedDayRecords,data.leaves,data.holidays,data.settings.allowedRadius,TimeService.getCorrectedNow(dynamicOffset)).labels;
 
             const finalStatus = statusParts.join(" / ");
 
@@ -1047,7 +928,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
         const endStr = TimeService.formatDateTime(i.end, true);
         const reason = i.reason ? String(i.reason) : '';
         const exportType = type === 'leave' ? i.type : '加班';
-        csv += `${i.userId},${i.userName},${exportType},${startStr},${endStr},${i.hours},${getStatusText(i.status)},${reason.replace(/,/g, ' ')}\n`;
+        csv += csvRow([i.userId,i.userName,exportType,startStr,endStr,i.hours,getStatusText(i.status),reason]);
     });
 
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -1061,134 +942,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
 
   // Modified to support historical date lookup
   const getEmployeeStatus = (uid: string, targetDateStr: string) => {
-    const userRecords = data.records.filter(r => r.userId === uid && TimeService.getAttendanceDate(r) === targetDateStr);
-    
-    // Check for approved leaves covering this date
-    const userLeaves = data.leaves.filter(l => 
-        l.userId === uid && 
-        l.status === 'approved' &&
-        l.start.substring(0, 10) <= targetDateStr && 
-        l.end.substring(0, 10) >= targetDateStr
-    );
-
-    const targetDate = new Date(targetDateStr);
-    const dayOfWeek = targetDate.getDay();
-    const isHoliday = data.holidays.some(h => TimeService.getTaiwanDate(h.date) === targetDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
-
-    userRecords.sort((a,b) => TimeService.getAttendanceTime(a).localeCompare(TimeService.getAttendanceTime(b)));
-    const firstInIdx = userRecords.findIndex(r => r.type === 'in');
-    // Keep an OUT-only day visible so an administrator can see a backfilled
-    // clock-out and the dashboard can correctly identify the missing IN card.
-    const validRecords = firstInIdx !== -1 ? userRecords.slice(firstInIdx) : userRecords;
-
-    const sortedIn = validRecords.filter(r => r.type === 'in');
-    const sortedOut = validRecords.filter(r => r.type === 'out');
-
-    const firstIn = sortedIn[0];
-    const lastOut = sortedOut[sortedOut.length - 1];
-
-    let midInDisplay = '';
-    let midOutDisplay = '';
-
-    if (sortedIn.length > 1) {
-        midInDisplay = sortedIn.slice(1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
-    }
-    if (sortedOut.length > 1) {
-        midOutDisplay = sortedOut.slice(0, sortedOut.length - 1).map(r => TimeService.getAttendanceTime(r, true)).join(', ');
-    }
-
-    const statusTags: { label: string, color: string }[] = [];
-
-    // 1. Holiday / Weekend Logic
-    if (isHoliday) {
-        if (firstIn) {
-            statusTags.push({ label: '休假日加班', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-        } else {
-            statusTags.push({ label: '休假', color: 'text-green-600 bg-green-50 border-green-200' });
-        }
-    } else {
-        // 2. Approved Leave Logic (only on non-holidays)
-        userLeaves.forEach(leave => {
-            statusTags.push({ 
-                label: `${leave.type}中`, 
-                color: 'text-indigo-600 bg-indigo-50 border-indigo-200' 
-            });
-        });
-    }
-
-    // 3. Attendance Logic
-    if (firstIn) {
-        const inTimeStr = TimeService.getAttendanceTime(firstIn, false);
-        
-        if (!isHoliday && userLeaves.length === 0) {
-            statusTags.push({ label: '已上班', color: 'text-blue-600 bg-blue-50 border-blue-200' });
-            if (inTimeStr > '08:32') {
-                statusTags.push({ label: '遲到', color: 'text-red-600 bg-red-50 border-red-200' });
-            }
-        }
-
-        if (lastOut) {
-            if (!isHoliday && userLeaves.length === 0) {
-                 statusTags.push({ label: '已下班', color: 'text-gray-600 bg-gray-100 border-gray-300' });
-                 const outTimeStr = TimeService.getAttendanceTime(lastOut, false);
-                 if (outTimeStr < '17:30') {
-                    statusTags.push({ label: '早退', color: 'text-red-600 bg-red-50 border-red-200' });
-                 }
-            }
-         } else {
-             // No out record yet
-             // Historical/current days after the scheduled end must expose a
-             // missing clock-out instead of silently showing only 已上班.
-             const nowTaiwan = TimeService.getTaiwanTime(new Date()).substring(0, 5);
-             const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
-             
-             if (isToday && nowTaiwan >= '18:00' && !isHoliday && userLeaves.length === 0) {
-                 statusTags.push({ label: '加班中', color: 'text-purple-600 bg-purple-50 border-purple-200' });
-             } else if ((!isToday || nowTaiwan >= '17:30') && !isHoliday && userLeaves.length === 0) {
-                 statusTags.push({ label: '缺下班卡', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-             }
-        }
-    } else {
-        // No IN record
-        if (lastOut) {
-             statusTags.push({ label: '缺上班卡', color: 'text-orange-600 bg-orange-50 border-orange-200' });
-        } else if (!isHoliday && userLeaves.length === 0) {
-             const nowStr = TimeService.getTaiwanTime(new Date());
-             const nowSimple = nowStr.substring(0, 5);
-             const isToday = targetDateStr === TimeService.getTaiwanDate(new Date());
-             const isPast = targetDateStr < TimeService.getTaiwanDate(new Date());
-
-             if (isPast || (isToday && nowSimple > '08:32')) {
-                 statusTags.push({ label: '未到班/曠職', color: 'text-red-600 bg-red-50 border-red-200' });
-             } else {
-                 statusTags.push({ label: '未打卡', color: 'text-gray-400 bg-gray-50 border-gray-200' });
-             }
-        }
-    }
-
-    // Prepare Display Data
-    const inDisplay = firstIn ? TimeService.getAttendanceTime(firstIn, true) : '--';
-    const outDisplay = lastOut ? TimeService.getAttendanceTime(lastOut, true) : '--';
-    
-    // Coordinates & Distance
-    const inLoc = firstIn ? { lat: firstIn.lat, lng: firstIn.lng, dist: firstIn.dist, source: firstIn.source } : null;
-    const outLoc = lastOut ? { lat: lastOut.lat, lng: lastOut.lng, dist: lastOut.dist, source: lastOut.source } : null;
-
-    if (firstIn?.source === 'admin') {
-      statusTags.push({ label: '管理員補上班卡', color: 'text-purple-600 bg-purple-50 border-purple-200' });
-    }
-    if (lastOut?.source === 'admin') {
-      statusTags.push({ label: '管理員補下班卡', color: 'text-purple-600 bg-purple-50 border-purple-200' });
-    }
-
-    return { 
-      tags: statusTags, 
-      inTime: inDisplay, 
-      outTime: outDisplay,
-      midIn: midInDisplay,
-      midOut: midOutDisplay,
-      inLoc,
-      outLoc
+    const user=data.users.find(u=>u.id===uid)!;
+    const result=dailyAttendance(user,targetDateStr,overviewRecords,data.leaves,data.holidays,data.settings.allowedRadius,TimeService.getCorrectedNow(dynamicOffset));
+    const {firstIn,lastOut,punches}=result;
+    const sortedIn=punches.filter(r=>r.type==='in'),sortedOut=punches.filter(r=>r.type==='out');
+    const ready=overviewReady && data.syncReady?.users && data.syncReady?.leaves && data.syncReady?.holidays && data.syncReady?.settings;
+    const labels=ready?result.labels:[overviewError?'讀取失敗，請重新整理':'資料同步中，尚未判定'];
+    const tags=labels.map(label=>({label,color:/遲到|早退|缺|曠職|異常|失敗/.test(label)?'text-red-600 bg-red-50 border-red-200':'text-blue-600 bg-blue-50 border-blue-200'}));
+    if(firstIn?.source==='admin')tags.push({label:'管理員補上班卡',color:'text-purple-600 bg-purple-50 border-purple-200'});
+    if(lastOut?.source==='admin')tags.push({label:'管理員補下班卡',color:'text-purple-600 bg-purple-50 border-purple-200'});
+    return {
+      tags,
+      inTime:firstIn?TimeService.getAttendanceTime(firstIn,true):'--',
+      outTime:lastOut?TimeService.getAttendanceTime(lastOut,true):'--',
+      midIn:sortedIn.slice(1).map(r=>TimeService.getAttendanceTime(r,true)).join(', '),
+      midOut:sortedOut.slice(0,-1).map(r=>TimeService.getAttendanceTime(r,true)).join(', '),
+      inLoc:firstIn?{lat:firstIn.lat,lng:firstIn.lng,dist:firstIn.dist,source:firstIn.source}:null,
+      outLoc:lastOut?{lat:lastOut.lat,lng:lastOut.lng,dist:lastOut.dist,source:lastOut.source}:null
     };
   };
 
@@ -2189,7 +1959,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ timeOffset, isTi
                         ) : (
                             data.leaves
                             .filter(l => l.userId === targetUser.id && l.status === 'approved')
-                            .sort((a,b) => b.id - a.id)
+                            .sort((a,b) => creationTime(b) - creationTime(a))
                             .slice(0, 5) // Limit to top 5
                             .map(l => (
                                 <div key={l.id} className="grid grid-cols-4 gap-2 items-center p-2 bg-white rounded-lg border border-gray-100 hover:shadow-sm">

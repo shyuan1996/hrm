@@ -1,267 +1,69 @@
-
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // --- Helper Functions ---
-
+    function signedIn() { return request.auth != null; }
+    function adminProfile(id) {
+      let p = get(/databases/$(database)/documents/users/$(id)).data;
+      return exists(/databases/$(database)/documents/users/$(id)) && p.get('uid','') == request.auth.uid && p.get('role','') == 'admin' &&
+        p.get('deleted',false) != true && p.get('mustChangePassword',false) != true && request.auth.token.get('auth_time',0) >= p.get('tokenValidAfterSeconds',0);
+    }
     function isAdmin() {
-      return request.auth != null && (
-        (exists(/databases/$(database)/documents/users/admin) &&
-         get(/databases/$(database)/documents/users/admin).data.get('uid', '') == request.auth.uid &&
-         get(/databases/$(database)/documents/users/admin).data.get('role', '') == 'admin') ||
-        (exists(/databases/$(database)/documents/users/syhr) &&
-         get(/databases/$(database)/documents/users/syhr).data.get('uid', '') == request.auth.uid &&
-         get(/databases/$(database)/documents/users/syhr).data.get('role', '') == 'admin') ||
-        (exists(/databases/$(database)/documents/users/service) &&
-         get(/databases/$(database)/documents/users/service).data.get('uid', '') == request.auth.uid &&
-         get(/databases/$(database)/documents/users/service).data.get('role', '') == 'admin')
-      );
+      return signedIn() && (adminProfile('admin') || adminProfile('syhr') || adminProfile('service'));
     }
-
-    // Helper: Normalize email to lowercase for comparison
-    function isEmailMatch(id) {
-       return request.auth != null &&
-              request.auth.token.email != null &&
-              request.auth.token.email.lower() == (id + '@shyuan-hrm.com').lower();
+    function ownProfile(id) {
+      let p = get(/databases/$(database)/documents/users/$(id)).data;
+      return signedIn() && id != '' && exists(/databases/$(database)/documents/users/$(id)) && !(id in ['admin','syhr','service']) &&
+        (p.get('uid','') == request.auth.uid ||
+          (p.get('uid','') == '' && request.auth.token.get('email','').lower() == (id + '@shyuan-hrm.com').lower()));
     }
-
-    // Profile ownership is intentionally independent from the forced
-    // password-change marker. Otherwise a freshly reset employee could not
-    // read their own profile to complete the required password change.
-    function isOwnProfile(userId) {
-      return request.auth != null &&
-             userId != '' &&
-             userId != 'admin' &&
-             userId != 'syhr' &&
-             userId != 'service' &&
-             exists(/databases/$(database)/documents/users/$(userId)) &&
-             (
-               get(/databases/$(database)/documents/users/$(userId)).data.get('uid', '') == request.auth.uid ||
-               isEmailMatch(userId)
-             );
+    function activeEmployee(id) {
+      let p = get(/databases/$(database)/documents/users/$(id)).data;
+      return exists(/databases/$(database)/documents/users/$(id)) && p.get('deleted',false) != true && p.get('mustChangePassword',false) != true && request.auth.token.get('auth_time',0) >= p.get('tokenValidAfterSeconds',0);
     }
-
-    // A temporary-password account may read its own profile so it can clear
-    // this marker, but it cannot access attendance or request data first.
-    function canUseEmployeeData(userId) {
-      return userId != '' &&
-             exists(/databases/$(database)/documents/users/$(userId)) &&
-             get(/databases/$(database)/documents/users/$(userId)).data.get('mustChangePassword', false) != true;
+    function ownResource() {
+      return signedIn() && resource.data.get('uid','') == request.auth.uid &&
+        ownProfile(resource.data.get('userId','')) && activeEmployee(resource.data.get('userId',''));
     }
-
-    // Helper: Check if the user owns the document (Read/Update/Delete context)
-    function isResourceOwner() {
-      let docUid = resource.data.get('uid', null);
-      let docUserId = resource.data.get('userId', '');
-      
-      return request.auth != null && (
-        docUid != null && docUid == request.auth.uid &&
-        isOwnProfile(docUserId) && canUseEmployeeData(docUserId)
-      );
-    }
-
-    // Helper: Check if the user is creating data for themselves (Create context)
-    function isCreatingOwnResource() {
-       return request.auth != null &&
-              request.resource.data.get('uid', '') == request.auth.uid &&
-              isOwnProfile(request.resource.data.get('userId', '')) &&
-              canUseEmployeeData(request.resource.data.get('userId', ''));
-    }
-
-    // Shared structural validation for employee and administrator-created
-    // attendance records. Administrator records add only explicit audit fields
-    // and still have to reference the employee's immutable Auth UID.
-    function isValidAttendanceRecord(record) {
-      return record.keys().hasOnly([
-               'id', 'userId', 'uid', 'userName', 'date', 'time',
-               'type', 'status', 'lat', 'lng', 'dist', 'photo', 'createdAt',
-               'source', 'createdByUid', 'createdByName'
-             ]) &&
-             record.id is int &&
-             record.userId is string &&
-             record.uid is string &&
-             record.userName is string &&
-             record.userName.size() <= 100 &&
-             record.type in ['in', 'out'] &&
-             record.status in ['正常', '地點異常'] &&
-             record.date is string &&
-             record.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
-             record.time is string &&
-             record.time.matches('^[0-9]{2}:[0-9]{2}:[0-9]{2}$') &&
-             record.lat is number &&
-             record.lat >= -90 && record.lat <= 90 &&
-             record.lng is number &&
-             record.lng >= -180 && record.lng <= 180 &&
-             record.dist is number &&
-             record.dist >= 0 && record.dist <= 20000000 &&
-             record.get('source', 'employee') in ['employee', 'admin'] &&
-             record.get('createdByUid', '') is string &&
-             record.get('createdByName', '') is string;
-    }
-
-    // --- Collection Rules ---
-
-    // Security Logs (New)
-    match /security_logs/{logId} {
-      allow create: if request.auth != null &&
-                       request.resource.data.uid == request.auth.uid &&
-                       request.resource.data.timestamp == request.time &&
-                       request.resource.data.action is string &&
-                       request.resource.data.action.size() <= 100 &&
-                       request.resource.data.details is string &&
-                       request.resource.data.details.size() <= 1000 &&
-                       request.resource.data.keys().hasOnly([
-                         'uid', 'email', 'action', 'details', 'timestamp', 'userAgent'
-                       ]);
-      // 僅管理員可讀取與管理日誌
-      allow read, update, delete: if isAdmin();
-    }
-
-    // Users Collection
     match /users/{userId} {
-      // Security fix: Employees can only read their own data. Admin can read all.
-      allow read: if isAdmin() || (
-        request.auth != null &&
-        userId != 'admin' &&
-        userId != 'syhr' &&
-        isOwnProfile(userId)
-      );
-      
-      // New employee profiles and all HR fields are administrator-managed.
-      allow create, delete: if isAdmin();
+      // A reset/archived employee can read only their own profile to see why
+      // access is blocked. All business reads and writes remain denied.
+      allow read: if isAdmin() || ownProfile(userId);
+      allow create: if isAdmin();
+      // Keep historical identities; use archive instead of destructive delete.
+      allow delete: if false;
       allow update: if isAdmin() || (
-        request.auth != null &&
-        userId != 'admin' &&
-        userId != 'syhr' &&
-        isOwnProfile(userId) &&
-        request.resource.data.get('uid', '') == request.auth.uid &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid', 'mustChangePassword']) &&
-        request.resource.data.get('mustChangePassword', false) == false
+        ownProfile(userId) &&
+        resource.data.get('deleted',false) != true &&
+        resource.data.get('uid','') == '' &&
+        request.resource.data.get('uid','') == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid'])
       );
     }
-
-    // Records (Attendance)
-    match /records/{recordId} {
-      allow read: if isAdmin() || isResourceOwner();
-      // Employees may only create their own valid records. Administrators may
-      // create a historical補打卡 record only with an explicit audit marker,
-      // and the UID must match the selected employee profile.
-      allow create: if (
-                       isAdmin() &&
-                       isValidAttendanceRecord(request.resource.data) &&
-                       request.resource.data.createdAt == request.time &&
-                       request.resource.data.get('source', '') == 'admin' &&
-                       request.resource.data.get('createdByUid', '') == request.auth.uid &&
-                       request.resource.data.get('createdByName', '').size() > 0 &&
-                       exists(/databases/$(database)/documents/users/$(request.resource.data.userId)) &&
-                       get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.get('uid', '') == request.resource.data.uid &&
-                       get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.get('role', '') == 'employee'
-                     ) || (
-                       isCreatingOwnResource() &&
-                       isValidAttendanceRecord(request.resource.data) &&
-                       request.resource.data.createdAt == request.time &&
-                       request.resource.data.uid == request.auth.uid &&
-                       request.resource.data.get('source', 'employee') == 'employee' &&
-                       request.resource.data.get('createdByUid', '') == '' &&
-                       request.resource.data.get('createdByName', '') == ''
-                     );
-      // 修改/刪除：僅限管理員
-      allow update, delete: if isAdmin();
+    // Validated callable functions are now the only writers of business data.
+    // Admin SDK bypasses Rules: authorization/validation lives in the callable.
+    match /records/{id} { allow read: if isAdmin() || ownResource(); allow write: if false; }
+    match /leaves/{id} { allow read: if isAdmin() || ownResource(); allow write: if false; }
+    match /overtimes/{id} { allow read: if isAdmin() || ownResource(); allow write: if false; }
+    match /attendance_state/{id} { allow read, write: if false; }
+    match /security_logs/{id} {
+      allow read: if isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid &&
+        request.resource.data.timestamp == request.time &&
+        request.resource.data.action is string && request.resource.data.action.size() <= 100 &&
+        request.resource.data.details is string && request.resource.data.details.size() <= 1000 &&
+        request.resource.data.keys().hasOnly(['uid','email','action','details','timestamp','userAgent']);
+      allow update, delete: if false;
     }
-
-    // Leaves (Requests)
-    match /leaves/{leaveId} {
-      allow read: if isAdmin() || isResourceOwner();
-      
-      // 建立假單：
-      // 1. 必須是本人
-      // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
-      allow create: if isCreatingOwnResource() &&
-        request.resource.data.keys().hasOnly([
-          'id', 'userId', 'uid', 'userName', 'type', 'start', 'end', 'hours',
-          'reason', 'status', 'rejectReason', 'created_at', 'createdAt',
-           'attachments'
-        ]) &&
-        request.resource.data.createdAt == request.time &&
-        request.resource.data.status == 'pending' &&
-        request.resource.data.id is int &&
-        request.resource.data.userId is string &&
-        request.resource.data.uid == request.auth.uid &&
-        request.resource.data.userName is string && request.resource.data.userName.size() <= 100 &&
-        request.resource.data.type is string && request.resource.data.type.size() <= 50 &&
-        request.resource.data.start is string && request.resource.data.end is string &&
-        request.resource.data.start.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
-        request.resource.data.end.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
-        request.resource.data.hours is number && request.resource.data.hours > 0 && request.resource.data.hours <= 744 &&
-        request.resource.data.reason is string && request.resource.data.reason.size() <= 2000 &&
-         request.resource.data.created_at is string && request.resource.data.created_at.size() <= 100 &&
-         request.resource.data.get('attachments', []) is list && request.resource.data.get('attachments', []).size() <= 5;
-      
-      // 更新規則：本人只能將狀態改為 cancelled (取消申請)
-      allow update: if isAdmin() || (
-        isResourceOwner() &&
-        resource.data.status == 'pending' &&
-        request.resource.data.status == 'cancelled' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
-      );
-      
-      // 刪除規則：僅限管理員
-      allow delete: if isAdmin();
-    }
-
-    // Overtimes (Requests)
-    match /overtimes/{otId} {
-      allow read: if isAdmin() || isResourceOwner();
-      
-      // 建立加班單：
-      // 1. 必須是本人
-      // 2. [安全性修正] 狀態必須強制為 'pending'，防止員工自我核准
-      allow create: if isCreatingOwnResource() &&
-        request.resource.data.keys().hasOnly([
-           'id', 'userId', 'uid', 'userName', 'start', 'end', 'hours',
-           'reason', 'status', 'created_at', 'createdAt'
-        ]) &&
-        request.resource.data.createdAt == request.time &&
-        request.resource.data.status == 'pending' &&
-        request.resource.data.id is int &&
-        request.resource.data.userId is string &&
-        request.resource.data.uid == request.auth.uid &&
-        request.resource.data.userName is string && request.resource.data.userName.size() <= 100 &&
-        request.resource.data.start is string && request.resource.data.end is string &&
-        request.resource.data.start.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
-        request.resource.data.end.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$') &&
-        request.resource.data.hours is number && request.resource.data.hours > 0 && request.resource.data.hours <= 744 &&
-        request.resource.data.reason is string && request.resource.data.reason.size() <= 2000 &&
-         request.resource.data.created_at is string && request.resource.data.created_at.size() <= 100;
-      
-      // 更新規則：本人只能將狀態改為 cancelled
-      allow update: if isAdmin() || (
-        isResourceOwner() &&
-        resource.data.status == 'pending' &&
-        request.resource.data.status == 'cancelled' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
-      );
-      
-      // 刪除規則：僅限管理員
-      allow delete: if isAdmin();
-    }
-
-    // Public/System Data
-    match /announcements/{annId} {
-      allow read: if true;
-      allow write: if isAdmin();
-    }
-
-    match /holidays/{id} {
-      allow read: if request.auth != null;
-      allow write: if isAdmin();
-    }
-
-    match /system/{document=**} {
-      // Company coordinates and geofence radius are not public information.
-      allow read: if request.auth != null;
-      allow write: if isAdmin();
+    match /announcements/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /holidays/{id} { allow read: if signedIn(); allow write: if isAdmin(); }
+    match /system/settings {
+      allow read: if signedIn();
+      allow write: if isAdmin() &&
+        request.resource.data.keys().hasOnly(['companyLat','companyLng','allowedRadius']) &&
+        request.resource.data.companyLat is number && request.resource.data.companyLat >= -90 && request.resource.data.companyLat <= 90 &&
+        request.resource.data.companyLng is number && request.resource.data.companyLng >= -180 && request.resource.data.companyLng <= 180 &&
+        !(request.resource.data.companyLat == 0 && request.resource.data.companyLng == 0) &&
+        request.resource.data.allowedRadius is number && request.resource.data.allowedRadius > 0 && request.resource.data.allowedRadius <= 20000000;
     }
   }
 }

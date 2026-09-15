@@ -2,6 +2,8 @@
 
 React、TypeScript、Vite 與 Firebase 建置的員工出勤、請假及加班管理系統。
 
+**2026-09-15 安全更新：請先閱讀 [部署與相容性說明](SECURITY-UPGRADE-2026-09-15.md)。本版新增後端功能，不能只更新前端，也不要先單獨發布 Rules。**
+
 ## Run Locally
 
 需求：Node.js。

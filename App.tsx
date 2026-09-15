@@ -9,8 +9,9 @@ import { TimeService } from './services/timeService';
 import { SESSION_KEY, DEFAULT_SETTINGS } from './constants';
 import { Key, LogOut, CheckCircle, UserCircle, AlertTriangle } from 'lucide-react';
 import { Button } from './components/ui/Button';
-import { auth } from './services/firebase';
-import { signOut, onAuthStateChanged, updatePassword, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
+import { auth, functions } from './services/firebase';
+import { httpsCallable } from 'firebase/functions';
+import { signOut, onAuthStateChanged, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -130,6 +131,7 @@ const App: React.FC = () => {
           StorageService.clearPrivateCache();
           localStorage.removeItem(SESSION_KEY);
           setCurrentUser(null);
+          await signOut(auth).catch(() => {});
           setIsForcedPasswordChange(false);
           setIsSelfPwdModalOpen(false);
         }
@@ -171,6 +173,27 @@ const App: React.FC = () => {
       window.removeEventListener('focus', refreshOnReturn);
     };
   }, [syncTime]);
+
+
+  // Keep the currently displayed employee in sync without requiring re-login.
+  // A removed/archived profile ends the session, rather than leaving old data.
+  useEffect(() => {
+    const onProfile = (event: Event) => {
+      const profile = (event as CustomEvent<User | null>).detail;
+      if (!profile || profile.deleted || profile.uid !== auth.currentUser?.uid) {
+        setCurrentUser(null);
+        setIsForcedPasswordChange(false);
+        setIsSelfPwdModalOpen(false);
+        void signOut(auth);
+        return;
+      }
+      setCurrentUser(profile);
+      setIsForcedPasswordChange(Boolean(profile.mustChangePassword));
+      if (profile.mustChangePassword) setIsSelfPwdModalOpen(true);
+    };
+    window.addEventListener('profile-update',onProfile);
+    return () => window.removeEventListener('profile-update',onProfile);
+  }, []);
 
   const handleUpdateSelfPwd = async () => {
     if (isProcessing) return; // 防重入
@@ -214,18 +237,8 @@ const App: React.FC = () => {
       }
 
       // 4. 執行密碼更新
-      await updatePassword(auth.currentUser, pwdForm.new1);
-
-      // 密碼只由 Firebase Authentication 管理；清除首次登入強制變更標記。
-      if (currentUser) {
-        try {
-          await StorageService.updateUser(currentUser.id, { mustChangePassword: false });
-        } catch (error) {
-          // The password is already changed. Keep the session safe and let the
-          // next login retry the marker update after rules are published.
-          console.warn('Failed to clear mustChangePassword marker', error);
-        }
-      }
+      if (pwdForm.new1 === pwdForm.old) throw new Error('新密碼不能與舊密碼相同');
+      await httpsCallable(functions, 'completePasswordChange')({oldPassword:pwdForm.old,newPassword:pwdForm.new1});
 
       // 6. 清除記住我
       localStorage.removeItem('sas_remember_user_v1');

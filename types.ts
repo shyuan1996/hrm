@@ -57,6 +57,7 @@ export interface AttendanceRecord {
   createdByUid?: string;
   createdByName?: string;
   createdAt?: { toDate: () => Date } | Date | string; // Trusted Firestore server timestamp for new records
+  effectiveAt?: { toDate: () => Date } | Date | string;
 }
 
 export interface LeaveAttachment {
@@ -66,7 +67,8 @@ export interface LeaveAttachment {
 }
 
 export interface LeaveRequest {
-  id: number;
+  id: number | string;
+  legacyId?: number;
   userId: string;
   uid?: string; // Added for robust security rules
   userName: string;
@@ -86,7 +88,8 @@ export interface LeaveRequest {
 }
 
 export interface OvertimeRequest {
-  id: number;
+  id: number | string;
+  legacyId?: number;
   userId: string;
   uid?: string; // Added for robust security rules
   userName: string;
@@ -103,7 +106,7 @@ export interface OvertimeRequest {
 }
 
 export interface Announcement {
-  id: number;
+  id: number | string;
   title: string;
   content: string;
   category: 'general' | 'urgent' | 'system';
@@ -114,7 +117,7 @@ export interface Announcement {
 }
 
 export interface Holiday {
-  id: number;
+  id: number | string;
   date: string;
   note: string;
   /** Optional precise creation time; legacy documents only have date. */

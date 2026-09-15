@@ -1,3 +1,4 @@
+import { creationTime } from '../utils/creationTime';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, AttendanceRecord, AppSettings, Holiday } from '../types';
 import { StorageService } from '../services/storageService';
@@ -79,7 +80,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   
   // Challenges
   const [punchMathChallenge, setPunchMathChallenge] = useState<{q:string, a:number, opts:number[]} | null>(null);
-  const [cancelLeaveChallenge, setCancelLeaveChallenge] = useState<{id: number, q:string, a:number, opts:number[], type: 'leave' | 'ot'} | null>(null);
+  const [cancelLeaveChallenge, setCancelLeaveChallenge] = useState<{id: number | string, q:string, a:number, opts:number[], type: 'leave' | 'ot'} | null>(null);
 
   // Filters
   const [punchFilterStart, setPunchFilterStart] = useState('');
@@ -405,7 +406,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   useEffect(() => {
       const userRecords = localData.records
         .filter(r => r.userId === user.id && TimeService.getAttendanceDate(r) >= minPunchHistoryDate)
-        .sort((a, b) => b.id - a.id);
+        .sort((a, b) => creationTime(b) - creationTime(a));
       setRecords(userRecords);
       setHolidays(localData.holidays);
   }, [localData, user.id, minPunchHistoryDate]);
@@ -726,10 +727,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     setPunchStep('idle');
   };
 
-  const allLeaves = localData.leaves.filter(l => l.userId === user.id).sort((a,b) => b.id - a.id);
+  const allLeaves = localData.leaves.filter(l => l.userId === user.id).sort((a,b) => creationTime(b) - creationTime(a));
   const recentLeave = allLeaves.length > 0 ? allLeaves[0] : null;
   
-  const allOvertime = localData.overtimes.filter(o => o.userId === user.id).sort((a,b) => b.id - a.id);
+  const allOvertime = localData.overtimes.filter(o => o.userId === user.id).sort((a,b) => creationTime(b) - creationTime(a));
   const recentOT = allOvertime.length > 0 ? allOvertime[0] : null;
 
   const quotaStats = useMemo(() => {
@@ -802,8 +803,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     if (!otForm.startDate || !otForm.endDate) return 0;
     
     // Create Date objects to represent the current OT applying
-    const s = new Date(`${otForm.startDate}T${otForm.startTime}`);
-    const e = new Date(`${otForm.endDate}T${otForm.endTime}`);
+    const s = new Date(`${otForm.startDate}T${otForm.startTime}:00+08:00`);
+    const e = new Date(`${otForm.endDate}T${otForm.endTime}:00+08:00`);
     
     if (e.getTime() <= s.getTime()) return 0;
 
@@ -819,7 +820,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
     return calculateOTWithDeduction(s, e, sameDayOTs, holidays.map(h => h.date));
   }, [otForm, localData.overtimes, user.id, holidays]);
 
-  const initiateCancelRequest = (id: number, type: 'leave' | 'ot') => {
+  const initiateCancelRequest = (id: number | string, type: 'leave' | 'ot') => {
     const n1 = Math.floor(Math.random() * 9) + 1;
     const n2 = Math.floor(Math.random() * 9) + 1;
     const ans = n1 + n2;
@@ -857,6 +858,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
      }
      if (!leaveForm.reason.trim()) {
        setNotification({ type: 'error', message: "請填寫請假事由" });
+       return;
+     }
+
+     if(calculatedHours<=0) {
+       setNotification({type:'error',message:'請確認請假起訖時間，可申請時數必須大於零'});
        return;
      }
 
@@ -1545,7 +1551,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     }
 
                     return filteredLeaves
-                        .sort((a, b) => b.id - a.id)
+                        .sort((a, b) => creationTime(b) - creationTime(a))
                         .map(l => (
                         <div key={l.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
                            <div className="flex justify-between items-start">
@@ -1618,7 +1624,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     }
 
                     return filteredOT
-                        .sort((a, b) => b.id - a.id)
+                        .sort((a, b) => creationTime(b) - creationTime(a))
                         .map(o => (
                         <div key={o.id} className="p-4 bg-white border border-gray-100 rounded-2xl space-y-2 hover:shadow-md transition-all">
                            <div className="flex justify-between items-start">

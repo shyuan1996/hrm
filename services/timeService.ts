@@ -1,5 +1,17 @@
 
 import type { AttendanceRecord, Holiday } from '../types';
+import { leaveHours, parseTaipei } from '../functions/src/domain';
+
+const parseDateInput = (value: Date | string | number): Date => {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(value)) {
+    try { return new Date(parseTaipei(value)); } catch { return new Date(NaN); }
+  }
+  return new Date(value);
+};
+const timestampDate = (value: any): Date | null => {
+  const d=value?.toDate?.() ?? (typeof value?.seconds==='number'?new Date(value.seconds*1000):typeof value?._seconds==='number'?new Date(value._seconds*1000):value instanceof Date?value:typeof value==='string'?new Date(value):null);
+  return d && Number.isFinite(d.getTime())?d:null;
+};
 
 // 使用模組級變數作為 Singleton 狀態儲存。
 // 每次成功校時都會重新建立錨點，避免頁面長時間開啟後因裝置時鐘漂移而越來越慢。
@@ -139,23 +151,13 @@ export const TimeService = {
   },
 
   getAttendanceDate: (record: AttendanceRecord): string => {
-    // Administrator補打卡的 date/time 是指定的實際打卡時間；createdAt
-    // 僅代表管理員執行補登的時間，不能拿來取代打卡日期。
-    if (record.source === 'admin') return TimeService.getTaiwanDate(record.date);
-    const timestamp = record.createdAt as any;
-    if (timestamp?.toDate instanceof Function) {
-      return TimeService.getTaiwanDate(timestamp.toDate());
-    }
-    return TimeService.getTaiwanDate(record.date);
+    const effective = timestampDate(record.effectiveAt) || (record.source !== 'admin' ? timestampDate(record.createdAt) : null);
+    return effective ? TimeService.getTaiwanDate(effective) : record.date.slice(0,10);
   },
 
   getAttendanceTime: (record: AttendanceRecord, withSeconds = true): string => {
-    if (record.source === 'admin') return TimeService.formatTimeOnly(record.time, withSeconds);
-    const timestamp = record.createdAt as any;
-    if (timestamp?.toDate instanceof Function) {
-      return TimeService.getTaiwanTime(timestamp.toDate()).substring(0, withSeconds ? 8 : 5);
-    }
-    return TimeService.formatTimeOnly(record.time, withSeconds);
+    const effective = timestampDate(record.effectiveAt) || (record.source !== 'admin' ? timestampDate(record.createdAt) : null);
+    return effective ? TimeService.getTaiwanTime(effective).slice(0,withSeconds?8:5) : TimeService.formatTimeOnly(record.time,withSeconds);
   },
 
   /**
@@ -163,7 +165,7 @@ export const TimeService = {
    */
   getTaiwanDate: (dateInput: Date | string | number): string => {
     try {
-      const d = new Date(dateInput);
+      const d = parseDateInput(dateInput);
       if (isNaN(d.getTime())) return String(dateInput);
       return d.toLocaleDateString('zh-TW', {
         timeZone: 'Asia/Taipei',
@@ -181,7 +183,7 @@ export const TimeService = {
    */
   getTaiwanTime: (dateInput: Date | string | number): string => {
     try {
-      const d = new Date(dateInput);
+      const d = parseDateInput(dateInput);
       if (isNaN(d.getTime())) return '';
       return d.toLocaleTimeString('zh-TW', {
         timeZone: 'Asia/Taipei',
@@ -201,7 +203,7 @@ export const TimeService = {
   formatDateTime: (dateStr: string, withSeconds = false): string => {
     if (!dateStr) return '--';
     try {
-        const d = new Date(dateStr);
+        const d = parseDateInput(dateStr);
         if (isNaN(d.getTime())) {
             return dateStr.replace('T', ' ').replace('Z', '');
         }
@@ -231,7 +233,7 @@ export const TimeService = {
     if (!rawTime) return '--';
     if (rawTime.includes('T') || rawTime.includes('-')) {
         try {
-            const d = new Date(rawTime);
+            const d = parseDateInput(rawTime);
             if (!isNaN(d.getTime())) {
                 return d.toLocaleTimeString('zh-TW', {
                     timeZone: 'Asia/Taipei',
@@ -277,49 +279,6 @@ export const TimeService = {
    * 計算請假時數
    */
   calculateLeaveHours: (startStr: string, endStr: string, holidays: Holiday[]): number => {
-    if (!startStr || !endStr) return 0;
-    const s = new Date(startStr.replace(' ', 'T'));
-    const e = new Date(endStr.replace(' ', 'T'));
-    if (e <= s) return 0;
-
-    let totalHours = 0;
-    let current = new Date(s);
-    
-    while (current < e) {
-        const currentDateStr = TimeService.getTaiwanDate(current);
-        const checkDay = new Date(currentDateStr); 
-        const dayOfWeek = checkDay.getDay();
-        
-        const isHoli = holidays.some(h => TimeService.getTaiwanDate(h.date) === currentDateStr) || dayOfWeek === 0 || dayOfWeek === 6;
-
-        if (!isHoli) {
-            const workStart = new Date(`${currentDateStr}T08:30:00`);
-            const workEnd = new Date(`${currentDateStr}T17:30:00`);
-            const lunchStart = new Date(`${currentDateStr}T12:00:00`);
-            const lunchEnd = new Date(`${currentDateStr}T13:00:00`);
-
-            const segmentStart = (s > workStart) ? s : workStart;
-            const segmentEnd = (e < workEnd) ? e : workEnd;
-
-            if (segmentEnd > segmentStart) {
-                let duration = segmentEnd.getTime() - segmentStart.getTime();
-                const lunchSegStart = (segmentStart > lunchStart) ? segmentStart : lunchStart;
-                const lunchSegEnd = (segmentEnd < lunchEnd) ? segmentEnd : lunchEnd;
-
-                if (lunchSegEnd > lunchSegStart) {
-                    duration -= (lunchSegEnd.getTime() - lunchSegStart.getTime());
-                }
-
-                if (duration > 0) {
-                    totalHours += duration;
-                }
-            }
-        }
-        current.setDate(current.getDate() + 1);
-        current.setHours(0,0,0,0);
-    }
-
-    const h = totalHours / (1000 * 60 * 60);
-    return parseFloat((Math.round(h * 2) / 2).toFixed(1));
+    try { return leaveHours(startStr,endStr,holidays.map(h=>h.date.slice(0,10))); } catch { return 0; }
   }
 };

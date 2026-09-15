@@ -1,4 +1,5 @@
 import type { AttendanceRecord } from '../types';
+import { TimeService } from '../services/timeService';
 
 export type AttendanceCompleteness =
   | 'empty'
@@ -21,8 +22,8 @@ export const analyzeAttendanceCompleteness = (
   }
 
   const records = [...chronologicalRecords].sort((a, b) => {
-    const left = `${a.date || ''} ${a.time || ''}`;
-    const right = `${b.date || ''} ${b.time || ''}`;
+    const left = `${TimeService.getAttendanceDate(a)} ${TimeService.getAttendanceTime(a)}`;
+    const right = `${TimeService.getAttendanceDate(b)} ${TimeService.getAttendanceTime(b)}`;
     return left.localeCompare(right);
   });
   const hasIn = records.some(record => record.type === 'in');

@@ -104,6 +104,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         if (userProfile.uid !== firebaseUser.uid) throw new Error('PROFILE_UID_MISMATCH');
 
         if (userProfile?.deleted && originalId !== 'admin') {
+            await signOut(auth);
             setError('此帳號已被封存');
             setIsLoading(false);
             return;
