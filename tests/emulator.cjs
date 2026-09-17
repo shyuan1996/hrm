@@ -140,6 +140,24 @@ test('isolated Firestore/Storage Rules and server workflow regression',async t=>
       await call('sy002','overtimeAction',{id:result.id,operation:'cancel'});
       assert.equal((await db.doc('overtimes/'+result.id).get()).data().status,'cancelled');
     });
+    await t.test('four-hour overtime stays four through server submission and approval',async()=>{
+      const result=await call('sy002','submitOvertime',{requestId:'ot-four-hour',start:'2026-09-17 04:30',end:'2026-09-17 08:30',hours:3.5,reason:'Synthetic four-hour boundary'});
+      assert.equal(result.hours,4);
+      assert.equal((await db.doc('overtimes/'+result.id).get()).data().hours,4);
+      await call('admin','overtimeAction',{id:result.id,operation:'approve'});
+      assert.equal((await db.doc('overtimes/'+result.id).get()).data().hours,4);
+      await call('admin','overtimeAction',{id:result.id,operation:'approve'});
+      assert.equal((await db.doc('overtimes/'+result.id).get()).data().hours,4);
+    });
+    await t.test('next thirty minutes are rest and previous authoritative hours are not migrated',async()=>{
+      const result=await call('sy002','submitOvertime',{requestId:'ot-forward-rest',start:'2026-09-19 08:00',end:'2026-09-19 12:15',hours:3.5,reason:'Synthetic partial rest'});
+      assert.equal(result.hours,4);
+      await call('admin','overtimeAction',{id:result.id,operation:'edit',updates:{end:'2026-09-19 13:00'}});
+      assert.equal((await db.doc('overtimes/'+result.id).get()).data().hours,4.5);
+      await db.doc('overtimes/legacy-four-hours').set({id:123,userId:'sy002',uid:'sy002',start:'2026-09-16 04:30',end:'2026-09-16 08:30',hours:3.5,status:'pending',calculationVersion:1});
+      await call('admin','overtimeAction',{id:'legacy-four-hours',operation:'approve'});
+      assert.equal((await db.doc('overtimes/legacy-four-hours').get()).data().hours,3.5);
+    });
     await t.test('permanent delete and audit tampering denied',async()=>{
       await assertFails(deleteDoc(doc(admin.firestore(),'users/sy001')));
       await db.doc('security_logs/test').set({action:'TEST'});

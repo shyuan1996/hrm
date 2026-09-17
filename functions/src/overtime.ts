@@ -4,9 +4,9 @@
  * Weekdays exclude the regular 08:30-17:30 working interval. Weekends and
  * configured holidays are fully eligible. Existing requests are merged with
  * the new request so an employee cannot claim the same minutes twice.
- * Every continuous four-hour block requires a 30-minute rest; an already
- * separated gap shorter than one hour is treated as that rest and is not
- * deducted a second time.
+ * Count four hours of work first, then reserve the NEXT 30 minutes for rest.
+ * A request ending at the four-hour boundary retains all four hours. Gaps
+ * during a due rest period satisfy that rest instead of being deducted twice.
  */
 export const calculateOTWithDeduction = (
   currentOtStart: Date,
@@ -109,31 +109,44 @@ export const calculateOTWithDeduction = (
       }
     }
 
-    // A short gap can be the legally required rest between two requests. A
-    // long gap (for example the regular daytime schedule) starts a new block.
-    const clusters: { start: number, end: number, rest: number }[] = [];
-    for (const span of merged) {
-      const last = clusters[clusters.length - 1];
-      if (!last || span.start - last.end >= ONE_HOUR) {
-        clusters.push({ start: span.start, end: span.end, rest: 0 });
-      } else {
-        last.rest += Math.max(0, span.start - last.end);
-        last.end = span.end;
-      }
-    }
-
+    const WORK_BLOCK = 4 * ONE_HOUR;
+    const REST_BLOCK = ONE_HOUR / 2;
+    let worked = 0;
+    let restRemaining = 0;
     let total = 0;
-    for (const cluster of clusters) {
-      const grossHours = (cluster.end - cluster.start) / ONE_HOUR - cluster.rest / ONE_HOUR;
-      // Every completed four hours requires a 30-minute rest.  Thus a
-      // continuous four-hour request is billed as 3.5 hours, while an
-      // eight-hour request carries two 30-minute breaks.
-      const requiredBreaks = grossHours >= 4 ? Math.floor(grossHours / 4) : 0;
-      const requiredRestHours = requiredBreaks * 0.5;
-      const alreadyRestedHours = cluster.rest / ONE_HOUR;
-      total += Math.max(0, grossHours - Math.max(0, requiredRestHours - alreadyRestedHours));
+    let previousEnd: number | undefined;
+    for (const span of merged) {
+      if (previousEnd !== undefined) {
+        const gap = span.start - previousEnd;
+        // Preserve the existing long-gap reset (including normal office hours).
+        if (gap >= ONE_HOUR) {
+          worked = 0;
+          restRemaining = 0;
+        } else if (restRemaining > 0) {
+          // Only a gap AFTER four hours can satisfy the rest now due.
+          restRemaining = Math.max(0, restRemaining - gap);
+          if (restRemaining === 0) worked = 0;
+        }
+      }
+      let remaining = span.end - span.start;
+      while (remaining > 0) {
+        if (restRemaining > 0) {
+          const rest = Math.min(remaining, restRemaining);
+          remaining -= rest;
+          restRemaining -= rest;
+          if (restRemaining === 0) worked = 0;
+        } else {
+          const work = Math.min(remaining, WORK_BLOCK - worked);
+          remaining -= work;
+          worked += work;
+          total += work;
+          // Mark future rest; never subtract from work already counted.
+          if (worked === WORK_BLOCK) restRemaining = REST_BLOCK;
+        }
+      }
+      previousEnd = span.end;
     }
-    return total;
+    return total / ONE_HOUR;
   };
 
   const totalNet = computeNetHours(allIntervals);

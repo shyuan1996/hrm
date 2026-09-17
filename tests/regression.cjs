@@ -15,6 +15,38 @@ function load(file) {
 }
 const domain=load('functions/src/domain.ts');
 const ot=load('functions/src/overtime.ts').calculateOTWithDeduction;
+const browserOt=load('utils/otCalculator.ts').calculateOTWithDeduction;
+const overtime=(start,end,existing=[],holidays=[])=>ot(new Date(start.replace(' ','T')+'+08:00'),new Date(end.replace(' ','T')+'+08:00'),existing,holidays);
+
+test('overtime keeps the first four hours and excludes regular weekday work',()=>{
+  assert.equal(overtime('2026-09-17 04:30','2026-09-17 08:30'),4);
+  assert.equal(overtime('2026-09-17 04:30','2026-09-17 09:00'),4);
+  assert.equal(overtime('2026-09-17 06:00','2026-09-17 09:00'),2.5);
+  assert.equal(overtime('2026-09-17 04:00','2026-09-17 08:30'),4);
+  assert.equal(overtime('2026-09-17 08:30','2026-09-17 17:30'),0);
+});
+test('overtime rest occupies only the next thirty minutes, then work resumes',()=>{
+  for(const [end,hours] of [['12:00',4],['12:15',4],['12:30',4],['13:00',4.5],['16:00',7.5],['16:30',8],['16:45',8],['17:00',8],['17:30',8.5]]) {
+    assert.equal(overtime('2026-09-19 08:00',`2026-09-19 ${end}`),hours,end);
+    assert.equal(overtime('2026-09-17 08:00',`2026-09-17 ${end}`,[],['2026-09-17']),hours,'holiday '+end);
+  }
+});
+test('overtime break continues over midnight rather than charging a new block',()=>{
+  assert.equal(overtime('2026-09-18 20:00','2026-09-19 00:00'),4);
+  assert.equal(overtime('2026-09-18 20:00','2026-09-19 00:30'),4);
+  assert.equal(overtime('2026-09-18 20:00','2026-09-19 01:00'),4.5);
+});
+test('an actual gap at the rest boundary is not deducted again',()=>{
+  const previous=[{start:'2026-09-19 08:00',end:'2026-09-19 12:00',hours:4}];
+  assert.equal(overtime('2026-09-19 12:30','2026-09-19 16:30',previous),4);
+  assert.equal(overtime('2026-09-19 12:30','2026-09-19 17:00',previous),4);
+  assert.equal(overtime('2026-09-19 12:15','2026-09-19 13:00',previous),0.5);
+  assert.equal(overtime('2026-09-19 12:00','2026-09-19 12:30',previous),0);
+  assert.equal(overtime('2026-09-19 08:00','2026-09-19 12:00',previous),0);
+});
+test('browser preview exports the same overtime calculator as the backend',()=>{
+  assert.equal(browserOt,ot);
+});
 const {TimeService}=load('services/timeService.ts');
 const {dailyAttendance}=load('utils/dailyAttendance.ts');
 const {csvCell}=load('utils/csv.ts');
