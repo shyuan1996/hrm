@@ -1,6 +1,7 @@
 
 import type { AttendanceRecord, Holiday } from '../types';
 import { leaveHours, parseTaipei } from '../functions/src/domain';
+import { firstSuccessful } from '../utils/firstSuccessful';
 
 const parseDateInput = (value: Date | string | number): Date => {
   if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(value)) {
@@ -98,8 +99,8 @@ export const TimeService = {
 
     const syncTask = (async (): Promise<number | null> => {
       try {
-        // 同時嘗試多個來源；Promise.any 只採用第一個有效回應。
-        const sample = await Promise.any([
+        // First valid source wins, including on Safari without Promise.any.
+        const sample = await firstSuccessful([
           fetchWithTimeout('https://worldtimeapi.org/api/timezone/Asia/Taipei'),
           fetchWithTimeout('https://io.adafruit.com/api/v2/time/ISO-8601'),
           fetchWithTimeout('https://timeapi.io/api/time/current/zone?timeZone=Asia%2FTaipei')

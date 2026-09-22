@@ -1,7 +1,10 @@
 
 import { initializeApp, getApp, getApps } from "firebase/app";
 import {
-  getAuth,
+  initializeAuth,
+  indexedDBLocalPersistence,
+  browserSessionPersistence,
+  inMemoryPersistence,
   createUserWithEmailAndPassword,
   signOut,
   browserLocalPersistence,
@@ -23,7 +26,12 @@ const firebaseConfig = {
 
 // 1. 主要 App (當前登入者使用)
 export const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+// Password-only login needs no popup/redirect iframe. On mobile Safari the
+// default resolver proactively loads one and can delay session restoration.
+// Retain all old persistence stores so existing sessions can migrate safely.
+export const auth = initializeAuth(app, {
+  persistence: [browserLocalPersistence, indexedDBLocalPersistence, browserSessionPersistence]
+});
 export const db = getFirestore(app);
 export const storage = getStorage(app); // Standard initialization
 // The callable password-reset function is deployed in the Taiwan region.
@@ -53,7 +61,7 @@ if (getApps().length > 1) {
   secondaryApp = initializeApp(firebaseConfig, SECONDARY_APP_NAME);
 }
 
-const secondaryAuth = getAuth(secondaryApp);
+const secondaryAuth = initializeAuth(secondaryApp, { persistence: inMemoryPersistence });
 
 /**
  * 專門給管理員使用的「建立員工帳號」功能

@@ -45,7 +45,7 @@ function cleanLeave(data: any): LeaveRequest {
 const requestTime = (r: any) => r.createdAt?.toMillis?.() ?? (Number(r.legacyId ?? r.id) || 0);
 
 export interface AppData {
-  syncReady: {users:boolean; leaves:boolean; holidays:boolean; settings:boolean};
+  syncReady: {users:boolean; records:boolean; leaves:boolean; holidays:boolean; settings:boolean};
   users: User[];
   records: AttendanceRecord[];
   leaves: LeaveRequest[];
@@ -56,7 +56,7 @@ export interface AppData {
 }
 
 const getInitialData = (): AppData => ({
-  syncReady: {users:false,leaves:false,holidays:false,settings:false},
+  syncReady: {users:false,records:false,leaves:false,holidays:false,settings:false},
   users: [],
   records: [],
   leaves: [],
@@ -89,7 +89,7 @@ export const StorageService = {
         return { ...profileDoc.data(), id: profileDoc.id } as User;
       }
     } catch (error: any) {
-      if (error?.message === 'DUPLICATE_USER_PROFILE') throw error;
+      if (error?.code !== 'permission-denied') throw error;
       // Older rule deployments may reject UID collection queries. The
       // document-ID fallback below remains safe and never creates a profile.
       console.warn('UID profile lookup failed; trying legacy document ID.', error?.code || error);
@@ -139,6 +139,7 @@ export const StorageService = {
   clearPrivateCache: () => {
     _memoryCache = {
       ..._memoryCache,
+      syncReady: {users:false,records:false,leaves:false,holidays:false,settings:false},
       users: [],
       records: [],
       leaves: [],
@@ -157,12 +158,14 @@ export const StorageService = {
   initRealtimeSync: (userId?: string, role?: string) => {
     // Clear existing listeners
     StorageService.stopRealtimeSync();
-    _memoryCache.syncReady={users:false,leaves:false,holidays:false,settings:false};
+    _memoryCache.syncReady={users:false,records:false,leaves:false,holidays:false,settings:false};
 
     // Never expose the previous account's protected cache while listeners for
     // another account are still loading (especially on shared browsers).
     if (!userId || !_memoryCache.users.some(user => user.id === userId)) {
       StorageService.clearPrivateCache();
+    } else {
+      StorageService._saveToLocal();
     }
 
     // --- Public Data (Announcements, Holidays) ---
@@ -211,9 +214,19 @@ export const StorageService = {
                 } else {
                     _memoryCache.users=[];
                 }
-                window.dispatchEvent(new CustomEvent('profile-update',{detail:docSnap.exists()?{...docSnap.data(),id:docSnap.id}:null}));
+                // A missing local cache entry is not a deleted server profile.
+                if (!docSnap.metadata.fromCache) {
+                    window.dispatchEvent(new CustomEvent('profile-update',{detail:docSnap.exists()?{...docSnap.data(),id:docSnap.id}:null}));
+                }
                 StorageService._saveToLocal();
-            }, (error) => { console.error('User sync error (Self):',error.code); window.dispatchEvent(new CustomEvent('profile-update',{detail:null})); }));
+            }, (error) => {
+                _memoryCache.syncReady.users=false;
+                StorageService._saveToLocal();
+                console.error('User sync error (Self):',error.code);
+                if (error.code === 'permission-denied' || error.code === 'unauthenticated') {
+                    window.dispatchEvent(new CustomEvent('profile-update',{detail:null}));
+                }
+            }));
         }
 
         // Settings Sync
@@ -268,7 +281,8 @@ export const StorageService = {
             );
         }
 
-        _listeners.push(onSnapshot(recordsQ, (snapshot) => {
+        _listeners.push(onSnapshot(recordsQ, {includeMetadataChanges:true}, (snapshot) => {
+            _memoryCache.syncReady.records=!snapshot.metadata.fromCache;
             const list = snapshot.docs
                 .map(d => ({ ...d.data(), firestoreId:d.id } as AttendanceRecord))
                 // Keep the account ID check as defence in depth for profiles
@@ -279,7 +293,11 @@ export const StorageService = {
             }
             _memoryCache.records = list;
             StorageService._saveToLocal();
-        }, (e) => console.warn("Records sync error:", e.code)));
+        }, (e) => {
+            _memoryCache.syncReady.records=false;
+            StorageService._saveToLocal();
+            console.warn("Records sync error:", e.code);
+        }));
 
         _listeners.push(onSnapshot(leavesQ, {includeMetadataChanges:true}, (snapshot) => {
             _memoryCache.syncReady.leaves=!snapshot.metadata.fromCache;

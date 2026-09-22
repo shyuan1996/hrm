@@ -1,20 +1,17 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { User, Announcement } from '../types';
+import { Announcement } from '../types';
 import { StorageService } from '../services/storageService';
 import { auth, authPersistenceReady } from '../services/firebase';
-import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import { signInWithEmailAndPassword } from 'firebase/auth';
+import { sessionHints } from '../utils/session';
 import { Button } from './ui/Button';
 import { sanitizeAnnouncementHtml } from '../utils/sanitizeHtml';
 import { Building2, AlertTriangle, Megaphone, CloudDownload, Eye, EyeOff } from 'lucide-react';
 
-interface LoginProps {
-  onLogin: (user: User) => void;
-}
-
 const REMEMBER_KEY = 'sas_remember_user_v1';
 
-export const Login: React.FC<LoginProps> = ({ onLogin }) => {
+export const Login: React.FC = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -37,20 +34,20 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
     // Load remembered account only. Older versions stored the password in
     // reversible Base64; migrate it immediately without ever restoring it.
-    const storedCreds = localStorage.getItem(REMEMBER_KEY);
+    const storedCreds = sessionHints.get(REMEMBER_KEY);
     if (storedCreds) {
         try {
             const { u } = JSON.parse(atob(storedCreds));
             if (u) {
                 setUsername(u);
                 setRememberMe(true);
-                localStorage.setItem(REMEMBER_KEY, btoa(JSON.stringify({ u })));
+                sessionHints.set(REMEMBER_KEY, btoa(JSON.stringify({ u })));
             } else {
-                localStorage.removeItem(REMEMBER_KEY);
+                sessionHints.remove(REMEMBER_KEY);
             }
         } catch (e) {
             console.error("Failed to parse saved credentials", e);
-            localStorage.removeItem(REMEMBER_KEY);
+            sessionHints.remove(REMEMBER_KEY);
         }
     }
 
@@ -76,7 +73,6 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
     // 完整 Email 必須保留原網域（例如 service@shyuan.com.tw）；
     // 只有純員工編號才補上內部登入用的假網域。
     const isFullEmail = normalizedInput.includes('@');
-    const originalId = isFullEmail ? normalizedInput.split('@')[0] : normalizedInput;
     const email = isFullEmail ? normalizedInput : `${normalizedInput}@shyuan-hrm.com`;
 
     try {
@@ -87,50 +83,27 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
         if (!persistenceReady) throw new Error('AUTH_PERSISTENCE_UNAVAILABLE');
 
         // 1. Firebase Auth Login
-        const userCredential = await signInWithEmailAndPassword(auth, email, password);
-        const firebaseUser = userCredential.user;
-
-        if (!firebaseUser) throw new Error("驗證失敗");
-
-        // Resolve the employee profile by immutable Firebase UID. This also
-        // supports legacy mixed-case document IDs without creating new data.
-        const userProfile = await StorageService.getUserProfileForAuth(
-          firebaseUser.uid,
-          firebaseUser.email,
-          originalId
-        );
-
-        if (!userProfile) throw new Error('USER_PROFILE_NOT_FOUND');
-        if (userProfile.uid !== firebaseUser.uid) throw new Error('PROFILE_UID_MISMATCH');
-
-        if (userProfile?.deleted && originalId !== 'admin') {
-            await signOut(auth);
-            setError('此帳號已被封存');
-            setIsLoading(false);
-            return;
-        }
+        await signInWithEmailAndPassword(auth, email, password);
+        // App's single auth listener owns profile validation and subscriptions.
 
         // Handle Remember Me Logic (Save after successful login)
         if (rememberMe) {
             const jsonStr = JSON.stringify({ u: normalizedInput });
-            localStorage.setItem(REMEMBER_KEY, btoa(jsonStr));
+            sessionHints.set(REMEMBER_KEY, btoa(jsonStr));
         } else {
-            localStorage.removeItem(REMEMBER_KEY);
+            sessionHints.remove(REMEMBER_KEY);
         }
-
-        onLogin(userProfile!);
 
     } catch (err: any) {
         console.error("Login Error:", err);
-        if (auth.currentUser) {
-            try { await signOut(auth); } catch { /* best-effort cleanup */ }
-        }
         const errCode = err.code;
         const errMessage = err.message;
 
         // 簡化錯誤提示邏輯：一般帳號密碼錯誤統一顯示，不提供解決方案
         if (errCode === 'auth/invalid-credential' || errCode === 'auth/wrong-password' || errCode === 'auth/user-not-found') {
             setError('帳號或密碼錯誤');
+        } else if (errCode === 'auth/network-request-failed') {
+            setError('無法連上登入服務。請切換 Wi-Fi／行動網路後重試，並確認手機日期時間正確；這不代表密碼錯誤。');
         } else if (errCode === 'auth/too-many-requests') {
             setError('嘗試次數過多，請稍後再試');
         } else if (errMessage === 'ADMIN_PERMISSION_DENIED') {

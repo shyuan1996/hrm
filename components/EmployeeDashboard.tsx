@@ -432,6 +432,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   const effectiveTimeSynced = timeSyncValid && timeSyncState === 'ready' && TimeService.isSyncFresh();
   const timeSyncWaiting = !effectiveTimeSynced && timeSyncState === 'pending';
   const timeSyncFailed = !effectiveTimeSynced && !timeSyncWaiting;
+  const punchDataReady = localData.syncReady.users && localData.syncReady.settings && localData.syncReady.records;
   
   // Punch direction must be derived from today's records only. Previously the
   // final punch from a prior day could make today's first punch an "out".
@@ -515,6 +516,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
   };
 
   const initiatePunch = async () => {
+    if (!punchDataReady) {
+      setNotification({ type: 'error', message: '公司設定或打卡紀錄尚未完成同步，請檢查網路並重新連線。' });
+      return;
+    }
     // Basic checks before even starting sync
     if (!effectiveTimeSynced) {
         if (timeSyncFailed) {
@@ -938,21 +943,23 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
         {/* Punch Section (Left) - Unchanged */}
         <div className={`w-full md:w-1/2 flex-col h-full flex-shrink-0 ${mobileView === 'punch' ? 'flex' : 'hidden md:flex'}`}>
             <div className="flex-1 bg-white rounded-[32px] md:rounded-[40px] shadow-sm border p-6 md:p-12 flex flex-col items-center justify-start space-y-6 md:space-y-8 overflow-y-auto custom-scroll relative h-full">
-              <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100 relative">
+              <div className="text-center w-full pb-4 md:pb-6 border-b border-gray-100 relative shrink-0">
                  <div className="text-brand-600 font-black text-lg md:text-2xl mb-1 md:mb-2">{TimeService.toROCDateString(now)}</div>
                  <div className="text-5xl md:text-7xl font-mono font-black tracking-tighter text-gray-800">
                    {currentTimeStr}
                  </div>
               </div>
 
-              <div className="flex flex-col items-center w-full max-w-sm">
+              <div className="flex flex-col items-center w-full max-w-sm shrink-0">
                 <Button 
                   variant="tech-circle" 
                   onClick={initiatePunch}
-                   disabled={!effectiveTimeSynced || isVerifying}
-                   className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!effectiveTimeSynced || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
+                   disabled={!punchDataReady || !effectiveTimeSynced || isVerifying}
+                   className={`w-48 h-48 md:w-64 md:h-64 rounded-full border-[8px] md:border-[12px] shadow-2xl transition-all duration-500 mb-6 md:mb-8 aspect-square ${(!punchDataReady || !effectiveTimeSynced || isVerifying) ? 'from-gray-400 to-gray-500 grayscale opacity-80 cursor-not-allowed' : currentPunchType === 'in' ? 'from-brand-500 to-brand-700 border-brand-100' : 'from-red-500 to-red-700 border-red-100'}`}
                  >
-                   {!effectiveTimeSynced ? (
+                   {!punchDataReady ? (
+                     <span className="text-xl font-black text-white">資料連線中…</span>
+                   ) : !effectiveTimeSynced ? (
                      <div className="flex flex-col items-center">
                        {timeSyncWaiting ? <Loader2 size={40} className="animate-spin text-white mb-2" /> : <AlertTriangle size={40} className="text-white mb-2" />}
                        <span className="text-xl md:text-2xl font-black text-white">{timeSyncWaiting ? '連線中...' : '校時失敗'}</span>
@@ -990,7 +997,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                     'bg-gray-100 text-gray-400'
                 }`}>
                    <MapPin size={20} className={`md:w-6 md:h-6 ${(timeSyncWaiting || (!isLocationReady && !gpsError)) ? 'animate-bounce' : ''}`} />
-                   {gpsError && effectiveTimeSynced ? (
+                   {!punchDataReady ? (
+                     <div className="flex flex-col items-center gap-2">
+                       <span>公司設定／紀錄尚未同步，請確認網路連線</span>
+                       <button type="button" className="underline text-brand-600" onClick={() => StorageService.initRealtimeSync(user.id, user.role)}>重新連線</button>
+                     </div>
+                   ) : gpsError && effectiveTimeSynced ? (
                      <span>{gpsError}</span>
                     ) : !effectiveTimeSynced ? (
                      <div className="flex items-center justify-center gap-2 flex-wrap">
@@ -1011,7 +1023,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                    ) : settings.companyLat ? (
                      <span>距離：{distance?.toFixed(1) || '--'} m ({inRange ? '範圍內' : '範圍外'})</span>
                    ) : (
-                     <span>管理員尚未設定座標 (不限距離)</span>
+                     <span>公司座標未設定，請聯絡管理員（伺服器仍會檢查打卡位置）</span>
                    )}
                 </div>
               </div>
@@ -1025,7 +1037,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({ user, sett
                   {records.slice(0, 2).map((r) => (
                     <RecordItem key={r.id} r={r} />
                   ))}
-                  {records.length === 0 && <div className="p-6 md:p-10 text-center text-gray-300 italic">尚無打卡紀錄</div>}
+                  {!localData.syncReady.records && <div className="p-6 text-center text-gray-500">打卡紀錄尚未同步，請稍候或重新連線</div>}
+                  {localData.syncReady.records && records.length === 0 && <div className="p-6 md:p-10 text-center text-gray-300 italic">尚無打卡紀錄</div>}
                 </div>
               </div>
 

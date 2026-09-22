@@ -12,9 +12,20 @@ import { Button } from './components/ui/Button';
 import { auth, functions } from './services/firebase';
 import { httpsCallable } from 'firebase/functions';
 import { signOut, onAuthStateChanged, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
+import { sessionHints, requiresSignOut, withTimeout } from './utils/session';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
+  const [authSlow, setAuthSlow] = useState(false);
+  const retryAuth = useRef<() => void>(() => {});
+  useEffect(() => {
+    setAuthSlow(false);
+    if (!authLoading) return;
+    const timer = setTimeout(() => setAuthSlow(true), 8000);
+    return () => clearTimeout(timer);
+  }, [authLoading]);
   const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [timeOffset, setTimeOffset] = useState(0);
   const [isTimeSynced, setIsTimeSynced] = useState(false); // New state to track time sync status
@@ -88,9 +99,14 @@ const App: React.FC = () => {
 
     // 4. Session & Auth State Listener
     let authCheckVersion = 0;
-    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+    let disposed = false;
+    let restoring = false;
+    const restore = async (firebaseUser: typeof auth.currentUser) => {
       const currentCheck = ++authCheckVersion;
-      const savedSessionRaw = localStorage.getItem(SESSION_KEY);
+      restoring = true;
+      setAuthLoading(true);
+      setAuthError('');
+      const savedSessionRaw = sessionHints.get(SESSION_KEY);
       let parsed: { id?: string } | null = null;
 
       if (savedSessionRaw) {
@@ -98,23 +114,24 @@ const App: React.FC = () => {
           parsed = JSON.parse(savedSessionRaw);
         } catch (e) {
           console.warn('Invalid SESSION_KEY JSON, clearing it', e);
-          localStorage.removeItem(SESSION_KEY);
+          sessionHints.remove(SESSION_KEY);
           parsed = null;
         }
       }
 
       if (firebaseUser) {
         try {
-          const user = await StorageService.getUserProfileForAuth(
+          const user = await withTimeout(StorageService.getUserProfileForAuth(
             firebaseUser.uid,
             firebaseUser.email,
             parsed?.id
-          );
-          if (currentCheck !== authCheckVersion) return;
+          ), 12000);
+          if (disposed || currentCheck !== authCheckVersion || auth.currentUser?.uid !== firebaseUser.uid) return;
 
           if (!user || user.deleted) {
             throw new Error(user?.deleted ? 'USER_ARCHIVED' : 'USER_PROFILE_NOT_FOUND');
           }
+          if (user.uid !== firebaseUser.uid) throw new Error('PROFILE_UID_MISMATCH');
 
           setCurrentUser(user);
           setIsForcedPasswordChange(Boolean(user.mustChangePassword));
@@ -122,18 +139,24 @@ const App: React.FC = () => {
             setPwdForm({ old: '', new1: '', new2: '' });
             setIsSelfPwdModalOpen(true);
           }
-          localStorage.setItem(SESSION_KEY, JSON.stringify({ id: user.id }));
+          sessionHints.set(SESSION_KEY, JSON.stringify({ id: user.id }));
           StorageService.initRealtimeSync(user.id, user.role);
         } catch (error) {
           console.error('Authenticated profile restore failed', error);
-          if (currentCheck !== authCheckVersion) return;
+          if (disposed || currentCheck !== authCheckVersion) return;
           StorageService.stopRealtimeSync();
           StorageService.clearPrivateCache();
-          localStorage.removeItem(SESSION_KEY);
           setCurrentUser(null);
-          await signOut(auth).catch(() => {});
           setIsForcedPasswordChange(false);
           setIsSelfPwdModalOpen(false);
+          if (requiresSignOut(error)) {
+            sessionHints.remove(SESSION_KEY);
+            showNotification('帳號已停用或員工資料無法驗證，請聯絡管理員。', 'error');
+            await signOut(auth).catch(() => {});
+          } else {
+            // A slow/blocked network must not destroy a valid saved login.
+            setAuthError('暫時無法載入員工資料，登入狀態已保留。請檢查網路後按「重新連線」。');
+          }
         }
       } else {
         // Firebase 已登出，強制清除本地狀態
@@ -142,16 +165,32 @@ const App: React.FC = () => {
         setCurrentUser(null);
         setIsForcedPasswordChange(false);
         setIsSelfPwdModalOpen(false);
-        localStorage.removeItem(SESSION_KEY);
+        sessionHints.remove(SESSION_KEY);
       }
+      if (!disposed && currentCheck === authCheckVersion) {
+        restoring = false;
+        setAuthLoading(false);
+      }
+    };
+    retryAuth.current = () => { if (!restoring) void restore(auth.currentUser); };
+    const onOnline = () => { if (!disposed && !restoring && !StorageService.loadData().syncReady.users) void restore(auth.currentUser); };
+    window.addEventListener('online', onOnline);
+    const unsubscribeAuth = onAuthStateChanged(auth, user => { void restore(user); }, () => {
+      restoring = false;
+      setAuthLoading(false);
+      setAuthError('無法恢復登入，請檢查網路後重新整理。');
     });
 
     return () => {
+      disposed = true;
+      ++authCheckVersion;
+      retryAuth.current = () => {};
+      window.removeEventListener('online', onOnline);
       window.removeEventListener('storage-update', handleStorageUpdate);
       StorageService.stopRealtimeSync();
       unsubscribeAuth();
     };
-  }, [safeLoadData, syncTime]);
+  }, [safeLoadData, syncTime, showNotification]);
 
   // Mobile browsers can suspend timers while a tab is backgrounded or the
   // screen is locked.  Re-sync as soon as the app becomes visible again so an
@@ -241,7 +280,7 @@ const App: React.FC = () => {
       await httpsCallable(functions, 'completePasswordChange')({oldPassword:pwdForm.old,newPassword:pwdForm.new1});
 
       // 6. 清除記住我
-      localStorage.removeItem('sas_remember_user_v1');
+      sessionHints.remove('sas_remember_user_v1');
 
       // 7. 成功提示並強制登出
       // 順序優化：先關閉視窗，再顯示成功訊息，最後才登出
@@ -266,7 +305,7 @@ const App: React.FC = () => {
         } catch (e) {
           // ignore
         }
-        localStorage.removeItem(SESSION_KEY);
+        sessionHints.remove(SESSION_KEY);
         setCurrentUser(null);
       }
     } catch (error: any) {
@@ -294,23 +333,6 @@ const App: React.FC = () => {
     }
   };
 
-  // Called when Login component succeeds
-  const handleLoginSuccess = (u: User) => {
-    setCurrentUser(u);
-    setIsForcedPasswordChange(Boolean(u.mustChangePassword));
-    if (u.mustChangePassword) {
-      setPwdForm({ old: '', new1: '', new2: '' });
-      setIsSelfPwdModalOpen(true);
-    }
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ id: u.id }));
-    // Start listening to this user's data
-    try {
-      StorageService.initRealtimeSync(u.id, u.role);
-    } catch (e) {
-      console.error('initRealtimeSync failed on login', e);
-    }
-  };
-
   const handleLogout = async () => {
     try {
       await signOut(auth);
@@ -319,7 +341,9 @@ const App: React.FC = () => {
     } finally {
       StorageService.stopRealtimeSync();
       StorageService.clearPrivateCache();
-      localStorage.removeItem(SESSION_KEY);
+      sessionHints.remove(SESSION_KEY);
+      setAuthError('');
+      setAuthLoading(false);
       setCurrentUser(null);
       setIsForcedPasswordChange(false);
       setIsSelfPwdModalOpen(false);
@@ -382,8 +406,21 @@ const App: React.FC = () => {
       )}
 
       <div className="flex-1 overflow-hidden relative">
-        {!currentUser ? (
-          <Login onLogin={handleLoginSuccess} />
+        {authLoading || authError ? (
+          <div className="h-full flex flex-col items-center justify-center p-8 gap-6 text-center" role="status" aria-live="polite">
+            <h1 className="text-2xl font-black text-brand-600">考勤管理系統</h1>
+            <p className="text-lg text-gray-600">{authError || '正在恢復登入，請稍候…'}</p>
+            {authLoading && authSlow && <>
+              <p className="text-gray-500">連線比平常慢，請確認網路；不用重複輸入帳號密碼。</p>
+              <button className="underline text-brand-600" onClick={() => window.location.reload()}>重新整理</button>
+            </>}
+            {authError && <>
+              <Button onClick={() => retryAuth.current()}>重新連線</Button>
+              <button onClick={handleLogout} className="text-gray-500 underline">登出並切換帳號</button>
+            </>}
+          </div>
+        ) : !currentUser ? (
+          <Login />
         ) : currentUser.role === 'admin' ? (
           <AdminDashboard timeOffset={timeOffset} isTimeSynced={isTimeSynced} onTimeSync={() => syncTime(true)} />
         ) : (
